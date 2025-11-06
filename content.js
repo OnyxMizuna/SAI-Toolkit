@@ -795,6 +795,28 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let messageIdToIndexMap = {}; // Map message IDs to their order in the conversation
     let currentConversationId = null; // Store the actual conversation ID from API
 
+    // Helper function to safely set HTML content (sanitizes input)
+    function safeSetHTML(element, content) {
+        // For simple text content, use textContent
+        if (!content.includes('<')) {
+            element.textContent = content;
+            return;
+        }
+        
+        // For content with <br> tags, convert to text nodes and actual <br> elements
+        // This avoids innerHTML security warnings while preserving line breaks
+        element.textContent = ''; // Clear existing content
+        const parts = content.split(/<br\s*\/?>/i);
+        parts.forEach((part, index) => {
+            if (part) {
+                element.appendChild(document.createTextNode(part));
+            }
+            if (index < parts.length - 1) {
+                element.appendChild(document.createElement('br'));
+            }
+        });
+    }
+
     // Build index map from stored message stats (for imported/old messages)
     async function buildIndexMapFromStats() {
         debugLog('[Stats] buildIndexMapFromStats starting...');
@@ -1957,21 +1979,50 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const modal = document.createElement('div');
         modal.style.cssText = `background: ${isDark ? '#1a1a1a' : '#ffffff'}; border-radius: 12px; padding: 24px; min-width: 320px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);`;
         
-        modal.innerHTML = `
-            <h2 style="font-size: 20px; font-weight: 600; margin-bottom: 16px; color: ${isDark ? '#fff' : '#000'};">Jump to Page</h2>
-            <p style="font-size: 14px; margin-bottom: 16px; color: ${isDark ? '#a1a1aa' : '#666'};">Enter a page number between 1 and ${totalPages}</p>
-            <input type="number" id="page-jump-input" min="1" max="${totalPages}" value="${currentPage}" placeholder="Page number" style="width: 100%; padding: 10px 12px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; border-radius: 8px; font-size: 16px; margin-bottom: 20px; background: ${isDark ? '#27272a' : '#fff'}; color: ${isDark ? '#fff' : '#000'};" />
-            <div style="display: flex; gap: 12px; justify-content: flex-end;">
-                <button id="page-jump-cancel" style="padding: 8px 16px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; background: transparent; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; color: ${isDark ? '#fff' : '#000'}; transition: all 0.2s;">Cancel</button>
-                <button id="page-jump-ok" style="padding: 8px 16px; border: none; background: #0072F5; color: white; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s;">Go to Page</button>
-            </div>
-        `;
+        // Use safe HTML construction to avoid innerHTML security warnings
+        const h2 = document.createElement('h2');
+        h2.style.cssText = `font-size: 20px; font-weight: 600; margin-bottom: 16px; color: ${isDark ? '#fff' : '#000'};`;
+        h2.textContent = 'Jump to Page';
+        
+        const p = document.createElement('p');
+        p.style.cssText = `font-size: 14px; margin-bottom: 16px; color: ${isDark ? '#a1a1aa' : '#666'};`;
+        p.textContent = `Enter a page number between 1 and ${totalPages}`;
+        
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.id = 'page-jump-input';
+        input.min = '1';
+        input.max = totalPages.toString();
+        input.value = currentPage.toString();
+        input.placeholder = 'Page number';
+        input.style.cssText = `width: 100%; padding: 10px 12px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; border-radius: 8px; font-size: 16px; margin-bottom: 20px; background: ${isDark ? '#27272a' : '#fff'}; color: ${isDark ? '#fff' : '#000'};`;
+        
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.cssText = 'display: flex; gap: 12px; justify-content: flex-end;';
+        
+        const cancelBtn = document.createElement('button');
+        cancelBtn.id = 'page-jump-cancel';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = `padding: 8px 16px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; background: transparent; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; color: ${isDark ? '#fff' : '#000'}; transition: all 0.2s;`;
+        
+        const okBtn = document.createElement('button');
+        okBtn.id = 'page-jump-ok';
+        okBtn.textContent = 'Go to Page';
+        okBtn.style.cssText = 'padding: 8px 16px; border: none; background: #0072F5; color: white; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s;';
+        
+        buttonContainer.appendChild(cancelBtn);
+        buttonContainer.appendChild(okBtn);
+        
+        modal.appendChild(h2);
+        modal.appendChild(p);
+        modal.appendChild(input);
+        modal.appendChild(buttonContainer);
         
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
         
-        const input = document.getElementById('page-jump-input');
-        setTimeout(() => { input.focus(); input.select(); }, 100);
+        const inputElement = document.getElementById('page-jump-input');
+        setTimeout(() => { inputElement.focus(); inputElement.select(); }, 100);
         
         const okButton = document.getElementById('page-jump-ok');
         const cancelButton = document.getElementById('page-jump-cancel');
@@ -1979,7 +2030,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         function closeModal() { overlay.remove(); }
         
         function handleSubmit() {
-            const pageNumber = parseInt(input.value);
+            const pageNumber = parseInt(inputElement.value);
             if (isNaN(pageNumber)) {
                 alert('Please enter a valid page number');
                 return;
@@ -1995,7 +2046,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         cancelButton.addEventListener('click', closeModal);
         overlay.addEventListener('click', async (e) => { if (e.target === overlay) closeModal(); });
         okButton.addEventListener('click', handleSubmit);
-        input.addEventListener('keypress', async (e) => { if (e.key === 'Enter') handleSubmit(); });
+        inputElement.addEventListener('keypress', async (e) => { if (e.key === 'Enter') handleSubmit(); });
         document.addEventListener('keydown', function escapeHandler(e) {
             if (e.key === 'Escape') {
                 closeModal();
@@ -2587,49 +2638,50 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const backdrop = document.createElement('div');
         backdrop.className = 'backdrop';
         
-        // Create modal
+        // Create modal with safe HTML (no dynamic content in innerHTML)
         const modal = document.createElement('div');
         modal.className = 'modal';
+        // Using static HTML template - checkboxes will be set programmatically below
         modal.innerHTML = `
             <div class="modal-header">S.AI Toolkit Settings</div>
             <div class="modal-body">
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off" ${sidebarEnabled ? 'checked' : ''}>
+                    <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Sidebar Layout</div>
                         <div class="setting-desc">Pin the Generation Settings and Memories modals to sidebar.</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="theme-checkbox" autocomplete="off" ${themeEnabled ? 'checked' : ''}>
+                    <input type="checkbox" class="setting-checkbox" id="theme-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Classic Theme</div>
                         <div class="setting-desc">Applies the classic colors and message box styling. Credit goes to <strong>MssAcc</strong> on Discord.</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off" ${hideForYouEnabled ? 'checked' : ''}>
+                    <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Hide "For You" Characters</div>
                         <div class="setting-desc">Hide character tiles with purple "For You" badge on page 1</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off" ${pageJumpEnabled ? 'checked' : ''}>
+                    <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Page Jump Modal</div>
                         <div class="setting-desc">Click "..." pagination button to jump to any page</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off" ${showStatsEnabled ? 'checked' : ''}>
+                    <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Show generation model stats and timestamp in messages</div>
                         <div class="setting-desc">Display model info and timestamps below bot messages (only for new messages)</div>
                     </div>
                 </label>
-                <label class="sub-setting-row ${showStatsEnabled ? '' : 'hidden'}" id="timestamp-format-row">
-                    <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off" ${timestampDateFirst ? 'checked' : ''}>
+                <label class="sub-setting-row hidden" id="timestamp-format-row">
+                    <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off">
                     <div class="sub-setting-text">
                         <div class="sub-setting-title">Show date first</div>
                         <div class="setting-desc">Reverses the order of the timestamp so that the date comes before the time</div>
@@ -2661,6 +2713,30 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         debugLog('[Toolkit] Modal and backdrop appended to shadow DOM');
         
+        // Get checkbox elements within shadow DOM
+        const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
+        const themeCheckbox = shadow.querySelector('#theme-checkbox');
+        const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
+        const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
+        const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
+        const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
+        const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
+        
+        // Set checkbox states programmatically (safer than innerHTML with dynamic values)
+        sidebarCheckbox.checked = sidebarEnabled;
+        themeCheckbox.checked = themeEnabled;
+        hideForYouCheckbox.checked = hideForYouEnabled;
+        pageJumpCheckbox.checked = pageJumpEnabled;
+        showStatsCheckbox.checked = showStatsEnabled;
+        timestampFormatCheckbox.checked = timestampDateFirst;
+        
+        // Show/hide timestamp format row based on showStats setting
+        if (showStatsEnabled) {
+            timestampFormatRow.classList.remove('hidden');
+        }
+        
+        debugLog('[Toolkit] Checkbox states set programmatically');
+        
         // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
         // Use BUBBLE phase (false) so events reach our handlers first, THEN get stopped from escaping
         debugLog('[Toolkit] Installing comprehensive event barrier at shadow root (bubble phase)');
@@ -2674,14 +2750,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         });
         debugLog('[Toolkit] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
         
-        // Get checkbox elements within shadow DOM
-        const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
-        const themeCheckbox = shadow.querySelector('#theme-checkbox');
-        const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
-        const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
-        const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
-        const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
-        const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
+        // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
@@ -3438,16 +3507,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     const statsText = `${generationStats.model}<br>tks: ${maxTokens} | tmp: ${temperature.toFixed(2)} | p: ${topP} | k: ${topK}`;
                     const timestamp = await formatTimestamp(generationStats.timestamp);
                     if (timestamp) {
-                        statsDiv.innerHTML = `${statsText}<br>${timestamp}`;
+                        safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
                     } else {
-                        statsDiv.innerHTML = statsText;
+                        safeSetHTML(statsDiv, statsText);
                     }
                     debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                 } else if (generationStats.timestamp) {
                     debugLog('[Stats] Has timestamp only');
                     const timestamp = await formatTimestamp(generationStats.timestamp);
                     if (timestamp) {
-                        statsDiv.innerHTML = timestamp;
+                        safeSetHTML(statsDiv, timestamp);
                         debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                     } else {
                         debugLog('[Stats] No valid timestamp, skipping');
@@ -3499,7 +3568,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 statsDiv.className = 'generation-stats';
                 statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
                 
-                statsDiv.innerHTML = timestamp;
+                safeSetHTML(statsDiv, timestamp);
                 
                 // Insert before the menu button's parent container
                 const menuButtonContainer = actionContainer.querySelector('.relative');
@@ -3589,17 +3658,17 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 if (generationStats.max_tokens && generationStats.model) {
                     const statsText = `${generationStats.model} | tks: ${generationStats.max_tokens} | tmp: ${generationStats.temperature.toFixed(2)} | p: ${generationStats.top_p} | k: ${generationStats.top_k}`;
                     const timestamp = await formatTimestamp(generationStats.timestamp);
-                    statsDiv.innerHTML = `${statsText}<br>${timestamp}`;
+                    safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
                 } else if (generationStats.timestamp) {
                     const timestamp = await formatTimestamp(generationStats.timestamp);
-                    statsDiv.innerHTML = timestamp;
+                    safeSetHTML(statsDiv, timestamp);
                 } else {
                     delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
                     botMessageIndex++;
                     continue;
                 }
                 
-                // Insert before the menu button's parent container
+                // Insert before the menu button's parent container (for insertStatsForAllMessages function)
                 const menuButtonContainer = actionContainer.querySelector('.relative');
                 if (menuButtonContainer) {
                     actionContainer.insertBefore(statsDiv, menuButtonContainer);
@@ -3632,7 +3701,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 statsDiv.className = 'generation-stats';
                 statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
                 
-                statsDiv.innerHTML = timestamp;
+                safeSetHTML(statsDiv, timestamp);
                 
                 // Insert before the menu button's parent container
                 const menuButtonContainer = actionContainer.querySelector('.relative');
