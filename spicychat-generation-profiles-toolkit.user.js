@@ -1,172 +1,34 @@
-/**
- * S.AI Toolkit - Browser Extension Content Script
- * Converted from Tampermonkey userscript
- * 
- * Features:
- * - Generation Settings Profiles (save/load/manage)
- * - Sidebar Layout (pin modals to right side)
- * - Classic Theme Customization
- * - Hide "For You" Characters
- * - Page Jump Modal
- * - Generation Stats Display
- * 
- * Testing the onboarding flow:
- * Run in browser console: resetSAIToolkitOnboarding()
- * Then reload the page to see the onboarding modal again.
- */
+// ==UserScript==
+// @name         SpicyChat - Toolkit Generation Settings Profiles
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Save and load generation settings profiles
+// @author       OnyxMizuna
+// @match        https://spicychat.ai/*
+// @match        https://www.spicychat.ai/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @run-at       document-start
+// ==/UserScript==
 
-// Debug mode - set to true to enable console logging for all operations
+// Testing the onboarding flow:
+// Run in browser console: resetSAIToolkitOnboarding()
+// Then reload the page to see the onboarding modal again.
+
+// Debug mode - set to false to disable verbose logging
 const DEBUG_MODE = false;
 
 // Debug logging helper
 function debugLog(...args) {
     if (DEBUG_MODE) {
-        console.log('[S.AI Toolkit]', ...args);
+        console.log(...args);
     }
 }
 
-debugLog('[S.AI Toolkit] Content script starting...');
-debugLog('[S.AI Toolkit] URL:', window.location.href);
-debugLog('[S.AI Toolkit] Document ready state:', document.readyState);
-
-// Inject debug functions into page context using external file (MV3 compatible - no inline scripts)
-const debugScript = document.createElement('script');
-// Use runtime API if available (extensions), otherwise fall back to relative path
-if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) {
-    debugScript.src = chrome.runtime.getURL('page-context.js');
-} else if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.getURL) {
-    debugScript.src = browser.runtime.getURL('page-context.js');
-} else {
-    // Fallback for non-extension environments
-    debugScript.src = 'page-context.js';
-}
-(document.head || document.documentElement).appendChild(debugScript);
-debugScript.remove();
-
-// Listen for debug requests from page context
-window.addEventListener('message', async (event) => {
-    if (event.source !== window) return;
-    
-    if (event.data.type === 'SAI_DEBUG_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_DEBUG_STATS_RESPONSE', stats: {} }, '*');
-            return;
-        }
-        
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        const stats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
-        window.postMessage({ type: 'SAI_DEBUG_STATS_RESPONSE', stats }, '*');
-    }
-    
-    if (event.data.type === 'SAI_CLEAR_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_CLEAR_STATS_RESPONSE' }, '*');
-            return;
-        }
-        
-        await new Promise((resolve) => {
-            storage.set({ messageGenerationStats: '{}' }, () => resolve());
-        });
-        
-        window.postMessage({ type: 'SAI_CLEAR_STATS_RESPONSE' }, '*');
-    }
-    
-    if (event.data.type === 'SAI_EXPORT_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_EXPORT_STATS_RESPONSE', stats: {} }, '*');
-            return;
-        }
-        
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        let stats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
-        
-        // If conversationId specified, export only that conversation
-        if (event.data.conversationId && stats[event.data.conversationId]) {
-            stats = { [event.data.conversationId]: stats[event.data.conversationId] };
-        }
-        
-        window.postMessage({ type: 'SAI_EXPORT_STATS_RESPONSE', stats }, '*');
-    }
-    
-    if (event.data.type === 'SAI_IMPORT_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_IMPORT_STATS_RESPONSE' }, '*');
-            return;
-        }
-        
-        // Get existing stats
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        let existingStats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
-        const importedStats = event.data.jsonData;
-        
-        // Merge imported stats with existing (imported takes precedence)
-        const mergedStats = { ...existingStats, ...importedStats };
-        
-        await new Promise((resolve) => {
-            storage.set({ messageGenerationStats: JSON.stringify(mergedStats) }, () => resolve());
-        });
-        
-        window.postMessage({ type: 'SAI_IMPORT_STATS_RESPONSE' }, '*');
-    }
-});
-
-'use strict';
-
-// =============================================================================
-// INJECT XHR/FETCH INTERCEPTION INTO PAGE CONTEXT - IMMEDIATELY
-// This MUST happen at document_start to catch the initial GET /messages call
-// =============================================================================
-
-debugLog('[Stats] Injecting XHR/Fetch interception into page context (EARLY)...');
-
-// Pass DEBUG_MODE to the page context
-window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
-
-// Inject the intercept script as external file (MV3 compatible - no inline scripts)
-const interceptScript = document.createElement('script');
-if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) {
-    interceptScript.src = chrome.runtime.getURL('xhr-intercept.js');
-} else if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.getURL) {
-    interceptScript.src = browser.runtime.getURL('xhr-intercept.js');
-} else {
-    interceptScript.src = 'xhr-intercept.js';
-}
-
-// Inject the script into the page IMMEDIATELY
-(document.head || document.documentElement).appendChild(interceptScript);
-interceptScript.remove(); // Clean up after injection
-debugLog('[Stats] Injection script added to page context (EARLY)');
-
-// Storage API wrapper (uses browser.storage.local via storage-wrapper.js)
-// The storage-wrapper.js is loaded first via manifest.json and provides:
-// - storage.get(key, defaultValue)
-// - storage.set(key, value)  
-// - await storage.get(key, defaultValue) - compatibility wrapper
-// - await storage.set(key, value) - compatibility wrapper
-
-(async function() {
+(function() {
     'use strict';
-    
-    debugLog('[Toolkit] Content script loaded - starting initialization...');
-    debugLog('[Toolkit] Storage object available:', typeof storage !== 'undefined');
-
-    // =============================================================================
-    // Note: Automatic migration from Tampermonkey is not possible due to isolated worlds
-    // Users can manually export/import data via the popup UI instead
-    // =============================================================================
 
     // =============================================================================
     // CRITICAL: Early CSS Injection (before React loads)
@@ -176,9 +38,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const SIDEBAR_LAYOUT_KEY = 'enableSidebarLayout';
     const THEME_CUSTOMIZATION_KEY = 'enableThemeCustomization';
     
-    // Get settings with async storage
-    const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-    const themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
+    const sidebarEnabled = GM_getValue(SIDEBAR_LAYOUT_KEY, false);
+    const themeEnabled = GM_getValue(THEME_CUSTOMIZATION_KEY, false);
     
     // Inject shared composer CSS if EITHER feature is enabled
     if (sidebarEnabled || themeEnabled) {
@@ -819,7 +680,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Wait for DOM to be ready before running main code
     // =============================================================================
     
-    async function initializeMainCode() {
+    function initializeMainCode() {
         debugLog('[Toolkit] DOM ready, initializing main code...');
 
     // =============================================================================
@@ -839,191 +700,29 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let pendingMessageStats = null; // Store stats temporarily until message appears in DOM
     let loadedMessageIds = []; // Store message IDs from GET /messages response
     let messageIdToIndexMap = {}; // Map message IDs to their order in the conversation
-    let currentConversationId = null; // Store the actual conversation ID from API
-
-    // Helper function to safely set HTML content (sanitizes input)
-    function safeSetHTML(element, content) {
-        // For simple text content, use textContent
-        if (!content.includes('<')) {
-            element.textContent = content;
-            return;
-        }
-        
-        // For content with <br> tags, convert to text nodes and actual <br> elements
-        // This avoids innerHTML security warnings while preserving line breaks
-        element.textContent = ''; // Clear existing content
-        const parts = content.split(/<br\s*\/?>/i);
-        parts.forEach((part, index) => {
-            if (part) {
-                element.appendChild(document.createTextNode(part));
-            }
-            if (index < parts.length - 1) {
-                element.appendChild(document.createElement('br'));
-            }
-        });
-    }
-
-    // Build index map from stored message stats (for imported/old messages)
-    async function buildIndexMapFromStats() {
-        debugLog('[Stats] buildIndexMapFromStats starting...');
-        
-        const messageStats = await loadMessageStats();
-        debugLog('[Stats] Loaded message stats, top-level keys (characters):', Object.keys(messageStats));
-        
-        // Get current character and conversation IDs
-        const characterId = getCurrentCharacterId();
-        // Use the conversation ID from API, fallback to URL, then '_default'
-        let conversationId = currentConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID in URL, use '_default'
-        if (!conversationId) {
-            conversationId = '_default';
-        }
-        
-        debugLog('[Stats] Current character ID:', characterId, 'conversation ID:', conversationId, '(from API:', currentConversationId, ')');
-        
-        let messageIds = [];
-        let messageData = {};
-        
-        // Navigate character → conversation → messages
-        if (characterId && messageStats[characterId]?.[conversationId]) {
-            debugLog('[Stats] Found messages for character/conversation');
-            messageData = messageStats[characterId][conversationId];
-            messageIds = Object.keys(messageData);
-            debugLog('[Stats] Found', messageIds.length, 'messages in conversation');
-        } else {
-            debugLog('[Stats] No messages found for current character/conversation');
-        }
-        
-        debugLog('[Stats] Found message IDs:', messageIds.length, messageIds.slice(0, 5));
-        
-        // Sort messages by timestamp (oldest first)
-        const sortedIds = messageIds.sort((a, b) => {
-            const aTime = messageData[a]?.timestamp || 0;
-            const bTime = messageData[b]?.timestamp || 0;
-            return aTime - bTime;
-        });
-        
-        // Build index map - this maps sequential index to message IDs
-        // This is only used as a fallback when extractMessageId() fails
-        sortedIds.forEach((id, index) => {
-            messageIdToIndexMap[index] = id;
-        });
-        
-        debugLog('[Stats] Built index map from storage:', Object.keys(messageIdToIndexMap).length, 'messages');
-        debugLog('[Stats] First 5 mappings:', Object.keys(messageIdToIndexMap).slice(0, 5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
-    }
 
     // Load message stats from storage
-    async function loadMessageStats() {
-        const stored = await storage.get(MESSAGE_STATS_KEY, '{}');
+    function loadMessageStats() {
+        const stored = GM_getValue(MESSAGE_STATS_KEY, '{}');
         return JSON.parse(stored);
     }
 
     // Save message stats to storage
-    async function saveMessageStats(messageStats) {
-        await storage.set(MESSAGE_STATS_KEY, JSON.stringify(messageStats));
+    function saveMessageStats(messageStats) {
+        GM_setValue(MESSAGE_STATS_KEY, JSON.stringify(messageStats));
+    }
+
+    // Store stats for a specific message ID
+    function storeStatsForMessage(messageId, stats) {
+        const messageStats = loadMessageStats();
+        messageStats[messageId] = stats;
+        saveMessageStats(messageStats);
     }
 
     // Get stats for a specific message ID
-    async function getStatsForMessage(messageId) {
-        const messageStats = await loadMessageStats();
-        const characterId = getCurrentCharacterId();
-        // Use the conversation ID from API, fallback to URL, then '_default'
-        let conversationId = currentConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID, use '_default'
-        if (!conversationId) {
-            conversationId = '_default';
-        }
-        
-        debugLog('[Stats] getStatsForMessage - characterId:', characterId, 'conversationId:', conversationId, '(from API:', currentConversationId, ') messageId:', messageId);
-        
-        // New format: character -> conversation -> message
-        if (characterId && messageStats[characterId]?.[conversationId]?.[messageId]) {
-            debugLog('[Stats] getStatsForMessage - found in new format');
-            return messageStats[characterId][conversationId][messageId];
-        }
-        
-        debugLog('[Stats] getStatsForMessage - not found');
-        return null;
-    }
-    
-    // Get current character ID from URL
-    function getCurrentCharacterId() {
-        // URL structure: /chat/{character_id} or /chat/{character_id}/{conversation_id}
-        const match = window.location.pathname.match(/\/chat\/([a-f0-9-]+)/);
-        if (match) {
-            debugLog('[Stats] getCurrentCharacterId - from URL:', match[1]);
-            return match[1];
-        }
-        
-        // Fallback: Try /chatbot/ pattern if on character profile page
-        const chatbotMatch = window.location.pathname.match(/\/chatbot\/([a-f0-9-]+)/);
-        if (chatbotMatch) {
-            debugLog('[Stats] getCurrentCharacterId - from /chatbot/ URL:', chatbotMatch[1]);
-            return chatbotMatch[1];
-        }
-        
-        debugLog('[Stats] getCurrentCharacterId - not found, URL:', window.location.pathname);
-        return null;
-    }
-    
-    // Get current conversation ID from URL
-    function getCurrentConversationId() {
-        // URL structure: /chat/{character_id}/{conversation_id}
-        // If only /chat/{character_id}, conversation_id will be null (defaults to most recent)
-        const match = window.location.pathname.match(/\/chat\/[a-f0-9-]+\/([a-f0-9-]+)/);
-        const convId = match ? match[1] : null;
-        debugLog('[Stats] getCurrentConversationId - URL:', window.location.pathname, 'extracted:', convId);
-        return convId;
-    }
-    
-    // Migrate old format to new format
-    // Store stats for a specific message ID (character → conversation → message hierarchy)
-    async function storeStatsForMessage(messageId, stats, explicitConversationId = null) {
-        const messageStats = await loadMessageStats();
-        const characterId = getCurrentCharacterId();
-        let conversationId = explicitConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID, use '_default' as fallback
-        if (!conversationId) {
-            conversationId = '_default';
-            debugLog('[Stats] No conversation ID provided, using _default');
-        }
-        
-        if (!characterId) {
-            debugLog('[Stats] Warning: Missing character ID - cannot store stats');
-            return;
-        }
-        
-        debugLog('[Stats] Storing stats - character:', characterId, 'conversation:', conversationId, 'message:', messageId);
-        debugLog('[Stats] Input stats object:', stats);
-        debugLog('[Stats] Extracted - model:', stats.model, 'settings:', stats.settings);
-        
-        // Ensure character object exists
-        if (!messageStats[characterId]) {
-            messageStats[characterId] = {};
-        }
-        
-        // Ensure conversation object exists
-        if (!messageStats[characterId][conversationId]) {
-            messageStats[characterId][conversationId] = {};
-        }
-        
-        // Store with new field names and flattened structure
-        messageStats[characterId][conversationId][messageId] = {
-            model: stats.model || null,
-            max_tokens: stats.settings?.max_new_tokens || stats.max_tokens || null,
-            temperature: stats.settings?.temperature || stats.temperature || null,
-            top_p: stats.settings?.top_p || stats.top_p || null,
-            top_k: stats.settings?.top_k || stats.top_k || null,
-            timestamp: stats.createdAt || stats.timestamp || null
-        };
-        
-        debugLog('[Stats] Stored data:', messageStats[characterId][conversationId][messageId]);
-        debugLog('[Stats] Stored for character:', characterId, 'conversation:', conversationId, 'message:', messageId);
-        await saveMessageStats(messageStats);
+    function getStatsForMessage(messageId) {
+        const messageStats = loadMessageStats();
+        return messageStats[messageId] || null;
     }
 
     // Extract message ID from DOM element
@@ -1031,9 +730,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Method 1: Check for data-message-id attribute
         let messageElement = container.closest('[data-message-id]');
         if (messageElement) {
-            const id = messageElement.getAttribute('data-message-id');
-            debugLog('[Stats] extractMessageId - Method 1 (data-message-id):', id);
-            return id;
+            return messageElement.getAttribute('data-message-id');
         }
         
         // Method 2: Look for message ID in React props
@@ -1046,18 +743,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 const props = current[reactKey];
                 
                 // Try different paths to find message ID
-                if (props?.message?.id) {
-                    debugLog('[Stats] extractMessageId - Method 2 (React props.message.id):', props.message.id);
-                    return props.message.id;
-                }
-                if (props?.children?.props?.message?.id) {
-                    debugLog('[Stats] extractMessageId - Method 2 (React children):', props.children.props.message.id);
-                    return props.children.props.message.id;
-                }
-                if (props?.memoizedProps?.message?.id) {
-                    debugLog('[Stats] extractMessageId - Method 2 (React memoized):', props.memoizedProps.message.id);
-                    return props.memoizedProps.message.id;
-                }
+                if (props?.message?.id) return props.message.id;
+                if (props?.children?.props?.message?.id) return props.children.props.message.id;
+                if (props?.memoizedProps?.message?.id) return props.memoizedProps.message.id;
             }
             current = current.parentElement;
         }
@@ -1070,32 +758,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (reactKey && btn[reactKey]?.onClick) {
                 const handler = btn[reactKey].onClick.toString();
                 const uuidMatch = handler.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                if (uuidMatch) {
-                    debugLog('[Stats] extractMessageId - Method 3 (button handler):', uuidMatch[0]);
-                    return uuidMatch[0];
-                }
+                if (uuidMatch) return uuidMatch[0];
             }
         }
         
-        debugLog('[Stats] extractMessageId - ALL METHODS FAILED');
         return null;
     }
 
     // Format timestamp according to system's locale settings
-    async function formatTimestamp(timestamp) {
+    function formatTimestamp(timestamp) {
         if (!timestamp) return null; // Return null instead of current time
         
         // Handle both Unix timestamp (number) and ISO string
         const date = typeof timestamp === 'number' ? new Date(timestamp) : new Date(timestamp);
-        debugLog('[Stats] formatTimestamp input:', timestamp, 'UTC date:', date.toISOString());
-        const formatted = await formatDate(date);
-        debugLog('[Stats] formatTimestamp output:', formatted);
-        return formatted;
+        return formatDate(date);
     }
     
-    async function formatDate(date) {
+    function formatDate(date) {
         // Get user preference for timestamp format (true = date@time, false = time@date)
-        const dateFirst = await storage.get('timestampDateFirst', true);
+        const dateFirst = GM_getValue('timestampDateFirst', true);
         
         // Use UTC methods to get correct time (timestamps are stored as UTC milliseconds)
         const year = date.getUTCFullYear();
@@ -1105,12 +786,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const minutes = String(date.getUTCMinutes()).padStart(2, '0');
         const seconds = String(date.getUTCSeconds()).padStart(2, '0');
         
-        debugLog('[Stats] formatDate components - year:', year, 'month:', month, 'day:', day, 'hours:', hours, 'minutes:', minutes, 'seconds:', seconds);
-        
         const dateStr = `${month}/${day}/${year}`;
         const timeStr = `${hours}:${minutes}:${seconds}`;
-        
-        debugLog('[Stats] formatDate - dateFirst:', dateFirst, 'dateStr:', dateStr, 'timeStr:', timeStr);
         
         // Return format based on user preference
         return dateFirst ? `${dateStr} @ ${timeStr}` : `${timeStr} @ ${dateStr}`;
@@ -1138,157 +815,169 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         return settings;
     }
 
-    // =============================================================================
-    // MESSAGE LISTENERS FOR NETWORK INTERCEPTION DATA
-    // These handlers receive postMessage events from the injected page-context script
-    // =============================================================================
+    // Intercept XMLHttpRequest to capture generation settings
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
     
-    window.addEventListener('message', async (event) => {
-        if (event.source !== window) return;
-        
-        // Listen for network interception data from page context
-        if (event.data.type === 'SAI_MESSAGES_LOADED') {
-            debugLog('[Stats] Received SAI_MESSAGES_LOADED from page context');
-            const { conversationId, botMessages, userMessages } = event.data;
-            
-            // Store the conversation ID globally for buildIndexMapFromStats to use
-            currentConversationId = conversationId;
-            debugLog('[Stats] Conversation ID from event:', conversationId);
-            debugLog('[Stats] Stored as currentConversationId:', currentConversationId);
-            
-            // Debug: Log first few messages
-            if (botMessages.length > 0) {
-                debugLog('[Stats] Sample bot messages:', botMessages.slice(0, 3).map(m => ({
-                    id: m.id.substring(0, 8),
-                    createdAt: m.createdAt,
-                    time: new Date(m.createdAt).toLocaleTimeString()
-                })));
-            }
-            if (userMessages.length > 0) {
-                debugLog('[Stats] Sample user messages:', userMessages.slice(0, 3).map(m => ({
-                    id: m.id.substring(0, 8),
-                    createdAt: m.createdAt,
-                    time: new Date(m.createdAt).toLocaleTimeString()
-                })));
-            }
-            
-            // Store stats for bot messages
-            for (const msg of botMessages) {
-                if (msg.id) {
-                    // Check if stats already exist in storage (to preserve POST data)
-                    const existingStats = await getStatsForMessage(msg.id);
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._method = method;
+        this._url = url;
+        return originalXHROpen.apply(this, [method, url, ...rest]);
+    };
+    
+    XMLHttpRequest.prototype.send = function(body) {
+        // Check if this is a messages GET request (loading message history)
+        if (this._method === 'GET' && this._url && this._url.includes('/messages')) {
+            this.addEventListener('load', function() {
+                try {
+                    const response = JSON.parse(this.responseText);
                     
-                    // Only update if we don't have stats yet, or if we're adding NEW data
-                    // GET /messages never includes inference_model or inference_settings, so don't overwrite!
-                    if (!existingStats) {
-                        // No stats yet - store whatever we have (likely just timestamp)
-                        const stats = {
-                            role: 'bot',
-                            model: msg.inference_model || null,
-                            settings: msg.inference_settings || null,
-                            createdAt: msg.createdAt || null
-                        };
-                        await storeStatsForMessage(msg.id, stats, conversationId);
-                    } else if (msg.inference_model && msg.inference_settings) {
-                        // We have full inference data (from POST) - update everything
-                        const stats = {
-                            role: 'bot',
-                            model: msg.inference_model,
-                            settings: msg.inference_settings,
-                            createdAt: msg.createdAt || existingStats.createdAt
-                        };
-                        await storeStatsForMessage(msg.id, stats, conversationId);
-                    } else if (!existingStats.role) {
-                        // Add role if missing
-                        existingStats.role = 'bot';
-                        await storeStatsForMessage(msg.id, existingStats, conversationId);
+                    if (response.messages && Array.isArray(response.messages)) {
+                        const botMessages = response.messages.filter(msg => msg.role === 'bot');
+                        const userMessages = response.messages.filter(msg => msg.role === 'user');
+                        
+                        // Store stats for each bot message - always store timestamps
+                        botMessages.forEach((msg) => {
+                            if (msg.id) {
+                                // Check if stats already exist in storage (to preserve POST data)
+                                const existingStats = getStatsForMessage(msg.id);
+                                
+                                // Always store timestamps, even if inference settings are missing
+                                const stats = {
+                                    model: msg.inference_model || existingStats?.model || null,
+                                    settings: msg.inference_settings || existingStats?.settings || null,
+                                    createdAt: msg.createdAt || existingStats?.createdAt || null
+                                };
+                                
+                                // Only store if we have new data or if nothing exists yet
+                                if (!existingStats || msg.inference_model || msg.inference_settings) {
+                                    storeStatsForMessage(msg.id, stats);
+                                }
+                            }
+                        });
+                        
+                        // Store timestamps for user messages
+                        userMessages.forEach((msg) => {
+                            if (msg.id) {
+                                const existingStats = getStatsForMessage(msg.id);
+                                if (!existingStats || !existingStats.createdAt) {
+                                    const stats = {
+                                        model: null,
+                                        settings: null,
+                                        createdAt: msg.createdAt || null
+                                    };
+                                    storeStatsForMessage(msg.id, stats);
+                                }
+                            }
+                        });
+                        
+                        loadedMessageIds = botMessages.map(msg => msg.id).reverse();
+                        
+                        // Create index map for order-based matching
+                        messageIdToIndexMap = {};
+                        loadedMessageIds.forEach((id, index) => {
+                            messageIdToIndexMap[index] = id;
+                        });
                     }
-                    // else: existingStats exist and we have no new model/settings - don't overwrite!
+                } catch (e) {
+                    console.error('[Stats] Error parsing messages response:', e);
                 }
-            }
-            
-            // Store timestamps for user messages
-            for (const msg of userMessages) {
-                if (msg.id) {
-                    const existingStats = await getStatsForMessage(msg.id);
-                    if (!existingStats || !existingStats.createdAt) {
-                        const stats = {
-                            role: 'user',
-                            model: null,
-                            settings: null,
-                            createdAt: msg.createdAt || null
-                        };
-                        await storeStatsForMessage(msg.id, stats, conversationId);
-                    } else if (!existingStats.role) {
-                        // Add role if missing
-                        existingStats.role = 'user';
-                        await storeStatsForMessage(msg.id, existingStats, conversationId);
-                    }
-                }
-            }
-            
-            debugLog('[Stats] Stored stats for', botMessages.length, 'bot messages and', userMessages.length, 'user messages');
-            
-            // Rebuild index map now that we have the conversation ID
-            await buildIndexMapFromStats();
+            });
         }
         
-        if (event.data.type === 'SAI_NEW_MESSAGE') {
-            debugLog('[Stats] Received SAI_NEW_MESSAGE from page context');
-            const { messageId, conversationId, model, settings, createdAt } = event.data;
-            
-            // Store/update the conversation ID
-            if (conversationId) {
-                currentConversationId = conversationId;
-            }
-            
-            debugLog('[Stats] New message - ID:', messageId, 'conversation:', conversationId);
-            
-            if (messageId) {
-                const statsWithTimestamp = {
-                    role: 'bot', // New messages from POST /chat are always bot responses
-                    model: model,
-                    settings: settings,
-                    createdAt: createdAt
-                };
-                await storeStatsForMessage(messageId, statsWithTimestamp, conversationId);
-                debugLog('[Stats] Stored stats for new message:', messageId);
+        // Check if this is a chat generation request
+        if (this._method === 'POST' && this._url && this._url.includes('/chat')) {
+            try {
+                const parsedBody = JSON.parse(body);
                 
-                // Rebuild index map with the new message
-                await buildIndexMapFromStats();
-                
-                // Trigger stats insertion after delays to let DOM update
-                setTimeout(() => insertStatsForAllMessages(), 500);
-                setTimeout(() => insertStatsForAllMessages(), 1500);
+                if (parsedBody.inference_model && parsedBody.inference_settings) {
+                    lastGenerationSettings = {
+                        model: parsedBody.inference_model,
+                        settings: parsedBody.inference_settings
+                    };
+                    
+                    // Store as pending until we see the message in DOM
+                    pendingMessageStats = lastGenerationSettings;
+                    
+                    // Listen for the response to get the message ID
+                    this.addEventListener('load', function() {
+                        try {
+                            const response = JSON.parse(this.responseText);
+                            
+                            if (response.message && response.message.id) {
+                                const messageId = response.message.id;
+                                const createdAt = response.message.createdAt || response.message.created_at || null;
+                                
+                                const statsWithTimestamp = {
+                                    ...lastGenerationSettings,
+                                    createdAt: createdAt
+                                };
+                                storeStatsForMessage(messageId, statsWithTimestamp);
+                                
+                                // Add to loaded IDs at the END (newest message goes last in DOM order)
+                                loadedMessageIds.push(messageId);
+                                messageIdToIndexMap = {};
+                                loadedMessageIds.forEach((id, index) => {
+                                    messageIdToIndexMap[index] = id;
+                                });
+                                
+                                // Trigger stats insertion after delays to let DOM update
+                                setTimeout(() => insertStatsForAllMessages(), 500);
+                                setTimeout(() => insertStatsForAllMessages(), 1500);
+                            }
+                        } catch (e) {
+                            console.error('[Stats] Error parsing chat response:', e);
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error('[Stats] Error parsing chat body:', e);
             }
         }
-    });
+        
+        return originalXHRSend.apply(this, [body]);
+    };
+    
+    // Also keep fetch interceptor as backup
+    const originalFetch = window.fetch;
+    window.fetch = function(...args) {
+        const [url, options] = args;
+        
+        // Check if this is a chat generation request
+        if (url && typeof url === 'string' && url.includes('/chat') && options && options.method === 'POST') {
+            try {
+                const body = JSON.parse(options.body);
+                if (body.inference_model && body.inference_settings) {
+                    lastGenerationSettings = {
+                        model: body.inference_model,
+                        settings: body.inference_settings
+                    };
+                }
+            } catch (e) {
+                console.error('[Stats] Error parsing fetch body:', e);
+            }
+        }
+        
+        return originalFetch.apply(this, args);
+    };
 
     // Load profiles from storage
-    async function loadProfiles() {
-        const stored = await storage.get(PROFILES_KEY, '{}');
+    function loadProfiles() {
+        const stored = GM_getValue(PROFILES_KEY, '{}');
         return JSON.parse(stored);
     }
 
     // Save profiles to storage
-    async function saveProfiles(profiles) {
-        await storage.set(PROFILES_KEY, JSON.stringify(profiles));
+    function saveProfiles(profiles) {
+        GM_setValue(PROFILES_KEY, JSON.stringify(profiles));
     }
 
     // Change the model by clicking on it in the model selection modal
     function changeModel(modelName, callback) {
-        // First, find the settings modal using the correct class selector
-        const modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2, div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]');
-        
+        // First, click the "Change Model" button
+        const modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full)');
         if (!modal) {
-            callback(false, 'Settings modal not found');
-            return;
-        }
-        
-        // Verify it's the Generation Settings modal
-        const heading = modal.querySelector('p.text-heading-6');
-        if (!heading || !heading.textContent.includes('Generation Settings')) {
-            callback(false, 'Settings modal not found');
+            callback(false, 'Generation Settings modal not found');
             return;
         }
         
@@ -1297,7 +986,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         );
         
         if (!changeModelBtn) {
-            callback(false, 'Change Model button not found');
+            callback(false, '"Change Model" button not found');
             return;
         }
         
@@ -1306,68 +995,60 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Wait for the model selection modal to appear
         setTimeout(() => {
-            // Find the model selection modal
-            const allModals = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2, div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]'));
-            const modelModal = allModals.find(el => {
-                const text = el.textContent;
-                return text.includes('Select a model') || text.includes('Choose Model') || text.includes('Select Model');
-            });
+            // Find the model selection modal - it's the one with "Select a model" text
+            const selectionModal = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2')).find(m => 
+                m.textContent.includes('Select a model')
+            );
             
-            if (!modelModal) {
-                callback(false, 'Model selection modal did not appear');
+            if (!selectionModal) {
+                callback(false, 'Model selection modal not found');
                 return;
             }
             
-            // Find the model option by matching the text content (using includes for flexibility)
-            const modelOptions = Array.from(modelModal.querySelectorAll('li, button, div[role="option"], p.text-label-lg'));
-            const modelOption = modelOptions.find(el => {
-                const text = el.textContent.trim();
-                // Try exact match first, then check if the model name is contained in the text
-                return text === modelName || text.includes(modelName);
+            // Find all model buttons in the selection modal
+            const modelButtons = Array.from(selectionModal.querySelectorAll('button'));
+            
+            // Find the button with the matching model name
+            const targetModelBtn = modelButtons.find(btn => {
+                const modelNameElement = btn.querySelector('.text-\\[14px\\].font-medium');
+                if (modelNameElement) {
+                    return modelNameElement.textContent.trim() === modelName;
+                }
+                return false;
             });
             
-            if (!modelOption) {
-                // Close the modal
-                const closeBtn = modelModal.querySelector('button[aria-label="X-button"], button[aria-label="Close"]') ||
-                                Array.from(modelModal.querySelectorAll('button')).find(btn => 
-                                    btn.textContent.includes('Close')
-                                );
-                if (closeBtn) closeBtn.click();
-                callback(false, `Model "${modelName}" not found in list`);
+            if (!targetModelBtn) {
+                callback(false, `Model "${modelName}" not found in selection list`);
                 return;
             }
             
-            // Click the model option
-            modelOption.click();
+            // Click the model button to select it
+            targetModelBtn.click();
             
-            // Wait for React to process and look for "Set Model" button
+            // Wait for the selection to register and "Set Model" button to appear
             setTimeout(() => {
-                // Find and click the "Set Model" button
-                const setModelBtn = Array.from(modelModal.querySelectorAll('button')).find(btn => 
+                // Find the "Set Model" button in the selection modal
+                const setModelBtn = Array.from(selectionModal.querySelectorAll('button')).find(btn => 
                     btn.textContent.includes('Set Model')
                 );
                 
-                if (setModelBtn) {
-                    setModelBtn.click();
-                    debugLog('[Change Model] Clicked "Set Model" button');
-                    
-                    // Wait a bit for the model to be set, then report success
-                    setTimeout(() => {
-                        callback(true, 'Model changed successfully');
-                    }, 500);
-                } else {
-                    debugLog('[Change Model] "Set Model" button not found');
+                if (!setModelBtn) {
                     callback(false, '"Set Model" button not found');
+                    return;
                 }
-            }, 800);
+                
+                // Click "Set Model" to confirm the selection
+                setModelBtn.click();
+                
+                // Success - "Set Model" already persists the changes
+                callback(true, 'Model changed successfully');
+            }, 300);
         }, 500);
     }
 
     // Apply settings to the modal
     async function applySettings(settings, autoChangeModel = false) {
-        // Find the settings modal using the correct class selector
-        const modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2:has(button[aria-label="X-button"]), div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]:has(button[aria-label="X-button"])');
-        
+        const modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2:has(button[aria-label="X-button"])');
         if (!modal) return false;
 
         const sliders = modal.querySelectorAll('input[type="range"]');
@@ -1434,8 +1115,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function createProfileControls() {
         debugLog('[Profile Controls] Function called. Flag:', isCreatingProfileControls);
         
-        // Find the Generation Settings modal using correct selector
-        const modals = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2, div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]'));
+        // Find the Generation Settings modal specifically (not Memory Manager)
+        const modals = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2'));
         const modal = modals.find(m => {
             const heading = m.querySelector('p.text-heading-6');
             return heading && heading.textContent.includes('Generation Settings');
@@ -1503,7 +1184,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Populate dropdown
         const profiles = await loadProfiles();
-        const lastProfile = await storage.get(LAST_PROFILE_KEY, '');
+        const lastProfile = GM_getValue(LAST_PROFILE_KEY, '');
         
         const defaultOption = document.createElement('option');
         defaultOption.value = '';
@@ -1529,7 +1210,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     const profileSettings = profiles[profileName];
                     const autoChange = true; // Always auto-change model
                     applySettings(profileSettings, autoChange);
-                    await storage.set(LAST_PROFILE_KEY, profileName);
+                    GM_setValue(LAST_PROFILE_KEY, profileName);
                     
                     // Poll for the Generation Settings modal to reappear, then scroll
                     let pollAttempts = 0;
@@ -1592,7 +1273,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     // Refresh dropdown
                     updateProfileDropdown();
                     select.value = profileName.trim();
-                    await storage.set(LAST_PROFILE_KEY, profileName.trim());
+                    GM_setValue(LAST_PROFILE_KEY, profileName.trim());
                     
                     showNotification(`Saved profile: ${profileName.trim()}`);
                 }
@@ -1706,7 +1387,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         defaultOption.textContent = '-- Select Profile --';
         select.appendChild(defaultOption);
 
-        Object.keys(profiles).sort().forEach(async name => {
+        Object.keys(profiles).sort().forEach(name => {
             const option = document.createElement('option');
             option.value = name;
             const profile = profiles[name];
@@ -1801,7 +1482,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let pageJumpObserver = null;
     
     // Apply or remove sidebar layout CSS
-    async function toggleSidebarLayout(enable) {
+    function toggleSidebarLayout(enable) {
         if (enable) {
             if (!sidebarStyleElement) {
                 sidebarStyleElement = document.createElement('style');
@@ -1821,11 +1502,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 sidebarStyleElement.disabled = true;
             }
         }
-        await storage.set(SIDEBAR_LAYOUT_KEY, enable);
+        GM_setValue(SIDEBAR_LAYOUT_KEY, enable);
     }
     
     // Apply or remove theme customization CSS
-    async function toggleThemeCustomization(enable) {
+    function toggleThemeCustomization(enable) {
         if (enable) {
             if (!themeStyleElement) {
                 themeStyleElement = document.createElement('style');
@@ -1839,7 +1520,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 themeStyleElement = null;
             }
         }
-        await storage.set(THEME_CUSTOMIZATION_KEY, enable);
+        GM_setValue(THEME_CUSTOMIZATION_KEY, enable);
     }
     
     // Hide For You functionality
@@ -1856,7 +1537,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     function hideForYouCharacters() {
         const characterTiles = document.querySelectorAll('.relative.group.rounded-xl.bg-gray-3');
-        characterTiles.forEach(async tile => {
+        characterTiles.forEach(tile => {
             const forYouBadge = tile.querySelector('.bg-purple-9 p.text-white');
             if (forYouBadge && forYouBadge.textContent.trim() === 'For You') {
                 const parentWrapper = tile.parentElement;
@@ -1880,22 +1561,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 stopHideForYou();
                 return;
             }
-            // Early return if mutations are not in relevant areas
-            let hasRelevantMutation = false;
-            for (const mutation of mutations) {
-                if (mutation.addedNodes.length > 0) {
-                    // Check if mutation is in character grid area
-                    const target = mutation.target;
-                    if (target.classList && (target.classList.contains('grid') || 
-                        target.classList.contains('gap-4') || 
-                        target.closest('.grid.gap-4'))) {
-                        hasRelevantMutation = true;
-                        break;
-                    }
-                }
-            }
-            if (!hasRelevantMutation) return;
-            
             let needsHiding = false;
             for (const mutation of mutations) {
                 if (mutation.addedNodes.length > 0) {
@@ -1914,7 +1579,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 if (needsHiding) break;
             }
-            
             if (needsHiding) {
                 setTimeout(hideForYouCharacters, 100);
             }
@@ -1937,7 +1601,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     function restoreForYouCharacters() {
         const hiddenWrappers = document.querySelectorAll('[data-hidden-by-script="true"]');
-        hiddenWrappers.forEach(async wrapper => {
+        hiddenWrappers.forEach(wrapper => {
             wrapper.style.cssText = '';
             delete wrapper.dataset.hiddenByScript;
         });
@@ -1951,7 +1615,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
     }
     
-    async function toggleHideForYou(enable) {
+    function toggleHideForYou(enable) {
         if (enable) {
             checkHideForYouPage();
             
@@ -1973,14 +1637,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 hideForYouUrlObserver = null;
             }
         }
-        await storage.set(HIDE_FOR_YOU_KEY, enable);
+        GM_setValue(HIDE_FOR_YOU_KEY, enable);
     }
     
     // Page Jump functionality
     function getTotalPages() {
         const pageButtons = document.querySelectorAll('button[aria-label^="page-"]');
         let maxPage = 1;
-        pageButtons.forEach(async button => {
+        pageButtons.forEach(button => {
             const label = button.getAttribute('aria-label');
             if (label && label.startsWith('page-')) {
                 const pageNum = label.replace('page-', '');
@@ -2031,50 +1695,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const modal = document.createElement('div');
         modal.style.cssText = `background: ${isDark ? '#1a1a1a' : '#ffffff'}; border-radius: 12px; padding: 24px; min-width: 320px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);`;
         
-        // Use safe HTML construction to avoid innerHTML security warnings
-        const h2 = document.createElement('h2');
-        h2.style.cssText = `font-size: 20px; font-weight: 600; margin-bottom: 16px; color: ${isDark ? '#fff' : '#000'};`;
-        h2.textContent = 'Jump to Page';
-        
-        const p = document.createElement('p');
-        p.style.cssText = `font-size: 14px; margin-bottom: 16px; color: ${isDark ? '#a1a1aa' : '#666'};`;
-        p.textContent = `Enter a page number between 1 and ${totalPages}`;
-        
-        const input = document.createElement('input');
-        input.type = 'number';
-        input.id = 'page-jump-input';
-        input.min = '1';
-        input.max = totalPages.toString();
-        input.value = currentPage.toString();
-        input.placeholder = 'Page number';
-        input.style.cssText = `width: 100%; padding: 10px 12px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; border-radius: 8px; font-size: 16px; margin-bottom: 20px; background: ${isDark ? '#27272a' : '#fff'}; color: ${isDark ? '#fff' : '#000'};`;
-        
-        const buttonContainer = document.createElement('div');
-        buttonContainer.style.cssText = 'display: flex; gap: 12px; justify-content: flex-end;';
-        
-        const cancelBtn = document.createElement('button');
-        cancelBtn.id = 'page-jump-cancel';
-        cancelBtn.textContent = 'Cancel';
-        cancelBtn.style.cssText = `padding: 8px 16px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; background: transparent; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; color: ${isDark ? '#fff' : '#000'}; transition: all 0.2s;`;
-        
-        const okBtn = document.createElement('button');
-        okBtn.id = 'page-jump-ok';
-        okBtn.textContent = 'Go to Page';
-        okBtn.style.cssText = 'padding: 8px 16px; border: none; background: #0072F5; color: white; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s;';
-        
-        buttonContainer.appendChild(cancelBtn);
-        buttonContainer.appendChild(okBtn);
-        
-        modal.appendChild(h2);
-        modal.appendChild(p);
-        modal.appendChild(input);
-        modal.appendChild(buttonContainer);
+        modal.innerHTML = `
+            <h2 style="font-size: 20px; font-weight: 600; margin-bottom: 16px; color: ${isDark ? '#fff' : '#000'};">Jump to Page</h2>
+            <p style="font-size: 14px; margin-bottom: 16px; color: ${isDark ? '#a1a1aa' : '#666'};">Enter a page number between 1 and ${totalPages}</p>
+            <input type="number" id="page-jump-input" min="1" max="${totalPages}" value="${currentPage}" placeholder="Page number" style="width: 100%; padding: 10px 12px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; border-radius: 8px; font-size: 16px; margin-bottom: 20px; background: ${isDark ? '#27272a' : '#fff'}; color: ${isDark ? '#fff' : '#000'};" />
+            <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                <button id="page-jump-cancel" style="padding: 8px 16px; border: 1px solid ${isDark ? '#3f3f46' : '#ccc'}; background: transparent; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; color: ${isDark ? '#fff' : '#000'}; transition: all 0.2s;">Cancel</button>
+                <button id="page-jump-ok" style="padding: 8px 16px; border: none; background: #0072F5; color: white; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s;">Go to Page</button>
+            </div>
+        `;
         
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
         
-        const inputElement = document.getElementById('page-jump-input');
-        setTimeout(() => { inputElement.focus(); inputElement.select(); }, 100);
+        const input = document.getElementById('page-jump-input');
+        setTimeout(() => { input.focus(); input.select(); }, 100);
         
         const okButton = document.getElementById('page-jump-ok');
         const cancelButton = document.getElementById('page-jump-cancel');
@@ -2082,7 +1717,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         function closeModal() { overlay.remove(); }
         
         function handleSubmit() {
-            const pageNumber = parseInt(inputElement.value);
+            const pageNumber = parseInt(input.value);
             if (isNaN(pageNumber)) {
                 alert('Please enter a valid page number');
                 return;
@@ -2096,9 +1731,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         cancelButton.addEventListener('click', closeModal);
-        overlay.addEventListener('click', async (e) => { if (e.target === overlay) closeModal(); });
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
         okButton.addEventListener('click', handleSubmit);
-        inputElement.addEventListener('keypress', async (e) => { if (e.key === 'Enter') handleSubmit(); });
+        input.addEventListener('keypress', (e) => { if (e.key === 'Enter') handleSubmit(); });
         document.addEventListener('keydown', function escapeHandler(e) {
             if (e.key === 'Escape') {
                 closeModal();
@@ -2111,14 +1746,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const ellipsisButtons = document.querySelectorAll('button[aria-label="page-..."]');
         if (ellipsisButtons.length === 0) return;
         
-        ellipsisButtons.forEach(async ellipsisButton => {
+        ellipsisButtons.forEach(ellipsisButton => {
             if (ellipsisButton.dataset.enhanced === 'true') return;
             ellipsisButton.dataset.enhanced = 'true';
             ellipsisButton.classList.remove('cursor-default');
             ellipsisButton.classList.add('cursor-pointer');
             ellipsisButton.classList.remove('undefined');
             
-            ellipsisButton.addEventListener('click', async (e) => {
+            ellipsisButton.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 showPageJumpModal();
@@ -2126,7 +1761,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         });
     }
     
-    async function togglePageJump(enable) {
+    function togglePageJump(enable) {
         if (enable) {
             setTimeout(enhanceEllipsisButton, 1000);
             
@@ -2162,15 +1797,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 pageJumpObserver = null;
             }
         }
-        await storage.set(PAGE_JUMP_KEY, enable);
+        GM_setValue(PAGE_JUMP_KEY, enable);
     }
     
     // Initialize features on page load
-    async function initializeStyles() {
-        const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-        const themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
-        const hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
-        const pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
+    function initializeStyles() {
+        const sidebarEnabled = GM_getValue(SIDEBAR_LAYOUT_KEY, false);
+        const themeEnabled = GM_getValue(THEME_CUSTOMIZATION_KEY, false);
+        const hideForYouEnabled = GM_getValue(HIDE_FOR_YOU_KEY, false);
+        const pageJumpEnabled = GM_getValue(PAGE_JUMP_KEY, false);
         
         debugLog('[Toolkit] Initializing with settings:', {
             sidebar: sidebarEnabled,
@@ -2198,7 +1833,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         if (hideForYouEnabled) {
-            await toggleHideForYou(true);
+            toggleHideForYou(true);
         } else {
             // Ensure any previously hidden characters are restored on page load
             setTimeout(() => {
@@ -2206,7 +1841,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }, 1000);
         }
         if (pageJumpEnabled) {
-            await togglePageJump(true);
+            togglePageJump(true);
         }
     }
 
@@ -2308,7 +1943,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         // Add click handler
-        clonedButton.addEventListener('click', async function(e) {
+        clonedButton.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             showToolkitSettingsModal();
@@ -2383,7 +2018,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Insert after the Help button wrapper
         helpButtonWrapper.parentNode.insertBefore(buttonWrapper, helpButtonWrapper.nextSibling);
-        
         debugLog('[Toolkit] Sidebar button injected successfully');
     }
     
@@ -2419,7 +2053,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         </svg>`;
         
         // Add click handler
-        toolkitBtn.addEventListener('click', async function(e) {
+        toolkitBtn.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             showToolkitSettingsModal();
@@ -2431,10 +2065,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }
     
     // Function to show toolkit settings modal
-    async function showToolkitSettingsModal() {
+    function showToolkitSettingsModal() {
     debugLog('[Toolkit] ===== OPENING SETTINGS MODAL =====');
-    debugLog('[Toolkit] Current Sidebar Layout enabled?', await storage.get(SIDEBAR_LAYOUT_KEY, false));
-    debugLog('[Toolkit] Current Theme Customization enabled?', await storage.get(THEME_CUSTOMIZATION_KEY, false));        // Create or get a dedicated container with SHADOW DOM for complete isolation
+    debugLog('[Toolkit] Current Sidebar Layout enabled?', GM_getValue(SIDEBAR_LAYOUT_KEY, false));
+    debugLog('[Toolkit] Current Theme Customization enabled?', GM_getValue(THEME_CUSTOMIZATION_KEY, false));        // Create or get a dedicated container with SHADOW DOM for complete isolation
         let toolkitRoot = document.getElementById('toolkit-modal-root');
         if (!toolkitRoot) {
             debugLog('[Toolkit] Creating new toolkit-modal-root with Shadow DOM');
@@ -2586,18 +2220,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     display: flex;
                     gap: 0.5rem;
                 }
-                .version-text {
-                    margin-top: 1rem;
-                    text-align: center;
-                    font-size: 12px;
-                    color: #9ca3af;
-                    font-weight: 400;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .version-text {
-                        color: #6b7280;
-                    }
-                }
                 .btn-data {
                     flex: 1;
                     padding: 0.5rem 0.75rem;
@@ -2676,12 +2298,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         
         // State tracking
-        let sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-        let themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
-        let hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
-        let pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
-        let showStatsEnabled = await storage.get('showGenerationStats', false);
-        let timestampDateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
+        let sidebarEnabled = GM_getValue(SIDEBAR_LAYOUT_KEY, false);
+        let themeEnabled = GM_getValue(THEME_CUSTOMIZATION_KEY, false);
+        let hideForYouEnabled = GM_getValue(HIDE_FOR_YOU_KEY, false);
+        let pageJumpEnabled = GM_getValue(PAGE_JUMP_KEY, false);
+        let showStatsEnabled = GM_getValue('showGenerationStats', false);
+        let timestampDateFirst = GM_getValue('timestampDateFirst', true); // true = date@time, false = time@date
         
         debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
         
@@ -2690,50 +2312,49 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const backdrop = document.createElement('div');
         backdrop.className = 'backdrop';
         
-        // Create modal with safe HTML (no dynamic content in innerHTML)
+        // Create modal
         const modal = document.createElement('div');
         modal.className = 'modal';
-        // Using static HTML template - checkboxes will be set programmatically below
         modal.innerHTML = `
             <div class="modal-header">S.AI Toolkit Settings</div>
             <div class="modal-body">
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
+                    <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off" ${sidebarEnabled ? 'checked' : ''}>
                     <div class="setting-text">
                         <div class="setting-title">Sidebar Layout</div>
                         <div class="setting-desc">Pin the Generation Settings and Memories modals to sidebar.</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="theme-checkbox" autocomplete="off">
+                    <input type="checkbox" class="setting-checkbox" id="theme-checkbox" autocomplete="off" ${themeEnabled ? 'checked' : ''}>
                     <div class="setting-text">
                         <div class="setting-title">Classic Theme</div>
                         <div class="setting-desc">Applies the classic colors and message box styling. Credit goes to <strong>MssAcc</strong> on Discord.</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
+                    <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off" ${hideForYouEnabled ? 'checked' : ''}>
                     <div class="setting-text">
                         <div class="setting-title">Hide "For You" Characters</div>
                         <div class="setting-desc">Hide character tiles with purple "For You" badge on page 1</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off">
+                    <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off" ${pageJumpEnabled ? 'checked' : ''}>
                     <div class="setting-text">
                         <div class="setting-title">Page Jump Modal</div>
                         <div class="setting-desc">Click "..." pagination button to jump to any page</div>
                     </div>
                 </label>
                 <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
+                    <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off" ${showStatsEnabled ? 'checked' : ''}>
                     <div class="setting-text">
                         <div class="setting-title">Show generation model stats and timestamp in messages</div>
                         <div class="setting-desc">Display model info and timestamps below bot messages (only for new messages)</div>
                     </div>
                 </label>
-                <label class="sub-setting-row hidden" id="timestamp-format-row">
-                    <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off">
+                <label class="sub-setting-row ${showStatsEnabled ? '' : 'hidden'}" id="timestamp-format-row">
+                    <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off" ${timestampDateFirst ? 'checked' : ''}>
                     <div class="sub-setting-text">
                         <div class="sub-setting-title">Show date first</div>
                         <div class="setting-desc">Reverses the order of the timestamp so that the date comes before the time</div>
@@ -2744,11 +2365,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 <div class="data-management-section">
                     <div class="section-divider"></div>
                     <div class="section-title">Data Management</div>
-                <div class="section-desc">Export or import all settings, profiles, and message stats</div>
+                    <div class="section-desc">Export or import all settings, profiles, and message stats</div>
                     <div class="data-buttons">
                         <button class="btn-data" id="export-all-btn">Export All Data</button>
                         <button class="btn-data" id="import-all-btn">Import All Data</button>
-                        <button class="btn-data" id="clear-all-btn">Clear All Data</button>
                     </div>
                     <div class="version-text">v1.0.11</div>
                 </div>
@@ -2765,6 +2385,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         debugLog('[Toolkit] Modal and backdrop appended to shadow DOM');
         
+        // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
+        // Use BUBBLE phase (false) so events reach our handlers first, THEN get stopped from escaping
+        debugLog('[Toolkit] Installing comprehensive event barrier at shadow root (bubble phase)');
+        const eventTypes = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 
+                           'touchstart', 'touchend', 'keydown', 'keyup', 'input', 'change'];
+        eventTypes.forEach(eventType => {
+            shadow.addEventListener(eventType, (e) => {
+                debugLog('[Toolkit] Event barrier stopping propagation:', eventType, 'target:', e.target.id || e.target.className);
+                e.stopPropagation();  // Prevent event from escaping shadow DOM
+            }, false); // Bubble phase - runs AFTER our handlers, stops events from leaving shadow DOM
+        });
+        debugLog('[Toolkit] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
+        
         // Get checkbox elements within shadow DOM
         const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
         const themeCheckbox = shadow.querySelector('#theme-checkbox');
@@ -2773,44 +2406,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
         const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
         const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
-        
-        // Set checkbox states programmatically (safer than innerHTML with dynamic values)
-        sidebarCheckbox.checked = sidebarEnabled;
-        themeCheckbox.checked = themeEnabled;
-        hideForYouCheckbox.checked = hideForYouEnabled;
-        pageJumpCheckbox.checked = pageJumpEnabled;
-        showStatsCheckbox.checked = showStatsEnabled;
-        timestampFormatCheckbox.checked = timestampDateFirst;
-        
-        // Show/hide timestamp format row based on showStats setting
-        if (showStatsEnabled) {
-            timestampFormatRow.classList.remove('hidden');
-        }
-        
-        debugLog('[Toolkit] Checkbox states set programmatically');
-        
-        // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
-        // Use BUBBLE phase (false) so events reach our handlers first, THEN get stopped from escaping
-        debugLog('[Toolkit] Installing comprehensive event barrier at shadow root (bubble phase)');
-        const eventTypes = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 
-                           'touchstart', 'touchend', 'keydown', 'keyup', 'input', 'change'];
-        eventTypes.forEach(async eventType => {
-            shadow.addEventListener(eventType, (e) => {
-                debugLog('[Toolkit] Event barrier stopping propagation:', eventType, 'target:', e.target.id || e.target.className);
-                e.stopPropagation();  // Prevent event from escaping shadow DOM
-            }, false); // Bubble phase - runs AFTER our handlers, stops events from leaving shadow DOM
-        });
-        debugLog('[Toolkit] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
-        
-        // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
-        const clearAllBtn = shadow.querySelector('#clear-all-btn');
         
         // Check if this is first run (onboarding) - disable cancel if so
-        const hasSeenOnboarding = await storage.get('hasSeenOnboarding', false);
+        const hasSeenOnboarding = GM_getValue('hasSeenOnboarding', false);
         if (!hasSeenOnboarding) {
             debugLog('[Toolkit] First run - disabling Cancel button');
             cancelBtn.disabled = true;
@@ -2946,92 +2548,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }, 300);
         };
         
-        // Clear All Data button - with confirmation dialog
-        clearAllBtn.onclick = async (e) => {
-            debugLog('[Toolkit] Clear All Data button clicked');
-            e.stopPropagation();
-            
-            // Create confirmation dialog in shadow DOM
-            const confirmBackdrop = document.createElement('div');
-            confirmBackdrop.className = 'backdrop';
-            confirmBackdrop.style.zIndex = '900002';
-            
-            const confirmModal = document.createElement('div');
-            confirmModal.className = 'modal';
-            confirmModal.style.zIndex = '900003';
-            confirmModal.style.width = '350px';
-            confirmModal.innerHTML = `
-                <div class="modal-header">⚠️ Clear All Data?</div>
-                <div class="modal-body">
-                    <div style="text-align: center; margin-bottom: 1rem;">
-                        <p style="margin-bottom: 0.5rem;">This will permanently delete:</p>
-                        <ul style="text-align: left; margin: 0; padding-left: 1.5rem;">
-                            <li>All settings</li>
-                            <li>All generation profiles</li>
-                            <li>All message stats</li>
-                        </ul>
-                        <p style="margin-top: 1rem; color: #ef4444; font-weight: 600;">This action cannot be undone!</p>
-                    </div>
-                </div>
-                <div class="button-row">
-                    <button class="btn-cancel" id="confirm-cancel-btn">Cancel</button>
-                    <button class="btn-save" id="confirm-clear-btn" style="background: #ef4444;">Clear All Data</button>
-                </div>
-            `;
-            
-            shadow.appendChild(confirmBackdrop);
-            shadow.appendChild(confirmModal);
-            
-            const confirmCancelBtn = shadow.querySelector('#confirm-cancel-btn');
-            const confirmClearBtn = shadow.querySelector('#confirm-clear-btn');
-            
-            // Cancel confirmation
-            confirmCancelBtn.onclick = (e) => {
-                e.stopPropagation();
-                confirmBackdrop.remove();
-                confirmModal.remove();
-            };
-            
-            // Confirm clear all data
-            confirmClearBtn.onclick = async (e) => {
-                e.stopPropagation();
-                debugLog('[Toolkit] Confirmed - clearing all data');
-                
-                try {
-                    await storage.clear();
-                    debugLog('[Toolkit] All data cleared');
-                    showNotification('All data cleared! Refreshing...');
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 500);
-                } catch (error) {
-                    console.error('[Toolkit] Error clearing data:', error);
-                    alert('Error clearing data: ' + error.message);
-                }
-            };
-            
-            // Close confirmation on backdrop click
-            confirmBackdrop.onclick = (e) => {
-                if (e.target === confirmBackdrop) {
-                    confirmBackdrop.remove();
-                    confirmModal.remove();
-                }
-            };
-        };
-        
         // Save & Refresh button
-        saveBtn.onclick = async (e) => {
+        saveBtn.onclick = (e) => {
             debugLog('[Toolkit] Save & Refresh button clicked');
             e.stopPropagation();
             debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
-            await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
-            await storage.set(THEME_CUSTOMIZATION_KEY, themeEnabled);
-            await storage.set(HIDE_FOR_YOU_KEY, hideForYouEnabled);
-            await storage.set(PAGE_JUMP_KEY, pageJumpEnabled);
-            await storage.set('showGenerationStats', showStatsEnabled);
-            await storage.set('timestampDateFirst', timestampDateFirst);
+            GM_setValue(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
+            GM_setValue(THEME_CUSTOMIZATION_KEY, themeEnabled);
+            GM_setValue(HIDE_FOR_YOU_KEY, hideForYouEnabled);
+            GM_setValue(PAGE_JUMP_KEY, pageJumpEnabled);
+            GM_setValue('showGenerationStats', showStatsEnabled);
+            GM_setValue('timestampDateFirst', timestampDateFirst);
             // Mark onboarding as seen when user saves settings
-            await storage.set('hasSeenOnboarding', true);
+            GM_setValue('hasSeenOnboarding', true);
             debugLog('[Toolkit] Settings saved to storage');
             showNotification('Settings saved! Refreshing...');
             setTimeout(() => {
@@ -3040,180 +2569,121 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }, 500);
         };
         
-        // Export All Data button
+        // Export All Data button - exports all settings, profiles, and message stats
         debugLog('[Toolkit] Attaching exportAllBtn onclick handler...');
         debugLog('[Toolkit] exportAllBtn element:', exportAllBtn);
         debugLog('[Toolkit] exportAllBtn exists?:', !!exportAllBtn);
         
         if (exportAllBtn) {
-            exportAllBtn.onclick = async (e) => {
+            exportAllBtn.onclick = (e) => {
                 debugLog('[Toolkit] ===== EXPORT ALL DATA CLICKED =====');
                 debugLog('[Toolkit] Event:', e);
                 e.stopPropagation();
                 
                 try {
-                    debugLog('[Toolkit] Starting data fetch...');
-                    debugLog('[Toolkit] Storage object type:', typeof storage);
-                    debugLog('[Toolkit] Storage object:', storage);
+                    debugLog('[Toolkit] Starting data collection from GM storage...');
                     
-                    // Get all data from extension storage - fetch each value separately
-                    debugLog('[Toolkit] Fetching enableSidebarLayout...');
-                const enableSidebarLayout = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-                debugLog('[Toolkit] enableSidebarLayout result:', enableSidebarLayout, 'Type:', typeof enableSidebarLayout);
-                
-                debugLog('[Toolkit] Fetching enableThemeCustomization...');
-                const enableThemeCustomization = await storage.get(THEME_CUSTOMIZATION_KEY, false);
-                debugLog('[Toolkit] enableThemeCustomization result:', enableThemeCustomization, 'Type:', typeof enableThemeCustomization);
-                
-                debugLog('[Toolkit] Fetching enableHideForYou...');
-                const enableHideForYou = await storage.get(HIDE_FOR_YOU_KEY, false);
-                debugLog('[Toolkit] enableHideForYou result:', enableHideForYou, 'Type:', typeof enableHideForYou);
-                
-                debugLog('[Toolkit] Fetching enablePageJump...');
-                const enablePageJump = await storage.get(PAGE_JUMP_KEY, false);
-                debugLog('[Toolkit] enablePageJump result:', enablePageJump, 'Type:', typeof enablePageJump);
-                
-                debugLog('[Toolkit] Fetching showGenerationStats...');
-                const showGenerationStats = await storage.get('showGenerationStats', false);
-                debugLog('[Toolkit] showGenerationStats result:', showGenerationStats, 'Type:', typeof showGenerationStats);
-                
-                debugLog('[Toolkit] Fetching timestampDateFirst...');
-                const timestampDateFirst = await storage.get('timestampDateFirst', true);
-                debugLog('[Toolkit] timestampDateFirst result:', timestampDateFirst, 'Type:', typeof timestampDateFirst);
-                
-                debugLog('[Toolkit] Fetching generationProfiles...');
-                const generationProfiles = await storage.get('generationProfiles', '{}');
-                debugLog('[Toolkit] generationProfiles result type:', typeof generationProfiles);
-                debugLog('[Toolkit] generationProfiles length:', generationProfiles?.length);
-                debugLog('[Toolkit] generationProfiles sample:', generationProfiles?.substring?.(0, 100));
-                
-                debugLog('[Toolkit] Fetching lastSelectedProfile...');
-                const lastSelectedProfile = await storage.get('lastSelectedProfile', '');
-                debugLog('[Toolkit] lastSelectedProfile result:', lastSelectedProfile, 'Type:', typeof lastSelectedProfile);
-                
-                debugLog('[Toolkit] Fetching messageGenerationStats...');
-                const messageGenerationStats = await storage.get('messageGenerationStats', '{}');
-                debugLog('[Toolkit] messageGenerationStats result type:', typeof messageGenerationStats);
-                debugLog('[Toolkit] messageGenerationStats length:', messageGenerationStats?.length);
-                debugLog('[Toolkit] messageGenerationStats sample:', messageGenerationStats?.substring?.(0, 100));
-                
-                debugLog('[Toolkit] All values fetched. Building export object...');
-                
-                // Build the export object
-                const allData = {
-                    enableSidebarLayout,
-                    enableThemeCustomization,
-                    enableHideForYou,
-                    enablePageJump,
-                    showGenerationStats,
-                    timestampDateFirst,
-                    generationProfiles,
-                    lastSelectedProfile,
-                    messageGenerationStats
-                };
-                
-                debugLog('[Toolkit] Export object built:', Object.keys(allData));
-                debugLog('[Toolkit] Export object full:', allData);
-                debugLog('[Toolkit] Checking each property:');
-                for (const [key, value] of Object.entries(allData)) {
-                    debugLog(`[Toolkit]   ${key}:`, typeof value, value?.constructor?.name, value);
+                    // Collect all toolkit data from GM storage
+                    const allData = {
+                        enableSidebarLayout: GM_getValue(SIDEBAR_LAYOUT_KEY, false),
+                        enableThemeCustomization: GM_getValue(THEME_CUSTOMIZATION_KEY, false),
+                        enableHideForYou: GM_getValue(HIDE_FOR_YOU_KEY, false),
+                        enablePageJump: GM_getValue(PAGE_JUMP_KEY, false),
+                        showGenerationStats: GM_getValue('showGenerationStats', false),
+                        timestampDateFirst: GM_getValue('timestampDateFirst', true),
+                        generationProfiles: GM_getValue(PROFILES_KEY, '{}'),
+                        lastSelectedProfile: GM_getValue(LAST_PROFILE_KEY, ''),
+                        messageGenerationStats: GM_getValue(MESSAGE_STATS_KEY, '{}')
+                    };
+                    
+                    debugLog('[Toolkit] Data collected:', Object.keys(allData));
+                    debugLog('[Toolkit] Checking each property:');
+                    for (const [key, value] of Object.entries(allData)) {
+                        debugLog(`[Toolkit]   ${key}:`, typeof value, value?.constructor?.name);
+                    }
+                    
+                    debugLog('[Toolkit] Stringifying to JSON...');
+                    const dataStr = JSON.stringify(allData, null, 2);
+                    debugLog('[Toolkit] JSON string length:', dataStr.length);
+                    debugLog('[Toolkit] JSON string sample:', dataStr.substring(0, 200));
+                    
+                    debugLog('[Toolkit] Creating blob...');
+                    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+                    debugLog('[Toolkit] Blob created, size:', dataBlob.size);
+                    
+                    const url = URL.createObjectURL(dataBlob);
+                    debugLog('[Toolkit] Object URL created:', url);
+                    
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `sai-toolkit-userscript-${Date.now()}.json`;
+                    debugLog('[Toolkit] Download link created, filename:', link.download);
+                    
+                    link.click();
+                    debugLog('[Toolkit] Link clicked');
+                    
+                    URL.revokeObjectURL(url);
+                    debugLog('[Toolkit] Object URL revoked');
+                    
+                    showNotification('All data exported successfully!\nFile includes: settings, profiles, and message stats');
+                    debugLog('[Toolkit] ===== EXPORT COMPLETED SUCCESSFULLY =====');
+                } catch (error) {
+                    console.error('[Toolkit] ===== EXPORT ERROR =====');
+                    console.error('[Toolkit] Error exporting data:', error);
+                    console.error('[Toolkit] Error stack:', error.stack);
+                    alert('Error exporting data: ' + error.message);
                 }
-                
-                debugLog('[Toolkit] Stringifying to JSON...');
-                const dataStr = JSON.stringify(allData, null, 2);
-                debugLog('[Toolkit] JSON string length:', dataStr.length);
-                debugLog('[Toolkit] JSON string sample:', dataStr.substring(0, 200));
-                
-                debugLog('[Toolkit] Creating blob...');
-                const dataBlob = new Blob([dataStr], { type: 'application/json' });
-                debugLog('[Toolkit] Blob created, size:', dataBlob.size);
-                
-                const url = URL.createObjectURL(dataBlob);
-                debugLog('[Toolkit] Object URL created:', url);
-                
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = `sai-toolkit-extension-${Date.now()}.json`;
-                debugLog('[Toolkit] Download link created, filename:', link.download);
-                
-                link.click();
-                debugLog('[Toolkit] Link clicked');
-                
-                URL.revokeObjectURL(url);
-                debugLog('[Toolkit] Object URL revoked');
-                
-                showNotification('All data exported successfully!\nFile includes: settings, profiles, and message stats');
-                debugLog('[Toolkit] ===== EXPORT COMPLETED SUCCESSFULLY =====');
-            } catch (error) {
-                console.error('[Toolkit] ===== EXPORT ERROR =====');
-                console.error('[Toolkit] Error exporting data:', error);
-                console.error('[Toolkit] Error stack:', error.stack);
-                alert('Error exporting data: ' + error.message);
-            }
-        };
+            };
         } else {
             console.error('[Toolkit] Cannot attach exportAllBtn handler - button not found!');
         }
         
-        // Import All Data button
+        // Import All Data button - imports settings, profiles, and message stats
         debugLog('[Toolkit] Attaching importAllBtn onclick handler...');
         debugLog('[Toolkit] importAllBtn element:', importAllBtn);
         debugLog('[Toolkit] importAllBtn exists?:', !!importAllBtn);
         
         if (importAllBtn) {
-            importAllBtn.onclick = async (e) => {
+            importAllBtn.onclick = (e) => {
                 debugLog('[Toolkit] Import All Data button clicked');
                 e.stopPropagation();
                 
                 const input = document.createElement('input');
                 input.type = 'file';
                 input.accept = '.json';
-                input.addEventListener('change', async function(event) {
+                input.addEventListener('change', function(event) {
                     const file = event.target.files[0];
-                    if (!file) {
-                        debugLog('[Toolkit] No file selected');
-                        return;
-                    }
-                
-                debugLog('[Toolkit] File selected:', file.name);
-                const reader = new FileReader();
-                reader.onload = async function(e) {
-                    try {
-                        const imported = JSON.parse(e.target.result);
-                        debugLog('[Toolkit] Parsed imported data:', Object.keys(imported));
-                        
-                        // Build updates object conditionally
-                        const updates = {};
-                        if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
-                        if (imported.enableThemeCustomization !== undefined) updates.enableThemeCustomization = imported.enableThemeCustomization;
-                        if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
-                        if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
-                        if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
-                        if (imported.timestampDateFirst !== undefined) updates.timestampDateFirst = imported.timestampDateFirst;
-                        if (imported.generationProfiles !== undefined) updates.generationProfiles = imported.generationProfiles;
-                        if (imported.lastSelectedProfile !== undefined) updates.lastSelectedProfile = imported.lastSelectedProfile;
-                        if (imported.messageGenerationStats !== undefined) updates.messageGenerationStats = imported.messageGenerationStats;
-                        
-                        debugLog('[Toolkit] Importing keys:', Object.keys(updates));
-                        
-                        // Apply all updates
-                        await storage.setMultiple(updates);
-                        debugLog('[Toolkit] All data imported successfully');
-                        
-                        showNotification('All data imported successfully!\nRefreshing page...');
-                        setTimeout(() => {
-                            debugLog('[Toolkit] Reloading page...');
-                            window.location.reload();
-                        }, 1500);
-                    } catch (error) {
-                        console.error('[Toolkit] Error importing data:', error);
-                        alert('Error importing data: ' + error.message);
-                    }
-                };
-                reader.readAsText(file);
-            });
-            input.click();
-        };
+                    if (!file) return;
+                    
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        try {
+                            const imported = JSON.parse(e.target.result);
+                            
+                            // Import all data to GM storage
+                            if (imported.enableSidebarLayout !== undefined) GM_setValue(SIDEBAR_LAYOUT_KEY, imported.enableSidebarLayout);
+                            if (imported.enableThemeCustomization !== undefined) GM_setValue(THEME_CUSTOMIZATION_KEY, imported.enableThemeCustomization);
+                            if (imported.enableHideForYou !== undefined) GM_setValue(HIDE_FOR_YOU_KEY, imported.enableHideForYou);
+                            if (imported.enablePageJump !== undefined) GM_setValue(PAGE_JUMP_KEY, imported.enablePageJump);
+                            if (imported.showGenerationStats !== undefined) GM_setValue('showGenerationStats', imported.showGenerationStats);
+                            if (imported.timestampDateFirst !== undefined) GM_setValue('timestampDateFirst', imported.timestampDateFirst);
+                            if (imported.generationProfiles !== undefined) GM_setValue(PROFILES_KEY, imported.generationProfiles);
+                            if (imported.lastSelectedProfile !== undefined) GM_setValue(LAST_PROFILE_KEY, imported.lastSelectedProfile);
+                            if (imported.messageGenerationStats !== undefined) GM_setValue(MESSAGE_STATS_KEY, imported.messageGenerationStats);
+                            
+                            showNotification('All data imported successfully!\nRefreshing page...');
+                            setTimeout(() => {
+                                window.location.reload();
+                            }, 1500);
+                        } catch (error) {
+                            console.error('[Toolkit] Error importing data:', error);
+                            alert('Error importing data: ' + error.message);
+                        }
+                    };
+                    reader.readAsText(file);
+                });
+                input.click();
+            };
         } else {
             console.error('[Toolkit] Cannot attach importAllBtn handler - button not found!');
         }
@@ -3232,7 +2702,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }
     
     // Global error monitoring to track React crashes
-    window.addEventListener('error', async (event) => {
+    window.addEventListener('error', (event) => {
         debugLog('[Toolkit] ===== GLOBAL ERROR DETECTED =====');
         debugLog('[Toolkit] Error message:', event.message);
         debugLog('[Toolkit] Error filename:', event.filename);
@@ -3243,7 +2713,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }, true);
     
     // Monitor unhandled promise rejections too
-    window.addEventListener('unhandledrejection', async (event) => {
+    window.addEventListener('unhandledrejection', (event) => {
         debugLog('[Toolkit] ===== UNHANDLED PROMISE REJECTION =====');
         debugLog('[Toolkit] Reason:', event.reason);
         debugLog('[Toolkit] Promise:', event.promise);
@@ -3271,22 +2741,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // =============================================================================
     // =============================================================================
 
-    // CHECK ONBOARDING FIRST - before initializing anything else
-    // Get all storage to check if it's truly empty or has any toolkit settings
-    const allStorage = await (typeof browser !== 'undefined' ? browser : chrome).storage.local.get(null);
-    const storageKeys = Object.keys(allStorage);
+    // Initialize styles on page load
+    initializeStyles();
     
-    debugLog('[Toolkit] ===== ONBOARDING CHECK (BEFORE INIT) =====');
-    debugLog('[Toolkit] All storage keys:', storageKeys);
-    debugLog('[Toolkit] Storage contents:', allStorage);
+    // Expose a helper function to reset onboarding (for testing)
+    window.resetSAIToolkitOnboarding = function() {
+        // Clear the onboarding flag
+        GM_setValue('hasSeenOnboarding', false);
+        // Also clear all settings to simulate a truly fresh install
+        GM_deleteValue(SIDEBAR_LAYOUT_KEY);
+        GM_deleteValue(THEME_CUSTOMIZATION_KEY);
+        GM_deleteValue(HIDE_FOR_YOU_KEY);
+        GM_deleteValue(PAGE_JUMP_KEY);
+        debugLog('[Toolkit] Onboarding and all settings reset! Reload the page to see the onboarding modal.');
+        return 'Onboarding reset! Reload the page.';
+    };
     
-    // Check if this is first run: no hasSeenOnboarding key OR it's explicitly false
-    const hasSeenOnboarding = allStorage.hasSeenOnboarding;
+    // Check if this is the first run (onboarding flow)
+    // For Tampermonkey, we check if keys exist using GM_listValues
+    const allStorageKeys = GM_listValues ? GM_listValues() : [];
+    
+    debugLog('[Toolkit] All storage keys:', allStorageKeys);
+    
+    // Check if hasSeenOnboarding exists in the list
+    const hasSeenOnboardingExists = allStorageKeys.includes('hasSeenOnboarding');
+    const hasSeenOnboarding = hasSeenOnboardingExists ? GM_getValue('hasSeenOnboarding') : undefined;
+    
     const hasToolkitSettings = (
-        SIDEBAR_LAYOUT_KEY in allStorage ||
-        THEME_CUSTOMIZATION_KEY in allStorage ||
-        HIDE_FOR_YOU_KEY in allStorage ||
-        PAGE_JUMP_KEY in allStorage
+        allStorageKeys.includes(SIDEBAR_LAYOUT_KEY) ||
+        allStorageKeys.includes(THEME_CUSTOMIZATION_KEY) ||
+        allStorageKeys.includes(HIDE_FOR_YOU_KEY) ||
+        allStorageKeys.includes(PAGE_JUMP_KEY)
     );
     
     debugLog('[Toolkit] Onboarding check - hasSeenOnboarding:', hasSeenOnboarding);
@@ -3294,29 +2779,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Show onboarding if: never seen before (undefined) OR explicitly false
     const shouldShowOnboarding = hasSeenOnboarding === undefined || hasSeenOnboarding === false;
-    debugLog('[Toolkit] Should show onboarding?', shouldShowOnboarding);
-    
-    // Initialize styles on page load
-    await initializeStyles();
-    
-    // Expose a helper function to reset onboarding (for testing)
-    // Since content scripts can't expose functions to page context, we use custom events
-    window.addEventListener('SAI_RESET_ONBOARDING', async function() {
-        debugLog('[Toolkit] Reset onboarding event received');
-        // Clear the onboarding flag
-        await storage.remove('hasSeenOnboarding');
-        // Also clear all settings to simulate a truly fresh install
-        await storage.remove(SIDEBAR_LAYOUT_KEY);
-        await storage.remove(THEME_CUSTOMIZATION_KEY);
-        await storage.remove(HIDE_FOR_YOU_KEY);
-        await storage.remove(PAGE_JUMP_KEY);
-        await storage.remove('showGenerationStats');
-        await storage.remove('timestampDateFirst');
-        debugLog('[Toolkit] Onboarding and all settings reset! Reload the page to see the onboarding modal.');
-        setTimeout(() => location.reload(), 1000);
-    });
-    
-    // Note: resetSAIToolkitOnboarding() function is injected via page-context.js
     
     if (shouldShowOnboarding) {
         debugLog('[Toolkit] First run detected - will show onboarding modal');
@@ -3333,28 +2795,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     } else {
         debugLog('[Toolkit] Not first run - skipping onboarding modal');
     }
-
-    // Observe for modal appearance
-    const observer = new MutationObserver(function(mutations) {
-        // Look specifically for the Generation Settings modal
-        const modals = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2, div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]'));
-        const modal = modals.find(m => {
-            const heading = m.querySelector('p.text-heading-6');
-            return heading && heading.textContent.includes('Generation Settings');
-        });
-        
-        if (modal && !modal.querySelector('#profile-controls')) {
-            // Wait a bit for the modal to fully render
-            setTimeout(createProfileControls, 100);
-        }
-        
-        // Try to inject sidebar button (watches for sidebar to load)
-        injectToolkitSidebarButton();
-        
-        // Inject CSS to hide toolkit button text when sidebar is collapsed
-        const toolkitButtonCSS = document.createElement('style');
-        toolkitButtonCSS.id = 'sai-toolkit-button-css';
-        toolkitButtonCSS.textContent = `
+    
+    // Try to inject sidebar button with multiple retry attempts (sidebar loads with navigation)
+    injectToolkitSidebarButton();
+    setTimeout(injectToolkitSidebarButton, 500);
+    setTimeout(injectToolkitSidebarButton, 1000);
+    setTimeout(injectToolkitSidebarButton, 2000);
+    setTimeout(injectToolkitSidebarButton, 3000);
+    setTimeout(injectToolkitSidebarButton, 5000);
+    
+    // Inject CSS to hide toolkit button text when sidebar is collapsed
+    const toolkitButtonCSS = document.createElement('style');
+    toolkitButtonCSS.id = 'sai-toolkit-button-css';
+    toolkitButtonCSS.textContent = `
 /* Ensure tooltip wrapper doesn't break width */
 #sai-toolkit-sidebar-btn[data-tooltip-id],
 div.w-full > [data-tooltip-id]:has(#sai-toolkit-sidebar-btn) {
@@ -3374,57 +2827,68 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     display: inline !important;
 }
 `;
-        document.head.appendChild(toolkitButtonCSS);
-        debugLog('[Toolkit] Button CSS injected');
-        
-        // Try to inject mobile button (watches for Like button to appear)
-        injectToolkitMobileButton();
-        
-        // Retry sidebar button injection with delays (in case sidebar loads later)
-        setTimeout(() => injectToolkitSidebarButton(), 500);
-        setTimeout(() => injectToolkitSidebarButton(), 1000);
-        setTimeout(() => injectToolkitSidebarButton(), 2000);
-        setTimeout(() => injectToolkitSidebarButton(), 3000);
-        setTimeout(() => injectToolkitSidebarButton(), 5000);
-        
-        // Retry mobile button injection with delays
-        setTimeout(() => injectToolkitMobileButton(), 500);
-        setTimeout(() => injectToolkitMobileButton(), 1000);
-        setTimeout(() => injectToolkitMobileButton(), 2000);
-        setTimeout(() => injectToolkitMobileButton(), 3000);
-        setTimeout(() => injectToolkitMobileButton(), 5000);
-        
-        // Instead of heavy MutationObservers, use lightweight periodic checks
-        // Check every 2 seconds if buttons still exist and text element is present
-        setInterval(() => {
-            const sidebarButton = document.getElementById('sai-toolkit-sidebar-btn');
-            if (sidebarButton) {
-                // Check if text element exists, if not re-add it
-                const iconContainer = sidebarButton.querySelector('.flex.items-center.gap-2');
-                if (iconContainer && !iconContainer.querySelector('.toolkit-button-text')) {
-                    let textElement = document.createElement('p');
-                    textElement.className = 'font-sans text-decoration-skip-ink-none text-underline-position-from-font text-label-lg font-regular text-left truncate toolkit-button-text';
-                    textElement.textContent = 'S.AI Toolkit';
-                    iconContainer.appendChild(textElement);
-                    debugLog('[Toolkit] Text element re-added after React removed it');
-                }
-            } else {
-                // Button missing, try to re-inject
-                const helpIcon = document.querySelector('svg.lucide-info');
-                if (helpIcon) {
-                    injectToolkitSidebarButton();
-                }
+    document.head.appendChild(toolkitButtonCSS);
+    debugLog('[Toolkit] Button CSS injected');
+    
+    // Try to inject mobile button with multiple retry attempts (mobile header loads on narrow view)
+    injectToolkitMobileButton();
+    setTimeout(injectToolkitMobileButton, 500);
+    setTimeout(injectToolkitMobileButton, 1000);
+    setTimeout(injectToolkitMobileButton, 2000);
+    setTimeout(injectToolkitMobileButton, 3000);
+    setTimeout(injectToolkitMobileButton, 5000);
+    
+    // Add observer specifically for sidebar button persistence
+    const sidebarButtonObserver = new MutationObserver(function() {
+        const existingButton = document.getElementById('sai-toolkit-sidebar-btn');
+        // If button doesn't exist but Help button does, re-inject
+        if (!existingButton) {
+            const helpIcon = document.querySelector('svg.lucide-info');
+            if (helpIcon) {
+                injectToolkitSidebarButton();
             }
-            
-            // Check mobile button
-            const mobileButton = document.getElementById('sai-toolkit-mobile-btn');
-            if (!mobileButton) {
-                const likeButton = document.querySelector('button[aria-label="ThumbsUp-button"]');
-                if (likeButton) {
-                    injectToolkitMobileButton();
-                }
+        }
+    });
+    
+    // Add observer specifically for mobile button persistence
+    const mobileButtonObserver = new MutationObserver(function() {
+        const existingMobileButton = document.getElementById('sai-toolkit-mobile-btn');
+        // If button doesn't exist but Like button does, re-inject
+        if (!existingMobileButton) {
+            const likeButton = document.querySelector('button[aria-label="ThumbsUp-button"]');
+            if (likeButton) {
+                injectToolkitMobileButton();
             }
-        }, 2000); // Check every 2 seconds instead of on every DOM mutation
+        }
+    });
+    
+    // Observe the entire body for sidebar and mobile changes
+    sidebarButtonObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+    
+    mobileButtonObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    // Observe for modal appearance
+    const observer = new MutationObserver(function(mutations) {
+        // Look specifically for the Generation Settings modal
+        const modals = Array.from(document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2'));
+        const modal = modals.find(m => {
+            const heading = m.querySelector('p.text-heading-6');
+            return heading && heading.textContent.includes('Generation Settings');
+        });
+        
+        if (modal && !modal.querySelector('#profile-controls')) {
+            // Wait a bit for the modal to fully render
+            setTimeout(createProfileControls, 100);
+        }
+        
+        // Try to inject header icon on main page (watches for header to load)
+        injectToolkitIconOnMainPage();
     });
 
     observer.observe(document.body, {
@@ -3433,27 +2897,10 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     });
 
     // Observer to add generation stats to messages
-    const messageObserver = new MutationObserver(async function(mutations) {
-        const statsEnabled = await storage.get('showGenerationStats', false);
+    const messageObserver = new MutationObserver(function(mutations) {
+        const statsEnabled = GM_getValue('showGenerationStats', false);
         
         if (!statsEnabled) return;
-        
-        // Only process if we see relevant mutations
-        let hasRelevantMutation = false;
-        for (const mutation of mutations) {
-            // Only care about added nodes that could be message wrappers
-            if (mutation.addedNodes.length > 0) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType === 1 && (node.classList?.contains('mb-lg') || node.querySelector?.('.mb-lg'))) {
-                        hasRelevantMutation = true;
-                        break;
-                    }
-                }
-            }
-            if (hasRelevantMutation) break;
-        }
-        
-        if (!hasRelevantMutation) return;
         
         // Debounce: wait a bit for DOM to settle before processing
         clearTimeout(messageObserver.debounceTimer);
@@ -3463,227 +2910,23 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     });
 
     // Separate function to process messages (can be called multiple times)
-    async function processMessagesForStats() {
-        const statsEnabled = await storage.get('showGenerationStats', false);
-        debugLog('[Stats] processMessagesForStats - statsEnabled:', statsEnabled);
-        if (!statsEnabled) return;
-        
-        const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
-        debugLog('[Stats] Found message wrappers:', messageWrappers.length);
-        
-        // Calculate total messages in the index map
-        const totalMessages = Object.keys(messageIdToIndexMap).length;
-        debugLog('[Stats] Total messages in index map:', totalMessages);
-        
-        let botMessageIndex = 0;
-        
-        for (const wrapper of messageWrappers) {
-            // Check if this is a bot message (has character link) or user message
-            const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
-            const isBotMessage = !!characterLink;
-            debugLog('[Stats] Processing message, isBotMessage:', isBotMessage, 'botMessageIndex:', botMessageIndex);
-            
-            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center');
-            
-            if (!actionContainer) {
-                debugLog('[Stats] No action container found!');
-                if (isBotMessage) botMessageIndex++;
-                continue;
-            }
-            
-            // Check if stats already exist OR if we're already processing this message
-            const hasExistingStats = actionContainer.querySelector('.generation-stats');
-            if (hasExistingStats) {
-                debugLog('[Stats] Stats already present, skipping');
-                if (isBotMessage) botMessageIndex++;
-                continue;
-            }
-            
-            if (actionContainer.dataset.statsProcessing) {
-                debugLog('[Stats] Already being processed (race condition), skipping');
-                if (isBotMessage) botMessageIndex++;
-                continue;
-            }
-            
-            // Mark as processing immediately to prevent race conditions
-            actionContainer.dataset.statsProcessing = 'true';
-            
-            if (isBotMessage) {
-                // Bot message - show full stats
-                let messageId = extractMessageId(wrapper);
-                
-                // Calculate the correct index: page shows newest messages, so offset from end of storage
-                // Count bot messages on page first, then calculate offset
-                const botMessagesOnPage = Array.from(messageWrappers).filter(w => !!w.querySelector('a[href^="/chatbot/"]')).length;
-                const storageOffset = totalMessages - botMessagesOnPage;
-                const correctedIndex = storageOffset + botMessageIndex;
-                
-                debugLog('[Stats] Extracted messageId:', messageId, 'botMessageIndex:', botMessageIndex, 'correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
-                if (!messageId && messageIdToIndexMap[correctedIndex] !== undefined) {
-                    messageId = messageIdToIndexMap[correctedIndex];
-                    debugLog('[Stats] Using mapped messageId:', messageId);
-                }
-                
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                debugLog('[Stats] Got stats from storage:', generationStats);
-                if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
-                if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
-                debugLog('[Stats] Final stats:', generationStats);
-                
-                if (!generationStats) {
-                    debugLog('[Stats] No stats found, skipping message');
-                    // Clear the processing flag so it can be retried later
-                    delete actionContainer.dataset.statsProcessing;
-                    botMessageIndex++;
-                    continue;
-                }
-                
-                debugLog('[Stats] Creating stats div...');
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
-                
-                debugLog('[Stats] Checking stats content:', generationStats);
-                
-                // Check for model and settings (new flat format with max_tokens)
-                const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
-                const hasModel = generationStats.model;
-                
-                if (hasSettings && hasModel) {
-                    debugLog('[Stats] Has full stats with settings');
-                    const maxTokens = generationStats.max_tokens;
-                    const temperature = generationStats.temperature;
-                    const topP = generationStats.top_p;
-                    const topK = generationStats.top_k;
-
-                    const statsText = `${generationStats.model}<br>Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`;
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    if (timestamp) {
-                        safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
-                    } else {
-                        safeSetHTML(statsDiv, statsText);
-                    }
-                    debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
-                } else if (generationStats.timestamp) {
-                    debugLog('[Stats] Has timestamp only');
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    if (timestamp) {
-                        safeSetHTML(statsDiv, timestamp);
-                        debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
-                    } else {
-                        debugLog('[Stats] No valid timestamp, skipping');
-                        delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
-                        botMessageIndex++;
-                        continue;
-                    }
-                } else {
-                    debugLog('[Stats] No usable data, skipping');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
-                    botMessageIndex++;
-                    continue;
-                }
-                
-                // Insert before the menu button's parent container
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                debugLog('[Stats] Menu button container:', menuButtonContainer);
-                if (menuButtonContainer) {
-                    debugLog('[Stats] Inserting stats div...');
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                    debugLog('[Stats] Stats div inserted successfully!');
-                } else {
-                    debugLog('[Stats] No menu button container found, cannot insert stats');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                }
-                
-                botMessageIndex++;
-            } else {
-                // User message - show only timestamp
-                let messageId = extractMessageId(wrapper);
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                
-                // Only display if we have a valid timestamp
-                if (!generationStats?.timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                const timestamp = await formatTimestamp(generationStats.timestamp);
-                if (!timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                // Create timestamp div for user messages
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
-                
-                safeSetHTML(statsDiv, timestamp);
-                
-                // Insert before the menu button's parent container
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                if (menuButtonContainer) {
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                }
-            }
-        }
-    }
-
-    // Initialize: Build index map from stored stats for imported/old messages
-    debugLog('[Stats] About to call buildIndexMapFromStats...');
-    buildIndexMapFromStats()
-        .then(() => {
-            debugLog('[Stats] Initialization complete, starting message observer');
-        })
-        .catch((error) => {
-            console.error('[Stats] Error building index map:', error);
-        });
-
-    messageObserver.observe(document.body, {
-        childList: true,
-        subtree: true
-    });
-
-    // Periodic check to ensure stats are inserted even if mutations are missed
-    // DISABLED FOR DEBUGGING - flooding logs
-    /*
-    setInterval(async () => {
-        const statsEnabled = await storage.get('showGenerationStats', false);
-        if (statsEnabled) {
-            processMessagesForStats();
-        }
-    }, 2000); // Check every 2 seconds
-    */
-
-    // Function to manually trigger stats insertion for all visible messages
-    async function insertStatsForAllMessages() {
-        const statsEnabled = await storage.get('showGenerationStats', false);
+    function processMessagesForStats() {
+        const statsEnabled = GM_getValue('showGenerationStats', false);
         if (!statsEnabled) return;
         
         const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
         let botMessageIndex = 0;
         
-        for (const wrapper of messageWrappers) {
+        messageWrappers.forEach(wrapper => {
             // Check if this is a bot message (has character link) or user message
             const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
             const isBotMessage = !!characterLink;
             
             const actionContainer = wrapper.querySelector('.flex.justify-between.items-center');
-            
-            // Check if stats already exist OR if we're already processing this message
-            if (!actionContainer || actionContainer.querySelector('.generation-stats') || actionContainer.dataset.statsProcessing) {
+            if (!actionContainer || actionContainer.querySelector('.generation-stats')) {
                 if (isBotMessage) botMessageIndex++;
-                continue;
+                return;
             }
-            
-            // Mark as processing immediately to prevent race conditions
-            actionContainer.dataset.statsProcessing = 'true';
             
             if (isBotMessage) {
                 // Bot message - show full stats
@@ -3692,80 +2935,158 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     messageId = messageIdToIndexMap[botMessageIndex];
                 }
                 
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                if (!generationStats && lastGenerationSettings) {
-                    generationStats = lastGenerationSettings;
-                }
+                let generationStats = messageId ? getStatsForMessage(messageId) : null;
+                if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
+                if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
                 
                 if (!generationStats) {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
                     botMessageIndex++;
-                    continue;
+                    return;
                 }
                 
                 const statsDiv = document.createElement('div');
                 statsDiv.className = 'generation-stats';
                 statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
                 
-                if (generationStats.max_tokens && generationStats.model) {
-                    const statsText = `${generationStats.model} | Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`;
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
-                } else if (generationStats.timestamp) {
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    safeSetHTML(statsDiv, timestamp);
+                if (generationStats.settings && generationStats.model) {
+                    const settings = generationStats.settings;
+                    const statsText = `${generationStats.model} <br> Tokens: ${settings.max_new_tokens} | Temp: ${settings.temperature.toFixed(2)} | Top-P: ${settings.top_p} | Top-K: ${settings.top_k}`;
+                    const timestamp = formatTimestamp(generationStats.createdAt);
+                    statsDiv.innerHTML = `${statsText}<br>${timestamp}`;
+                } else if (generationStats.createdAt) {
+                    const timestamp = formatTimestamp(generationStats.createdAt);
+                    statsDiv.innerHTML = timestamp;
                 } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
                     botMessageIndex++;
-                    continue;
+                    return;
                 }
-                
-                // Insert before the menu button's parent container (for insertStatsForAllMessages function)
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                if (menuButtonContainer) {
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                }
-                
-                botMessageIndex++;
-            } else {
-                // User message - show only timestamp
-                let messageId = extractMessageId(wrapper);
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                
-                // Only display if we have a valid timestamp
-                if (!generationStats?.timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                const timestamp = await formatTimestamp(generationStats.timestamp);
-                if (!timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                // Create timestamp div for user messages
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
-                
-                safeSetHTML(statsDiv, timestamp);
                 
                 // Insert before the menu button's parent container
                 const menuButtonContainer = actionContainer.querySelector('.relative');
                 if (menuButtonContainer) {
                     actionContainer.insertBefore(statsDiv, menuButtonContainer);
                     actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                }
+                
+                botMessageIndex++;
+            } else {
+                // User message - show only timestamp
+                let messageId = extractMessageId(wrapper);
+                let generationStats = messageId ? getStatsForMessage(messageId) : null;
+                
+                // Create timestamp div for user messages
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'generation-stats';
+                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                
+                const timestamp = formatTimestamp(generationStats?.createdAt);
+                statsDiv.innerHTML = timestamp;
+                
+                // Insert before the menu button's parent container
+                const menuButtonContainer = actionContainer.querySelector('.relative');
+                if (menuButtonContainer) {
+                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                    actionContainer.style.setProperty('gap', '4px', 'important');
                 }
             }
+        });
+    }
+
+    messageObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    // Periodic check to ensure stats are inserted even if mutations are missed
+    setInterval(() => {
+        const statsEnabled = GM_getValue('showGenerationStats', false);
+        if (statsEnabled) {
+            processMessagesForStats();
         }
+    }, 2000); // Check every 2 seconds
+
+    // Function to manually trigger stats insertion for all visible messages
+    function insertStatsForAllMessages() {
+        const statsEnabled = GM_getValue('showGenerationStats', false);
+        if (!statsEnabled) return;
+        
+        const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
+        let botMessageIndex = 0;
+        
+        messageWrappers.forEach((wrapper) => {
+            // Check if this is a bot message (has character link) or user message
+            const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
+            const isBotMessage = !!characterLink;
+            
+            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center');
+            if (!actionContainer || actionContainer.querySelector('.generation-stats')) {
+                if (isBotMessage) botMessageIndex++;
+                return;
+            }
+            
+            if (isBotMessage) {
+                // Bot message - show full stats
+                let messageId = extractMessageId(wrapper);
+                if (!messageId && messageIdToIndexMap[botMessageIndex] !== undefined) {
+                    messageId = messageIdToIndexMap[botMessageIndex];
+                }
+                
+                let generationStats = messageId ? getStatsForMessage(messageId) : null;
+                if (!generationStats && lastGenerationSettings) {
+                    generationStats = lastGenerationSettings;
+                }
+                
+                if (!generationStats) {
+                    botMessageIndex++;
+                    return;
+                }
+                
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'generation-stats';
+                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                
+                if (generationStats.settings && generationStats.model) {
+                    const settings = generationStats.settings;
+                    const statsText = `${generationStats.model} | tks: ${settings.max_new_tokens} | tmp: ${settings.temperature.toFixed(2)} | p: ${settings.top_p} | k: ${settings.top_k}`;
+                    const timestamp = formatTimestamp(generationStats.createdAt);
+                    statsDiv.innerHTML = `${statsText}<br>${timestamp}`;
+                } else if (generationStats.createdAt) {
+                    const timestamp = formatTimestamp(generationStats.createdAt);
+                    statsDiv.innerHTML = timestamp;
+                } else {
+                    botMessageIndex++;
+                    return;
+                }
+                
+                // Insert before the menu button's parent container
+                const menuButtonContainer = actionContainer.querySelector('.relative');
+                if (menuButtonContainer) {
+                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                    actionContainer.style.setProperty('gap', '4px', 'important');
+                }
+                
+                botMessageIndex++;
+            } else {
+                // User message - show only timestamp
+                let messageId = extractMessageId(wrapper);
+                let generationStats = messageId ? getStatsForMessage(messageId) : null;
+                
+                // Create timestamp div for user messages
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'generation-stats';
+                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                
+                const timestamp = formatTimestamp(generationStats?.createdAt);
+                statsDiv.innerHTML = timestamp;
+                
+                // Insert before the menu button's parent container
+                const menuButtonContainer = actionContainer.querySelector('.relative');
+                if (menuButtonContainer) {
+                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                    actionContainer.style.setProperty('gap', '4px', 'important');
+                }
+            }
+        });
     }
 
     // Initial check for existing messages after page load
@@ -3797,4 +3118,4 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         initializeMainCode();
     }
     
-})(); // End of async IIFE
+})();
