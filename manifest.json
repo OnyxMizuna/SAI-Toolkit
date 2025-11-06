@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "S.AI Toolkit",
+  "version": "1.0.10",
+  "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "*://spicychat.ai/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://spicychat.ai/*"
+      ],
+      "js": [
+        "storage-wrapper.js",
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page-context.js",
+        "xhr-intercept.js"
+      ],
+      "matches": [
+        "*://spicychat.ai/*"
+      ]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "sai-toolkit@spicychat.ai"
+    }
+  }
+}
