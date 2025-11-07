@@ -180,8 +180,9 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
     const themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
     
-    // Inject shared composer CSS if EITHER feature is enabled
-    if (sidebarEnabled || themeEnabled) {
+    // Inject shared composer CSS ONLY if sidebar layout is enabled
+    // (Composer CSS is designed to work with sidebar layout, not standalone)
+    if (sidebarEnabled) {
         const injectComposerCSS = () => {
             if (!document.head) {
                 if (document.readyState === 'loading') {
@@ -279,16 +280,37 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // Define shared composer layout CSS (used by both Sidebar and Theme features)
     function getComposerLayoutCSSEarly() {
         return `/* ===== Composer layout & icon placement ===== */
+/* Target the outer composer container with image button */
+div.flex.items-end.gap-sm[style*="margin-left"] {
+  align-items: center !important;
+}
+
 /* Target ONLY the composer input row, NOT persona grid containers */
 div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) {
   display: flex !important;
   flex-direction: row !important;
-  align-items: flex-end !important;  /* Align icons to bottom of textarea */
+  align-items: center !important;  /* Align icons to center of textarea */
   flex-wrap: nowrap !important;
   gap: 0.5rem !important;
   width: 100% !important;
   max-width: none !important;
   box-sizing: border-box !important;
+}
+
+/* Make button wrapper divs stretch to full height */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) > div.inline-flex {
+  height: 100% !important;
+  align-items: center !important;
+}
+
+/* Remove margin from image generation button and other composer buttons */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) button {
+  margin-bottom: 0 !important;
+}
+
+/* Also remove margin from the image button outside the input row */
+div.flex.items-end.gap-sm[style*="margin-left"] button {
+  margin-bottom: 0 !important;
 }
 
 /* Fix message box alignment */
@@ -421,6 +443,14 @@ body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
 /* Blur sidebar modals when image modal is open */
 body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
 div.fixed.left-1\\/2.top-1\\/2:not(.size-full) {
+  filter: blur(4px) !important;
+  opacity: 0.7 !important;
+  pointer-events: none !important;
+}
+
+/* Blur sidebar modals when toolkit settings modal is open */
+body:has(#toolkit-modal-root .backdrop)
+div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container) {
   filter: blur(4px) !important;
   opacity: 0.7 !important;
   pointer-events: none !important;
@@ -589,7 +619,7 @@ div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: co
 
 div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
   position: relative;
-  padding-right: 0 !important;
+  padding-right: 16px !important;
   padding-left: 16px !important;
   padding-top: 0px !important;
   align-items: flex-start;
@@ -608,7 +638,7 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
 
   body:has(div.fixed.left-1\\/2.top-1\\/2)
     div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
-    padding-right: 0 !important;
+    padding-right: 16px !important;
     max-height: calc(100vh - 56px) !important;
     flex: 1 1 auto !important;
   }
@@ -651,7 +681,7 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
 @media (max-width: 999px) {
   div.fixed.left-1\\/2.top-1\\/2 { display: none !important; }
   div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 { 
-    padding-right: 0 !important;
+    padding-right: 16px !important;
     max-height: 100vh !important; /* No header in narrow view, use full viewport */
   }
 }
@@ -727,24 +757,70 @@ button:hover {
 }
 
 .flex-row-reverse { 
-  flex-direction: row; 
+  flex-direction: row !important;
 }
 
 .items-end {
   align-items: flex-start !important;
 }
 
+/* Fix main container flexbox shrinking */
+div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] {
+  flex-shrink: 0 !important;
+  min-width: 0 !important;
+}
+
+/* Fix the bg-gray-2 child inside .p-0 */
+div.p-0 > div.bg-gray-2.flex.grow.flex-col {
+  min-width: 100% !important;
+  width: 100% !important;
+}
+
+/* Fix the max-w-[620px] content container that's constraining width */
+div.bg-gray-2 .max-w-\[620px\] {
+  max-width: 100% !important;
+}
+
+/* More specific selector for the max-w-[620px] container */
+div.p-0 div.bg-gray-2 div.max-w-\[620px\],
+div.max-w-\[620px\] {
+  max-width: none !important;
+  width: 100% !important;
+}
+
+
 /* ===== Composer layout & icon placement ===== */
+/* Target the outer composer container with image button */
+div.flex.items-end.gap-sm[style*="margin-left"] {
+  align-items: center !important;
+}
+
 /* Target ONLY the composer input row, NOT persona grid containers */
 div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) {
   display: flex !important;
   flex-direction: row !important;
-  align-items: flex-end !important;  /* Align icons to bottom of textarea */
+  align-items: center !important;  /* Align icons to center of textarea */
   flex-wrap: nowrap !important;
   gap: 0.5rem !important;
   width: 100% !important;
   max-width: none !important;
   box-sizing: border-box !important;
+}
+
+/* Make button wrapper divs stretch to full height */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) > div.inline-flex {
+  height: 100% !important;
+  align-items: center !important;
+}
+
+/* Remove margin from image generation button and other composer buttons */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) button {
+  margin-bottom: 0 !important;
+}
+
+/* Also remove margin from the image button outside the input row */
+div.flex.items-end.gap-sm[style*="margin-left"] button {
+  margin-bottom: 0 !important;
 }
 
 /* ===== Center message input container ===== */
@@ -787,8 +863,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 }
 
 /* Fix chat width when left sidebar is collapsed */
+/* Note: The issue is that the default CSS uses 220px for the expanded sidebar, 
+   but we need to use 54px when collapsed */
 @media (min-width: 1000px) {
   /* When left sidebar collapsed AND right sidebar modal is open */
+  /* Override the width calculation to use collapsed width instead of 220px */
   body:has(nav[style*="width: 54px"]):has(div.fixed.left-1\\/2.top-1\\/2)
     div.sticky.top-0[class*="z-[100]"] {
     width: calc(100vw - var(--mm-gutter) - var(--left-sidebar-collapsed-width)) !important;
@@ -800,16 +879,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     width: calc(100vw - var(--mm-gutter) - var(--left-sidebar-collapsed-width)) !important;
   }
   
-  /* When left sidebar collapsed AND NO right sidebar modal */
-  body:has(nav[style*="width: 54px"]):not(:has(div.fixed.left-1\\/2.top-1\\/2))
-    div.sticky.top-0[class*="z-[100]"] {
-    width: calc(100vw - var(--left-sidebar-collapsed-width)) !important;
-    max-width: calc(100vw - var(--left-sidebar-collapsed-width)) !important;
-  }
-  
-  body:has(nav[style*="width: 54px"]):not(:has(div.fixed.left-1\\/2.top-1\\/2))
-    div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] {
-    width: calc(100vw - var(--left-sidebar-collapsed-width)) !important;
+  body:has(nav[style*="width: 54px"]):has(div.fixed.left-1\\/2.top-1\\/2)
+    div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding-right: 16px !important;
+    padding-left: 16px !important;
   }
 }
 `;
@@ -1622,65 +1697,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }
         });
 
-        // Export button
-        const exportBtn = document.createElement('button');
-        exportBtn.className = 'flex-1 h-[28px] px-3 rounded-md bg-green-500 hover:bg-green-600 text-white text-[12px] font-medium cursor-pointer transition-colors';
-        exportBtn.textContent = 'Export';
-        exportBtn.addEventListener('click', async function() {
-            const profiles = await loadProfiles();
-            const dataStr = JSON.stringify(profiles, null, 2);
-            const dataBlob = new Blob([dataStr], { type: 'application/json' });
-            const url = URL.createObjectURL(dataBlob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = 'spicychat-profiles.json';
-            link.click();
-            URL.revokeObjectURL(url);
-            showNotification('Profiles exported');
-        });
-
-        // Import button
-        const importBtn = document.createElement('button');
-        importBtn.className = 'flex-1 h-[28px] px-3 rounded-md bg-purple-500 hover:bg-purple-600 text-white text-[12px] font-medium cursor-pointer transition-colors';
-        importBtn.textContent = 'Import';
-        importBtn.addEventListener('click', async function() {
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.accept = '.json';
-            input.addEventListener('change', async function(e) {
-                const file = e.target.files[0];
-                if (file) {
-                    const reader = new FileReader();
-                    reader.onload = async function(event) {
-                        try {
-                            const imported = JSON.parse(event.target.result);
-                            const profiles = await loadProfiles();
-                            Object.assign(profiles, imported);
-                            await saveProfiles(profiles);
-                            updateProfileDropdown();
-                            showNotification('Profiles imported successfully');
-                        } catch (err) {
-                            alert('Error importing profiles: ' + err.message);
-                        }
-                    };
-                    reader.readAsText(file);
-                }
-            });
-            input.click();
-        });
-
         buttonsRow.appendChild(saveBtn);
         buttonsRow.appendChild(deleteBtn);
-        
-        // Second button row for export/import
-        const buttonsRow2 = document.createElement('div');
-        buttonsRow2.className = 'flex justify-undefined items-center gap-2';
-        buttonsRow2.appendChild(exportBtn);
-        buttonsRow2.appendChild(importBtn);
 
         controlsDiv.appendChild(selectorRow);
         controlsDiv.appendChild(buttonsRow);
-        controlsDiv.appendChild(buttonsRow2);
 
         // Insert at the end of the scrollable settings container (under Top-K)
         settingsContainer.appendChild(controlsDiv);
@@ -1792,9 +1813,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // are defined at the top of the file for early injection and shared use
     const HIDE_FOR_YOU_KEY = 'enableHideForYou';
     const PAGE_JUMP_KEY = 'enablePageJump';
+    const COMPACT_GENERATION_KEY = 'enableCompactGeneration';
     
     let sidebarStyleElement = null;
     let themeStyleElement = null;
+    let compactGenerationStyleElement = null;
     let hideForYouObserver = null;
     let hideForYouUrlObserver = null;
     let hideForYouActive = false;
@@ -1804,18 +1827,29 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function toggleSidebarLayout(enable) {
         if (enable) {
             if (!sidebarStyleElement) {
-                sidebarStyleElement = document.createElement('style');
-                sidebarStyleElement.id = 'sai-toolkit-sidebar-layout';
-                sidebarStyleElement.textContent = getSidebarLayoutCSSEarly();
-                // Add BEFORE other elements to ensure it loads early
-                if (document.head.firstChild) {
-                    document.head.insertBefore(sidebarStyleElement, document.head.firstChild);
-                } else {
-                    document.head.appendChild(sidebarStyleElement);
+                // Check if early-injected element exists
+                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') || 
+                                      document.getElementById('sai-toolkit-sidebar-layout');
+                
+                if (!sidebarStyleElement) {
+                    sidebarStyleElement = document.createElement('style');
+                    sidebarStyleElement.id = 'sai-toolkit-sidebar-layout';
+                    sidebarStyleElement.textContent = getSidebarLayoutCSSEarly();
+                    // Add BEFORE other elements to ensure it loads early
+                    if (document.head.firstChild) {
+                        document.head.insertBefore(sidebarStyleElement, document.head.firstChild);
+                    } else {
+                        document.head.appendChild(sidebarStyleElement);
+                    }
                 }
             }
             sidebarStyleElement.disabled = false;
         } else {
+            if (!sidebarStyleElement) {
+                // Check if early-injected element exists
+                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') || 
+                                      document.getElementById('sai-toolkit-sidebar-layout');
+            }
             if (sidebarStyleElement) {
                 // Don't remove the element, just disable it to avoid React re-render issues
                 sidebarStyleElement.disabled = true;
@@ -1840,6 +1874,107 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }
         }
         await storage.set(THEME_CUSTOMIZATION_KEY, enable);
+    }
+    
+    // CSS for compact generation settings
+    function getCompactGenerationCSS() {
+        return `
+            /* Hide all descriptive text paragraphs in Generation Settings modal */
+            /* Target text-gray-11 descriptions (general descriptions) */
+            div.overflow-y-auto.overflow-x-hidden p.text-gray-11 {
+                display: none !important;
+            }
+            
+            /* Target text-gray-10 descriptions (model description) */
+            div.overflow-y-auto.overflow-x-hidden p.text-gray-10 {
+                display: none !important;
+            }
+            
+            /* Make the inference model section a horizontal row with wrap */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start {
+                flex-direction: row !important;
+                flex-wrap: wrap !important;
+                align-items: center !important;
+                gap: 8px !important;
+            }
+            
+            /* "Inference Model" heading on its own line */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start > p.text-label-lg {
+                order: 1 !important;
+                width: 100% !important;
+            }
+            
+            /* Move button after the heading (new line) */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start > button {
+                width: 32px !important;
+                height: 32px !important;
+                min-width: 32px !important;
+                padding: 0 !important;
+                border-radius: 4px !important;
+                flex-shrink: 0 !important;
+                order: 2 !important;
+            }
+            
+            /* Move model info after button */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start .flex.py-md {
+                flex: 1 !important;
+                padding: 0 !important;
+                order: 3 !important;
+            }
+            
+            /* Hide the "Change Model" text */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start > button p {
+                display: none !important;
+            }
+            
+            /* Add pencil icon */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.items-start > button::before {
+                content: "✎" !important;
+                font-size: 18px !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+            }
+            
+            /* Reduce gaps between settings for more compact view */
+            div.overflow-y-auto.overflow-x-hidden.grow.flex.flex-col.gap-lg.px-lg {
+                gap: 0rem !important;
+            }
+            
+            /* Target each setting container directly */
+            div.overflow-y-auto.overflow-x-hidden.grow > div.flex.flex-col.gap-1.w-full {
+                margin-bottom: 0.5rem !important;
+            }
+            
+            /* Reduce vertical spacing in each slider section */
+            div.overflow-y-auto.overflow-x-hidden div.flex.flex-col.gap-1 {
+                gap: 0.15rem !important;
+            }
+            
+            /* Tighter spacing for slider controls */
+            div.overflow-y-auto.overflow-x-hidden .flex.flex-1.items-center.gap-3 {
+                margin-top: 0.15rem !important;
+                margin-bottom: 0.15rem !important;
+            }
+        `;
+    }
+    
+    // Apply or remove compact generation settings CSS
+    async function toggleCompactGeneration(enable) {
+        if (enable) {
+            if (!compactGenerationStyleElement) {
+                compactGenerationStyleElement = document.createElement('style');
+                compactGenerationStyleElement.id = 'sai-toolkit-compact-generation';
+                compactGenerationStyleElement.textContent = getCompactGenerationCSS();
+                document.head.appendChild(compactGenerationStyleElement);
+            }
+        } else {
+            if (compactGenerationStyleElement) {
+                compactGenerationStyleElement.remove();
+                compactGenerationStyleElement = null;
+            }
+        }
+        await storage.set(COMPACT_GENERATION_KEY, enable);
     }
     
     // Hide For You functionality
@@ -2171,12 +2306,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
         const hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
         const pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
+        const compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
         
         debugLog('[Toolkit] Initializing with settings:', {
             sidebar: sidebarEnabled,
             theme: themeEnabled,
             hideForYou: hideForYouEnabled,
-            pageJump: pageJumpEnabled
+            pageJump: pageJumpEnabled,
+            compactGeneration: compactGenerationEnabled
         });
         
         // Sidebar Layout CSS is already injected early if enabled
@@ -2185,6 +2322,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early');
             if (sidebarStyleElement) {
                 debugLog('[Toolkit] Using early-injected Sidebar Layout CSS');
+                sidebarStyleElement.disabled = false;
+            }
+        } else {
+            // If disabled but early CSS was injected, disable it
+            const earlyElement = document.getElementById('sai-toolkit-sidebar-layout-early');
+            if (earlyElement) {
+                earlyElement.disabled = true;
+                sidebarStyleElement = earlyElement;
+                debugLog('[Toolkit] Disabled early-injected Sidebar Layout CSS');
             }
         }
         
@@ -2194,7 +2340,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             themeStyleElement = document.getElementById('sai-toolkit-theme-customization-early');
             if (themeStyleElement) {
                 debugLog('[Toolkit] Using early-injected Theme Customization CSS');
+                themeStyleElement.disabled = false;
             }
+        } else {
+            // If disabled but early CSS was injected, disable it
+            const earlyElement = document.getElementById('sai-toolkit-theme-customization-early');
+            if (earlyElement) {
+                earlyElement.disabled = true;
+                themeStyleElement = earlyElement;
+                debugLog('[Toolkit] Disabled early-injected Theme Customization CSS');
+            }
+        }
+        
+        if (compactGenerationEnabled) {
+            await toggleCompactGeneration(true);
         }
         
         if (hideForYouEnabled) {
@@ -2440,7 +2599,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Toolkit] Creating new toolkit-modal-root with Shadow DOM');
             toolkitRoot = document.createElement('div');
             toolkitRoot.id = 'toolkit-modal-root';
-            toolkitRoot.style.cssText = 'position: fixed; inset: 0; pointer-events: none; z-index: 900000;';
+            toolkitRoot.className = 'toolkit-modal-container';
+            toolkitRoot.style.cssText = 'position: fixed; inset: 0; pointer-events: none; z-index: 10000003;';
             document.body.appendChild(toolkitRoot);
             
             // Attach shadow DOM for complete isolation from React
@@ -2456,7 +2616,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     inset: 0;
                     background: rgba(0, 0, 0, 0.3);
                     backdrop-filter: blur(4px);
-                    z-index: 900000;
+                    z-index: 10000003;
                     pointer-events: auto;
                 }
                 .modal {
@@ -2469,7 +2629,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     width: 400px;
                     max-width: 90vw;
                     max-height: 600px;
-                    z-index: 900001;
+                    z-index: 10000004;
                     pointer-events: auto;
                     display: flex;
                     flex-direction: column;
@@ -2529,12 +2689,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 .sub-setting-row {
                     background: #e5e7eb;
                     padding: 0.75rem;
-                    padding-left: 2.5rem;
+                    padding-left: 0.5rem;
                     border-radius: 0.5rem;
-                    margin-top: 0.5rem;
+                    margin-top: -0.25rem;
                     display: flex;
                     align-items: center;
                     gap: 0.5rem;
+                    margin-left: 2rem;
                 }
                 @media (prefers-color-scheme: dark) {
                     .sub-setting-row { background: #1f1f1f; }
@@ -2677,13 +2838,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // State tracking
         let sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
+        let compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
         let themeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, false);
         let hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
         let pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
         let showStatsEnabled = await storage.get('showGenerationStats', false);
         let timestampDateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
         
-        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
+        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
         
         // Create backdrop
         debugLog('[Toolkit] Creating backdrop and modal elements');
@@ -2697,11 +2859,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         modal.innerHTML = `
             <div class="modal-header">S.AI Toolkit Settings</div>
             <div class="modal-body">
-                <label class="setting-row">
+
+            <div class="modal-sub-header">Visual Settings</div>
+            <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
                     <div class="setting-text">
                         <div class="setting-title">Sidebar Layout</div>
                         <div class="setting-desc">Pin the Generation Settings and Memories modals to sidebar.</div>
+                    </div>
+                </label>
+                <label class="sub-setting-row hidden" id="compact-generation-row">
+                    <input type="checkbox" class="setting-checkbox" id="compact-generation-checkbox" autocomplete="off">
+                    <div class="sub-setting-text">
+                        <div class="sub-setting-title">Compact Generation Settings</div>
+                        <div class="setting-desc">Hide descriptive text for each inference setting to make the modal more compact</div>
                     </div>
                 </label>
                 <label class="setting-row">
@@ -2711,6 +2882,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <div class="setting-desc">Applies the classic colors and message box styling. Credit goes to <strong>MssAcc</strong> on Discord.</div>
                     </div>
                 </label>
+                
+            <br>
+            <div class="modal-sub-header">Main Page Settings</div>
+
                 <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
                     <div class="setting-text">
@@ -2725,6 +2900,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <div class="setting-desc">Click "..." pagination button to jump to any page</div>
                     </div>
                 </label>
+                
+            <br>
+            <div class="modal-sub-header">Chat Settings</div>
+
                 <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
                     <div class="setting-text">
@@ -2737,20 +2916,32 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     <div class="sub-setting-text">
                         <div class="sub-setting-title">Show date first</div>
                         <div class="setting-desc">Reverses the order of the timestamp so that the date comes before the time</div>
-
                     </div>
                 </label>
-                
+                <label class="setting-row">
+                    <input type="checkbox" class="setting-checkbox" id="memories-auto-injection-checkbox" autocomplete="off" disabled>
+                    <div class="setting-text">
+                        <div class="setting-title">Memories Auto-Injection</div>
+                        <div class="setting-desc">Automatically inject memories into conversations (Not yet implemented)</div>
+                    </div>
+                </label>
+
                 <div class="data-management-section">
                     <div class="section-divider"></div>
                     <div class="section-title">Data Management</div>
-                <div class="section-desc">Export or import all settings, profiles, and message stats</div>
+                <div class="section-desc">Export or import all image generation profiles</div>
+                    <div class="data-buttons">
+                        <button class="btn-data" id="export-profiles-btn">Export Profiles</button>
+                        <button class="btn-data" id="import-profiles-btn">Import Profiles</button>
+                    </div>
+                <br>
+                    <div class="section-desc">Export or import all settings, profiles, and message stats</div>
                     <div class="data-buttons">
                         <button class="btn-data" id="export-all-btn">Export All Data</button>
                         <button class="btn-data" id="import-all-btn">Import All Data</button>
                         <button class="btn-data" id="clear-all-btn">Clear All Data</button>
                     </div>
-                    <div class="version-text">v1.0.11</div>
+                    <div class="version-text">v1.0.12</div>
                 </div>
             </div>
             <div class="button-row">
@@ -2767,15 +2958,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Get checkbox elements within shadow DOM
         const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
+        const compactGenerationCheckbox = shadow.querySelector('#compact-generation-checkbox');
         const themeCheckbox = shadow.querySelector('#theme-checkbox');
         const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
         const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
         const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
         const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
+        const compactGenerationRow = shadow.querySelector('#compact-generation-row');
         
         // Set checkbox states programmatically (safer than innerHTML with dynamic values)
         sidebarCheckbox.checked = sidebarEnabled;
+        compactGenerationCheckbox.checked = compactGenerationEnabled;
         themeCheckbox.checked = themeEnabled;
         hideForYouCheckbox.checked = hideForYouEnabled;
         pageJumpCheckbox.checked = pageJumpEnabled;
@@ -2785,6 +2979,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Show/hide timestamp format row based on showStats setting
         if (showStatsEnabled) {
             timestampFormatRow.classList.remove('hidden');
+        }
+        
+        // Show/hide compact generation row based on sidebar setting
+        if (sidebarEnabled) {
+            compactGenerationRow.classList.remove('hidden');
+        } else {
+            compactGenerationRow.classList.add('hidden');
         }
         
         debugLog('[Toolkit] Checkbox states set programmatically');
@@ -2805,6 +3006,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
+        const exportProfilesBtn = shadow.querySelector('#export-profiles-btn');
+        const importProfilesBtn = shadow.querySelector('#import-profiles-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
         const clearAllBtn = shadow.querySelector('#clear-all-btn');
@@ -2837,6 +3040,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Toolkit] SIDEBAR CHECKBOX CHANGED');
             sidebarEnabled = e.target.checked;
             debugLog('[Toolkit] Sidebar:', sidebarEnabled);
+            
+            // Toggle compact generation sub-checkbox visibility
+            if (sidebarEnabled) {
+                compactGenerationRow.classList.remove('hidden');
+            } else {
+                compactGenerationRow.classList.add('hidden');
+                // Also disable compact generation when sidebar is disabled
+                compactGenerationEnabled = false;
+                compactGenerationCheckbox.checked = false;
+            }
+        };
+        
+        compactGenerationCheckbox.onchange = (e) => {
+            debugLog('[Toolkit] COMPACT GENERATION CHECKBOX CHANGED');
+            compactGenerationEnabled = e.target.checked;
+            debugLog('[Toolkit] Compact Generation:', compactGenerationEnabled);
         };
         
         themeCheckbox.onchange = (e) => {
@@ -2954,11 +3173,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Create confirmation dialog in shadow DOM
             const confirmBackdrop = document.createElement('div');
             confirmBackdrop.className = 'backdrop';
-            confirmBackdrop.style.zIndex = '900002';
+            confirmBackdrop.style.zIndex = '10000005';
             
             const confirmModal = document.createElement('div');
             confirmModal.className = 'modal';
-            confirmModal.style.zIndex = '900003';
+            confirmModal.style.zIndex = '10000006';
             confirmModal.style.width = '350px';
             confirmModal.innerHTML = `
                 <div class="modal-header">⚠️ Clear All Data?</div>
@@ -3023,8 +3242,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         saveBtn.onclick = async (e) => {
             debugLog('[Toolkit] Save & Refresh button clicked');
             e.stopPropagation();
-            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
+            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'Theme:', themeEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date');
             await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
+            await storage.set(COMPACT_GENERATION_KEY, compactGenerationEnabled);
             await storage.set(THEME_CUSTOMIZATION_KEY, themeEnabled);
             await storage.set(HIDE_FOR_YOU_KEY, hideForYouEnabled);
             await storage.set(PAGE_JUMP_KEY, pageJumpEnabled);
@@ -3039,6 +3259,57 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 window.location.reload();
             }, 500);
         };
+        
+        // Export Profiles button
+        if (exportProfilesBtn) {
+            exportProfilesBtn.onclick = async (e) => {
+                e.stopPropagation();
+                try {
+                    const profiles = await loadProfiles();
+                    const dataStr = JSON.stringify(profiles, null, 2);
+                    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+                    const url = URL.createObjectURL(dataBlob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'spicychat-profiles.json';
+                    link.click();
+                    URL.revokeObjectURL(url);
+                    showNotification('Profiles exported');
+                } catch (error) {
+                    console.error('[Toolkit] Error exporting profiles:', error);
+                    alert('Error exporting profiles: ' + error.message);
+                }
+            };
+        }
+        
+        // Import Profiles button
+        if (importProfilesBtn) {
+            importProfilesBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json';
+                input.addEventListener('change', async function(e) {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = async function(event) {
+                            try {
+                                const imported = JSON.parse(event.target.result);
+                                const profiles = await loadProfiles();
+                                Object.assign(profiles, imported);
+                                await saveProfiles(profiles);
+                                showNotification('Profiles imported successfully');
+                            } catch (err) {
+                                alert('Error importing profiles: ' + err.message);
+                            }
+                        };
+                        reader.readAsText(file);
+                    }
+                });
+                input.click();
+            };
+        }
         
         // Export All Data button
         debugLog('[Toolkit] Attaching exportAllBtn onclick handler...');
@@ -3064,6 +3335,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 debugLog('[Toolkit] Fetching enableThemeCustomization...');
                 const enableThemeCustomization = await storage.get(THEME_CUSTOMIZATION_KEY, false);
                 debugLog('[Toolkit] enableThemeCustomization result:', enableThemeCustomization, 'Type:', typeof enableThemeCustomization);
+                
+                debugLog('[Toolkit] Fetching enableCompactGeneration...');
+                const enableCompactGeneration = await storage.get(COMPACT_GENERATION_KEY, false);
+                debugLog('[Toolkit] enableCompactGeneration result:', enableCompactGeneration, 'Type:', typeof enableCompactGeneration);
                 
                 debugLog('[Toolkit] Fetching enableHideForYou...');
                 const enableHideForYou = await storage.get(HIDE_FOR_YOU_KEY, false);
@@ -3103,6 +3378,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 const allData = {
                     enableSidebarLayout,
                     enableThemeCustomization,
+                    enableCompactGeneration,
                     enableHideForYou,
                     enablePageJump,
                     showGenerationStats,
@@ -3186,6 +3462,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         const updates = {};
                         if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
                         if (imported.enableThemeCustomization !== undefined) updates.enableThemeCustomization = imported.enableThemeCustomization;
+                        if (imported.enableCompactGeneration !== undefined) updates.enableCompactGeneration = imported.enableCompactGeneration;
                         if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
                         if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
                         if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
@@ -3285,6 +3562,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     const hasToolkitSettings = (
         SIDEBAR_LAYOUT_KEY in allStorage ||
         THEME_CUSTOMIZATION_KEY in allStorage ||
+        COMPACT_GENERATION_KEY in allStorage ||
         HIDE_FOR_YOU_KEY in allStorage ||
         PAGE_JUMP_KEY in allStorage
     );
@@ -3308,6 +3586,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Also clear all settings to simulate a truly fresh install
         await storage.remove(SIDEBAR_LAYOUT_KEY);
         await storage.remove(THEME_CUSTOMIZATION_KEY);
+        await storage.remove(COMPACT_GENERATION_KEY);
         await storage.remove(HIDE_FOR_YOU_KEY);
         await storage.remove(PAGE_JUMP_KEY);
         await storage.remove('showGenerationStats');
