@@ -1,0 +1,66 @@
+{
+  "Glam - Standard": {
+    "model": "Glam 4.6",
+    "modelKey": "glm45",
+    "responseMaxTokens": 300,
+    "temperature": 1,
+    "topP": 0.7,
+    "topK": 80
+  },
+  "Glam - Deep": {
+    "model": "Glam 4.6",
+    "responseMaxTokens": 300,
+    "temperature": 0.85,
+    "topP": 0.85,
+    "topK": 45
+  },
+  "Glam - Light Conflict": {
+    "model": "Glam 4.6",
+    "responseMaxTokens": 300,
+    "temperature": 0.87,
+    "topP": 0.86,
+    "topK": 50
+  },
+  "Glam - Playful & Witty": {
+    "model": "Glam 4.6",
+    "responseMaxTokens": 300,
+    "temperature": 0.89,
+    "topP": 0.87,
+    "topK": 53
+  },
+  "Glam - Flirty": {
+    "model": "Glam 4.6",
+    "responseMaxTokens": 300,
+    "temperature": 0.92,
+    "topP": 0.87,
+    "topK": 58
+  },
+  "Glam - Intense": {
+    "model": "Glam 4.6",
+    "responseMaxTokens": 300,
+    "temperature": 0.95,
+    "topP": 0.89,
+    "topK": 62
+  },
+  "DS3 - Normal": {
+    "model": "Deepseek V3",
+    "responseMaxTokens": 300,
+    "temperature": 0.05,
+    "topP": 0.15,
+    "topK": 25
+  },
+  "Qwen - Normal": {
+    "model": "Qwen3 235B 2507",
+    "responseMaxTokens": 300,
+    "temperature": 0.8,
+    "topP": 0.7,
+    "topK": 90
+  },
+  "Skyli - Normal": {
+    "model": "Skyli Pro",
+    "responseMaxTokens": 300,
+    "temperature": 1,
+    "topP": 0.8,
+    "topK": 80
+  }
+}
