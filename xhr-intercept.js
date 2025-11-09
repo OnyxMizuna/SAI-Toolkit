@@ -118,32 +118,49 @@
                     };
                     debugLog('[Stats] Stored lastGenerationSettings:', lastGenerationSettings);
                     
+                    // Capture the POST send timestamp for user message
+                    const userMessageTimestamp = Date.now();
+                    
                     // Listen for the response
                     this.addEventListener('load', function() {
                         debugLog('[Stats] POST response received');
                         try {
                             const response = JSON.parse(this.responseText);
                             debugLog('[Stats] POST response structure - top-level keys:', Object.keys(response));
-                            if (response.message) {
-                                debugLog('[Stats] response.message keys:', Object.keys(response.message));
-                            }
                             
+                            // Handle bot message (response.message)
                             if (response.message && response.message.id) {
                                 const messageId = response.message.id;
                                 const createdAt = response.message.createdAt || response.message.created_at || null;
                                 const conversationId = response.message.conversation_id || response.message.chat_id || response.chat_id || response.conversation_id || null;
-                                debugLog('[Stats] Got message ID from response:', messageId, 'conversation:', conversationId);
-                                debugLog('[Stats] About to send postMessage with model:', lastGenerationSettings.model);
-                                debugLog('[Stats] About to send postMessage with settings:', lastGenerationSettings.settings);
+                                
+                                console.log('[Stats XHR] ========== NEW BOT MESSAGE ==========');
+                                console.log('[Stats XHR] Bot message ID:', messageId);
+                                console.log('[Stats XHR] Raw response.message.createdAt:', response.message.createdAt);
+                                console.log('[Stats XHR] Extracted createdAt value:', createdAt);
+                                console.log('[Stats XHR] createdAt type:', typeof createdAt);
+                                console.log('[Stats XHR] createdAt as Date:', new Date(createdAt).toISOString());
+                                console.log('[Stats XHR] =======================================');
+                                
+                                // Extract both request and response model names
+                                const requestModel = lastGenerationSettings.model;
+                                const responseModel = response.engine || requestModel;
+                                const modelDisplay = requestModel && responseModel && requestModel !== responseModel 
+                                    ? `${requestModel} → ${responseModel}` 
+                                    : responseModel;
+                                
+                                debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel);
+                                console.log('[Stats XHR] About to postMessage with createdAt:', createdAt);
                                 
                                 // Send to content script
                                 window.postMessage({
                                     type: 'SAI_NEW_MESSAGE',
                                     messageId: messageId,
                                     conversationId: conversationId,
-                                    model: lastGenerationSettings.model,
+                                    model: modelDisplay,
                                     settings: lastGenerationSettings.settings,
-                                    createdAt: createdAt
+                                    createdAt: createdAt,
+                                    role: 'bot'
                                 }, '*');
                                 
                                 // Update local tracking
@@ -153,6 +170,16 @@
                                     messageIdToIndexMap[index] = id;
                                 });
                             }
+                            
+                            // Send notification for user message using captured timestamp
+                            // Note: User message ID is not returned in the response, so we send
+                            // a notification to the content script to detect it via DOM observation
+                            debugLog('[Stats] Sending SAI_USER_MESSAGE_SENT with timestamp:', userMessageTimestamp);
+                            window.postMessage({
+                                type: 'SAI_USER_MESSAGE_SENT',
+                                timestamp: userMessageTimestamp,
+                                conversationId: response.conversation_id || response.chat_id || null
+                            }, '*');
                         } catch (e) {
                             console.error('[Stats] Error parsing chat response:', e);
                         }
@@ -173,9 +200,13 @@
         
         debugLog('[Stats] Fetch intercepted:', typeof url === 'string' ? url : url?.toString(), options?.method || 'GET');
         
+        // Capture timestamp when POST /chat is sent
+        let userMessageTimestamp = null;
+        
         // POST /chat via fetch
         if (url && typeof url === 'string' && url.includes('/chat') && options && options.method === 'POST') {
             debugLog('[Stats] Intercepted POST to /chat via fetch');
+            userMessageTimestamp = Date.now();
             try {
                 const body = JSON.parse(options.body);
                 if (body.inference_model && body.inference_settings) {
@@ -202,16 +233,38 @@
                 if (data.message && data.message.id && lastGenerationSettings) {
                     const messageId = data.message.id;
                     const createdAt = data.message.createdAt || data.message.created_at || null;
-                    debugLog('[Stats] Got message ID from fetch response:', messageId);
+                    const conversationId = data.message.conversation_id || data.message.chat_id || data.chat_id || data.conversation_id || null;
+                    
+                    // Extract both request and response model names
+                    const requestModel = lastGenerationSettings.model;
+                    const responseModel = data.engine || requestModel;
+                    const modelDisplay = requestModel && responseModel && requestModel !== responseModel 
+                        ? `${requestModel} → ${responseModel}` 
+                        : responseModel;
+                    
+                    debugLog('[Stats] Got message ID from fetch response:', messageId, 'conversation:', conversationId);
+                    debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel);
                     
                     // Send to content script
                     window.postMessage({
                         type: 'SAI_NEW_MESSAGE',
                         messageId: messageId,
-                        model: lastGenerationSettings.model,
+                        conversationId: conversationId,
+                        model: modelDisplay,
                         settings: lastGenerationSettings.settings,
-                        createdAt: createdAt
+                        createdAt: createdAt,
+                        role: 'bot'
                     }, '*');
+                    
+                    // Send user message notification
+                    if (userMessageTimestamp) {
+                        debugLog('[Stats] Sending SAI_USER_MESSAGE_SENT with timestamp:', userMessageTimestamp);
+                        window.postMessage({
+                            type: 'SAI_USER_MESSAGE_SENT',
+                            timestamp: userMessageTimestamp,
+                            conversationId: conversationId
+                        }, '*');
+                    }
                     
                     // Update local tracking
                     loadedMessageIds.push(messageId);

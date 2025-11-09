@@ -500,10 +500,11 @@ div.w-full.flex.mb-lg.bg-transparent.items-center div.relative {
 
 /* GENERATION SETTINGS PANEL (TOP 40vh) */
 /* Match both max-h-[600px] and max-h-[700px] variants */
+/* Exclude modals with sai-placeholder-modal class */
 body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
-  div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full):not(.size-full),
+  div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full):not(.size-full):not(.sai-placeholder-modal),
 body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
-  div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not(.size-full) {
+  div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not(.size-full):not(.sai-placeholder-modal) {
   position: fixed !important;
   top: 0 !important;
   bottom: auto !important;
@@ -898,6 +899,104 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Toolkit] DOM ready, initializing main code...');
 
     // =============================================================================
+    // ===              AUTH HEADER INTERCEPTOR FOR MEMORY REFRESH              ===
+    // =============================================================================
+    
+    // Inject interceptors to capture auth token and headers
+    const authInterceptorScript = document.createElement('script');
+    authInterceptorScript.textContent = `
+        (function() {
+            // Store last seen auth token and headers
+            window.__lastAuthHeaders = {};
+            window.__kindeAccessToken = null;
+            
+            // Intercept XHR to capture Kinde token refresh and API headers
+            const originalXHROpen = XMLHttpRequest.prototype.open;
+            const originalXHRSend = XMLHttpRequest.prototype.send;
+            const originalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+            
+            XMLHttpRequest.prototype.open = function(method, url, ...args) {
+                this._url = url;
+                this._method = method;
+                this._requestHeaders = {};
+                return originalXHROpen.apply(this, [method, url, ...args]);
+            };
+            
+            XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+                this._requestHeaders = this._requestHeaders || {};
+                this._requestHeaders[header] = value;
+                return originalXHRSetRequestHeader.apply(this, [header, value]);
+            };
+            
+            XMLHttpRequest.prototype.send = function(...args) {
+                // Capture headers from prod.nd-api.com requests
+                if (this._url && this._url.includes('prod.nd-api.com') && this._requestHeaders) {
+                    if (this._requestHeaders.Authorization) window.__lastAuthHeaders.Authorization = this._requestHeaders.Authorization;
+                    if (this._requestHeaders['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = this._requestHeaders['X-Guest-UserId'];
+                    if (this._requestHeaders['X-Country']) window.__lastAuthHeaders['X-Country'] = this._requestHeaders['X-Country'];
+                    if (this._requestHeaders['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = this._requestHeaders['X-App-Id'];
+                }
+                
+                // Listen for Kinde token refresh responses
+                if (this._url && this._url.includes('gamma.kinde.com/oauth2/token')) {
+                    this.addEventListener('load', function() {
+                        if (this.status === 200) {
+                            try {
+                                const response = JSON.parse(this.responseText);
+                                if (response.access_token) {
+                                    window.__kindeAccessToken = response.access_token;
+                                    window.__lastAuthHeaders.Authorization = 'Bearer ' + response.access_token;
+                                    console.log('[S.AI] Captured fresh Kinde access token');
+                                }
+                            } catch (e) {
+                                console.warn('[S.AI] Could not parse Kinde token response:', e);
+                            }
+                        }
+                    });
+                }
+                
+                return originalXHRSend.apply(this, args);
+            };
+            
+            // Also intercept fetch
+            const originalFetch = window.fetch;
+            window.fetch = function(...args) {
+                const [url, options] = args;
+                
+                // Capture auth headers from API calls
+                if (options && options.headers && url.includes('prod.nd-api.com')) {
+                    const headers = options.headers;
+                    if (headers.Authorization) window.__lastAuthHeaders.Authorization = headers.Authorization;
+                    if (headers['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = headers['X-Guest-UserId'];
+                    if (headers['X-Country']) window.__lastAuthHeaders['X-Country'] = headers['X-Country'];
+                    if (headers['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = headers['X-App-Id'];
+                }
+                
+                // Intercept Kinde token refresh
+                if (url.includes('gamma.kinde.com/oauth2/token')) {
+                    return originalFetch.apply(this, args).then(response => {
+                        const clonedResponse = response.clone();
+                        clonedResponse.json().then(data => {
+                            if (data.access_token) {
+                                window.__kindeAccessToken = data.access_token;
+                                window.__lastAuthHeaders.Authorization = 'Bearer ' + data.access_token;
+                                console.log('[S.AI] Captured fresh Kinde access token (fetch)');
+                            }
+                        }).catch(() => {});
+                        return response;
+                    });
+                }
+                
+                return originalFetch.apply(this, args);
+            };
+            
+            console.log('[S.AI] Auth header interceptor installed (XHR + fetch)');
+        })();
+    `;
+    document.documentElement.appendChild(authInterceptorScript);
+    authInterceptorScript.remove();
+
+    // =============================================================================
     // =============================================================================
     // =============================================================================
     // ===                                                                       ===
@@ -1093,7 +1192,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             temperature: stats.settings?.temperature || stats.temperature || null,
             top_p: stats.settings?.top_p || stats.top_p || null,
             top_k: stats.settings?.top_k || stats.top_k || null,
-            timestamp: stats.createdAt || stats.timestamp || null
+            role: stats.role || null,
+            // Always store as 'timestamp' - convert createdAt if present
+            timestamp: stats.timestamp || stats.createdAt || null
         };
         
         debugLog('[Stats] Stored data:', messageStats[characterId][conversationId][messageId]);
@@ -1196,9 +1297,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2:has(button[aria-label="X-button"])');
         if (!modal) return null;
 
-        // Find the model name
-        const modelElement = modal.querySelector('.text-\\[14px\\].font-medium');
-        const model = modelElement ? modelElement.textContent.trim() : 'Unknown';
+        // Find the model name - updated for new UI structure
+        // Look for the "Inference Model" section and get the model name from the first text-label-lg p tag after it
+        let model = 'Unknown';
+        const inferenceModelLabel = Array.from(modal.querySelectorAll('p.text-label-lg')).find(p => 
+            p.textContent.trim() === 'Inference Model'
+        );
+        if (inferenceModelLabel) {
+            // Find the model name in the next sibling structure
+            const modelNameElement = inferenceModelLabel.parentElement.querySelector('p.text-label-lg.font-regular.text-gray-12');
+            if (modelNameElement) {
+                model = modelNameElement.textContent.trim();
+            }
+        }
+        
+        // Fallback: try the old selector for backwards compatibility
+        if (model === 'Unknown') {
+            const modelElement = modal.querySelector('.text-\\[14px\\].font-medium');
+            model = modelElement ? modelElement.textContent.trim() : 'Unknown';
+        }
 
         // Get slider values
         const sliders = modal.querySelectorAll('input[type="range"]');
@@ -1247,38 +1364,77 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 })));
             }
             
+            // Log all message IDs received from GET /messages
+            if (DEBUG_MODE) {
+                console.log('[Stats MESSAGES_LOADED] Total bot messages in GET response:', botMessages.length);
+                console.log('[Stats MESSAGES_LOADED] All bot message IDs:', botMessages.map(m => m.id));
+            }
+            
+            // Build index map from GET /messages order (most accurate!)
+            // GET /messages returns newest-first, but DOM displays oldest-first
+            // So we need to REVERSE the array before mapping to indices
+            messageIdToIndexMap = {};
+            const reversedBotMessages = [...botMessages].reverse(); // Reverse to match DOM order
+            reversedBotMessages.forEach((msg, index) => {
+                if (msg.id) {
+                    messageIdToIndexMap[index] = msg.id;
+                }
+            });
+            if (DEBUG_MODE) {
+                console.log('[Stats MESSAGES_LOADED] Built index map from GET response (reversed):', Object.keys(messageIdToIndexMap).length, 'messages');
+                console.log('[Stats MESSAGES_LOADED] First 5 mappings:', Object.keys(messageIdToIndexMap).slice(0, 5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
+                console.log('[Stats MESSAGES_LOADED] Last 5 mappings:', Object.keys(messageIdToIndexMap).slice(-5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
+            }
+            
             // Store stats for bot messages
             for (const msg of botMessages) {
                 if (msg.id) {
                     // Check if stats already exist in storage (to preserve POST data)
                     const existingStats = await getStatsForMessage(msg.id);
                     
+                    console.log('[Stats MESSAGES_LOADED] Processing message:', msg.id.substring(0, 8));
+                    console.log('[Stats MESSAGES_LOADED] Message createdAt:', msg.createdAt, 'as Date:', new Date(msg.createdAt).toISOString());
+                    console.log('[Stats MESSAGES_LOADED] Existing stats:', existingStats);
+                    
                     // Only update if we don't have stats yet, or if we're adding NEW data
-                    // GET /messages never includes inference_model or inference_settings, so don't overwrite!
+                    // GET /messages never includes the engine field (response model), so don't overwrite!
                     if (!existingStats) {
+                        console.log('[Stats MESSAGES_LOADED] No existing stats, creating new');
                         // No stats yet - store whatever we have (likely just timestamp)
                         const stats = {
                             role: 'bot',
                             model: msg.inference_model || null,
                             settings: msg.inference_settings || null,
-                            createdAt: msg.createdAt || null
+                            timestamp: msg.createdAt || null  // Use timestamp consistently
                         };
                         await storeStatsForMessage(msg.id, stats, conversationId);
-                    } else if (msg.inference_model && msg.inference_settings) {
-                        // We have full inference data (from POST) - update everything
+                    } else if (existingStats.model && existingStats.model.includes('→')) {
+                        console.log('[Stats MESSAGES_LOADED] Model has arrow format - PRESERVING:', existingStats.model);
+                        console.log('[Stats MESSAGES_LOADED] Existing timestamp PRESERVED:', existingStats.timestamp);
+                        // Model already has the full "request → response" format - don't overwrite!
+                        // This data came from POST /chat which includes the actual engine field
+                    } else if (!existingStats.model && msg.inference_model && msg.inference_settings) {
+                        console.log('[Stats MESSAGES_LOADED] Updating with inference data from GET');
+                        console.log('[Stats MESSAGES_LOADED] PRESERVING existing timestamp:', existingStats.timestamp);
+                        console.log('[Stats MESSAGES_LOADED] NOT using GET timestamp:', msg.createdAt);
+                        // We don't have model data yet AND we have inference data - update
+                        // CRITICAL: Preserve existing timestamp if available (POST timestamp is more accurate)
                         const stats = {
                             role: 'bot',
                             model: msg.inference_model,
                             settings: msg.inference_settings,
-                            createdAt: msg.createdAt || existingStats.createdAt
+                            timestamp: existingStats.timestamp || msg.createdAt  // Preserve POST timestamp
                         };
                         await storeStatsForMessage(msg.id, stats, conversationId);
                     } else if (!existingStats.role) {
-                        // Add role if missing
+                        console.log('[Stats MESSAGES_LOADED] Adding role to existing stats');
+                        // Add role if missing (but don't overwrite model!)
                         existingStats.role = 'bot';
                         await storeStatsForMessage(msg.id, existingStats, conversationId);
+                    } else {
+                        console.log('[Stats MESSAGES_LOADED] Existing stats preserved - no update');
+                        // Existing stats preserved - no update needed
                     }
-                    // else: existingStats exist and we have no new model/settings - don't overwrite!
                 }
             }
             
@@ -1286,12 +1442,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             for (const msg of userMessages) {
                 if (msg.id) {
                     const existingStats = await getStatsForMessage(msg.id);
-                    if (!existingStats || !existingStats.createdAt) {
+                    if (!existingStats || !existingStats.timestamp) {
                         const stats = {
                             role: 'user',
                             model: null,
                             settings: null,
-                            createdAt: msg.createdAt || null
+                            timestamp: msg.createdAt || null  // Use timestamp consistently
                         };
                         await storeStatsForMessage(msg.id, stats, conversationId);
                     } else if (!existingStats.role) {
@@ -1304,40 +1460,116 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             debugLog('[Stats] Stored stats for', botMessages.length, 'bot messages and', userMessages.length, 'user messages');
             
-            // Rebuild index map now that we have the conversation ID
-            await buildIndexMapFromStats();
+            // Don't rebuild index map - we already built it from GET /messages order above
+            // await buildIndexMapFromStats();
         }
         
         if (event.data.type === 'SAI_NEW_MESSAGE') {
             debugLog('[Stats] Received SAI_NEW_MESSAGE from page context');
-            const { messageId, conversationId, model, settings, createdAt } = event.data;
+            const { messageId, conversationId, model, settings, createdAt, role } = event.data;
+            
+            console.log('[Stats CONTENT] ========== RECEIVED SAI_NEW_MESSAGE ==========');
+            console.log('[Stats CONTENT] Message ID:', messageId);
+            console.log('[Stats CONTENT] Role:', role);
+            console.log('[Stats CONTENT] Received createdAt:', createdAt);
+            console.log('[Stats CONTENT] createdAt type:', typeof createdAt);
+            console.log('[Stats CONTENT] createdAt as Date:', createdAt ? new Date(createdAt).toISOString() : 'null');
+            console.log('[Stats CONTENT] ==============================================');
             
             // Store/update the conversation ID
             if (conversationId) {
                 currentConversationId = conversationId;
             }
             
-            debugLog('[Stats] New message - ID:', messageId, 'conversation:', conversationId);
+            debugLog('[Stats] New message - ID:', messageId, 'role:', role, 'conversation:', conversationId);
+            debugLog('[Stats] New message - createdAt received:', createdAt, 'type:', typeof createdAt);
             
-            if (messageId) {
+            if (messageId && createdAt) {
                 const statsWithTimestamp = {
-                    role: 'bot', // New messages from POST /chat are always bot responses
+                    role: role || 'bot',  // Use role from interceptor
                     model: model,
                     settings: settings,
-                    createdAt: createdAt
+                    timestamp: createdAt  // CRITICAL: This must be the actual message.createdAt from API
                 };
-                await storeStatsForMessage(messageId, statsWithTimestamp, conversationId);
-                debugLog('[Stats] Stored stats for new message:', messageId);
                 
-                // Rebuild index map with the new message
-                await buildIndexMapFromStats();
+                console.log('[Stats SAVE] ============ SAVING NEW MESSAGE ============');
+                console.log('[Stats SAVE] Message ID:', messageId);
+                console.log('[Stats SAVE] Role:', role);
+                console.log('[Stats SAVE] Model being saved:', model);
+                console.log('[Stats SAVE] Timestamp being saved (from API response.message.createdAt):', createdAt);
+                console.log('[Stats SAVE] Timestamp type:', typeof createdAt);
+                console.log('[Stats SAVE] Full stats object:', statsWithTimestamp);
+                console.log('[Stats SAVE] =============================================');
+                
+                await storeStatsForMessage(messageId, statsWithTimestamp, conversationId);
+                
+                console.log('[Stats SAVE] Storage complete, verifying...');
+                const verifyStats = await getStatsForMessage(messageId);
+                console.log('[Stats SAVE] Verified stored stats:', verifyStats);
+                console.log('[Stats SAVE] Verified timestamp:', verifyStats?.timestamp);
+                console.log('[Stats SAVE] Verified timestamp as Date:', verifyStats?.timestamp ? new Date(verifyStats.timestamp).toISOString() : 'null');
+                
+                debugLog('[Stats] Stored stats for new message:', messageId, 'with timestamp:', createdAt);
+                
+                // CRITICAL: Add new message to the index map so processMessagesForStats can find it
+                // New messages are added at the END (highest index)
+                const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
+                const newIndex = currentMaxIndex + 1;
+                messageIdToIndexMap[newIndex] = messageId;
+                console.log('[Stats SAVE] Added message to index map at index:', newIndex, 'messageId:', messageId);
+                console.log('[Stats SAVE] Index map now has', Object.keys(messageIdToIndexMap).length, 'messages');
                 
                 // Trigger stats insertion after delays to let DOM update
-                setTimeout(() => insertStatsForAllMessages(), 500);
-                setTimeout(() => insertStatsForAllMessages(), 1500);
+                setTimeout(() => processMessagesForStats(), 500);
+                setTimeout(() => processMessagesForStats(), 1500);
+            } else if (messageId && !createdAt) {
+                console.warn('[Stats] SAI_NEW_MESSAGE received without createdAt timestamp for message:', messageId);
             }
         }
+        
+        if (event.data.type === 'SAI_USER_MESSAGE_SENT') {
+            debugLog('[Stats] Received SAI_USER_MESSAGE_SENT from page context');
+            const { timestamp, conversationId } = event.data;
+            
+            debugLog('[Stats] User message sent at timestamp:', timestamp);
+            
+            // Store the timestamp for when we detect the user message in the DOM
+            lastUserMessageTimestamp = timestamp;
+            
+            // Try to find and tag the user message after a short delay
+            setTimeout(async () => {
+                debugLog('[Stats] Looking for new user message to tag with timestamp:', timestamp);
+                
+                // Find all user messages (role="user")
+                const allMessages = document.querySelectorAll('[data-message-id]');
+                debugLog('[Stats] Found', allMessages.length, 'total messages with data-message-id');
+                
+                // Find user messages without timestamps
+                for (const msgEl of allMessages) {
+                    const messageId = msgEl.getAttribute('data-message-id');
+                    const role = msgEl.getAttribute('data-role') || 'unknown';
+                    
+                    if (role === 'user') {
+                        // Check if this message already has a timestamp
+                        const existingStats = await getStatsForMessage(messageId);
+                        if (!existingStats || !existingStats.timestamp) {
+                            debugLog('[Stats] Found user message without timestamp:', messageId, '- adding timestamp:', timestamp);
+                            await storeStatsForMessage(messageId, {
+                                role: 'user',
+                                timestamp: timestamp
+                            }, conversationId);
+                            
+                            // Insert stats for this message
+                            setTimeout(() => processMessagesForStats(), 100);
+                        }
+                    }
+                }
+            }, 500);
+        }
     });
+
+    // Track the last user message timestamp for later tagging
+    let lastUserMessageTimestamp = null;
 
     // Load profiles from storage
     async function loadProfiles() {
@@ -2860,7 +3092,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             <div class="modal-header">S.AI Toolkit Settings</div>
             <div class="modal-body">
 
-            <div class="modal-sub-header">Visual Settings</div>
+            <div class="modal-sub-header">Visuals</div>
             <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
                     <div class="setting-text">
@@ -2884,7 +3116,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 </label>
                 
             <br>
-            <div class="modal-sub-header">Main Page Settings</div>
+            <div class="modal-sub-header">Main Page</div>
 
                 <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
@@ -2902,22 +3134,41 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 </label>
                 
             <br>
-            <div class="modal-sub-header">Chat Settings</div>
+            <div class="modal-sub-header">Chat</div>
 
                 <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
                     <div class="setting-text">
-                        <div class="setting-title">Show generation model stats and timestamp in messages</div>
+                        <div class="setting-title">Show generation model in messages</div>
+                        <div class="setting-desc">Display model info on the corner of bot messages (only for messages received since the extension was installed)</div>
+                    </div>
+                </label>
+                    <label class="sub-setting-row hidden" id="generation-model-details-row">
+                        <input type="checkbox" class="setting-checkbox" id="generation-model-details-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Show extended model details</div>
+                            <div class="setting-desc">When enabled, shows the model that was requested, and the engine that was used in response.</div>
+                        </div>
+                    </label>
+
+                <label class="setting-row">
+                    <input type="checkbox" class="setting-checkbox" id="showtimestamp-checkbox" autocomplete="off">
+                    <div class="setting-text">
+                        <div class="setting-title">Show timestamp in messages</div>
                         <div class="setting-desc">Display model info and timestamps below bot messages (only for new messages)</div>
                     </div>
                 </label>
-                <label class="sub-setting-row hidden" id="timestamp-format-row">
-                    <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off">
-                    <div class="sub-setting-text">
-                        <div class="sub-setting-title">Show date first</div>
-                        <div class="setting-desc">Reverses the order of the timestamp so that the date comes before the time</div>
-                    </div>
-                </label>
+                    <label class="sub-setting-row hidden" id="timestamp-format-row">
+                        <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Show date first</div>
+                            <div class="setting-desc">Reverses the order of the timestamp so that the date comes before the time</div>
+                        </div>
+                    </label>
+                
+            <br>
+            <div class="modal-sub-header">Memories</div>
+
                 <label class="setting-row">
                     <input type="checkbox" class="setting-checkbox" id="memories-auto-injection-checkbox" autocomplete="off" disabled>
                     <div class="setting-text">
@@ -2941,7 +3192,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <button class="btn-data" id="import-all-btn">Import All Data</button>
                         <button class="btn-data" id="clear-all-btn">Clear All Data</button>
                     </div>
-                    <div class="version-text">v1.0.12</div>
+                    <div class="version-text">v1.0.15</div>
                 </div>
             </div>
             <div class="button-row">
@@ -3742,12 +3993,17 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     });
 
     // Separate function to process messages (can be called multiple times)
+    // This unified function handles all stats injection to avoid duplication and inconsistency
     async function processMessagesForStats() {
+        console.log('[Stats DISPLAY] ========== processMessagesForStats CALLED ==========');
+        console.log('[Stats DISPLAY] Call stack:', new Error().stack);
         const statsEnabled = await storage.get('showGenerationStats', false);
+        console.log('[Stats DISPLAY] Stats enabled:', statsEnabled);
         debugLog('[Stats] processMessagesForStats - statsEnabled:', statsEnabled);
         if (!statsEnabled) return;
         
         const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
+        console.log('[Stats DISPLAY] Found message wrappers:', messageWrappers.length);
         debugLog('[Stats] Found message wrappers:', messageWrappers.length);
         
         // Calculate total messages in the index map
@@ -3770,12 +4026,66 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 continue;
             }
             
-            // Check if stats already exist OR if we're already processing this message
-            const hasExistingStats = actionContainer.querySelector('.generation-stats');
-            if (hasExistingStats) {
-                debugLog('[Stats] Stats already present, skipping');
-                if (isBotMessage) botMessageIndex++;
-                continue;
+            // Check if stats already exist
+            const existingStatsDiv = actionContainer.querySelector('.generation-stats');
+            if (existingStatsDiv) {
+                if (DEBUG_MODE) console.log('[Stats] Found existing stats div');
+                // Check if we need to update the stats (e.g., from partial to full model format)
+                if (isBotMessage) {
+                    let messageId = extractMessageId(wrapper);
+                    if (DEBUG_MODE) console.log('[Stats] Bot message, messageId:', messageId);
+                    
+                    // Try fallback to index map if extraction failed
+                    if (!messageId) {
+                        // Calculate the correct index: page shows newest messages, so offset from end of storage
+                        const botMessagesOnPage = Array.from(messageWrappers).filter(w => !!w.querySelector('a[href^="/chatbot/"]')).length;
+                        const storageOffset = totalMessages - botMessagesOnPage;
+                        const correctedIndex = storageOffset + botMessageIndex;
+                        
+                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                            messageId = messageIdToIndexMap[correctedIndex];
+                            if (DEBUG_MODE) console.log('[Stats] Using fallback messageId from index map:', messageId);
+                        }
+                    }
+                    
+                    if (messageId) {
+                        const latestStats = await getStatsForMessage(messageId);
+                        if (DEBUG_MODE) console.log('[Stats] Latest stats from storage:', latestStats);
+                        if (latestStats?.model && latestStats.model.includes('→')) {
+                            // We have full format in storage but need to check if it's displayed
+                            const existingText = existingStatsDiv.textContent;
+                            if (DEBUG_MODE) {
+                                console.log('[Stats] Storage has arrow format:', latestStats.model);
+                                console.log('[Stats] Display shows:', existingText);
+                            }
+                            if (!existingText.includes('→')) {
+                                // Stats are outdated - remove and re-insert
+                                if (DEBUG_MODE) console.log('[Stats] OUTDATED! Removing old stats div and re-inserting...');
+                                existingStatsDiv.remove();
+                                // Don't skip - let it fall through to re-insert
+                            } else {
+                                if (DEBUG_MODE) console.log('[Stats] Stats already up-to-date, skipping');
+                                debugLog('[Stats] Stats already present and up-to-date, skipping');
+                                botMessageIndex++;
+                                continue;
+                            }
+                        } else {
+                            if (DEBUG_MODE) console.log('[Stats] Storage does not have arrow format, skipping update');
+                            debugLog('[Stats] Stats already present, skipping');
+                            botMessageIndex++;
+                            continue;
+                        }
+                    } else {
+                        if (DEBUG_MODE) console.log('[Stats] No messageId extracted, skipping');
+                        debugLog('[Stats] Stats already present, skipping');
+                        botMessageIndex++;
+                        continue;
+                    }
+                } else {
+                    if (DEBUG_MODE) console.log('[Stats] User message, skipping');
+                    debugLog('[Stats] Stats already present, skipping');
+                    continue;
+                }
             }
             
             if (actionContainer.dataset.statsProcessing) {
@@ -3791,19 +4101,30 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // Bot message - show full stats
                 let messageId = extractMessageId(wrapper);
                 
-                // Calculate the correct index: page shows newest messages, so offset from end of storage
-                // Count bot messages on page first, then calculate offset
-                const botMessagesOnPage = Array.from(messageWrappers).filter(w => !!w.querySelector('a[href^="/chatbot/"]')).length;
-                const storageOffset = totalMessages - botMessagesOnPage;
-                const correctedIndex = storageOffset + botMessageIndex;
+                console.log('[Stats DISPLAY] ========== PROCESSING BOT MESSAGE ==========');
+                console.log('[Stats DISPLAY] Extracted messageId:', messageId);
+                console.log('[Stats DISPLAY] botMessageIndex:', botMessageIndex);
                 
-                debugLog('[Stats] Extracted messageId:', messageId, 'botMessageIndex:', botMessageIndex, 'correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
-                if (!messageId && messageIdToIndexMap[correctedIndex] !== undefined) {
-                    messageId = messageIdToIndexMap[correctedIndex];
-                    debugLog('[Stats] Using mapped messageId:', messageId);
+                // Calculate the correct index: page shows newest messages, so offset from end of storage
+                if (!messageId) {
+                    const botMessagesOnPage = Array.from(messageWrappers).filter(w => !!w.querySelector('a[href^="/chatbot/"]')).length;
+                    const storageOffset = totalMessages - botMessagesOnPage;
+                    const correctedIndex = storageOffset + botMessageIndex;
+                    
+                    console.log('[Stats DISPLAY] Fallback - correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
+                    debugLog('[Stats] Extracted messageId:', messageId, 'botMessageIndex:', botMessageIndex, 'correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
+                    if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                        messageId = messageIdToIndexMap[correctedIndex];
+                        console.log('[Stats DISPLAY] Using mapped messageId:', messageId);
+                        debugLog('[Stats] Using mapped messageId:', messageId);
+                    }
                 }
                 
+                console.log('[Stats DISPLAY] Final messageId to lookup:', messageId);
                 let generationStats = messageId ? await getStatsForMessage(messageId) : null;
+                console.log('[Stats DISPLAY] Retrieved from storage:', generationStats);
+                console.log('[Stats DISPLAY] Timestamp from storage:', generationStats?.timestamp);
+                console.log('[Stats DISPLAY] Timestamp as Date:', generationStats?.timestamp ? new Date(generationStats.timestamp).toISOString() : 'null');
                 debugLog('[Stats] Got stats from storage:', generationStats);
                 if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
                 if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
@@ -3837,10 +4158,14 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
 
                     const statsText = `${generationStats.model}<br>Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`;
                     const timestamp = await formatTimestamp(generationStats.timestamp);
+                    console.log('[Stats DISPLAY] Formatted timestamp:', timestamp);
+                    console.log('[Stats DISPLAY] Input to formatTimestamp was:', generationStats.timestamp);
                     if (timestamp) {
                         safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
+                        console.log('[Stats DISPLAY] Stats div content (with timestamp):', statsDiv.textContent);
                     } else {
                         safeSetHTML(statsDiv, statsText);
+                        console.log('[Stats DISPLAY] Stats div content (no timestamp):', statsDiv.textContent);
                     }
                     debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                 } else if (generationStats.timestamp) {
@@ -3866,10 +4191,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 const menuButtonContainer = actionContainer.querySelector('.relative');
                 debugLog('[Stats] Menu button container:', menuButtonContainer);
                 if (menuButtonContainer) {
+                    console.log('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
+                    console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
+                    console.log('[Stats DISPLAY] Inserting into action container');
                     debugLog('[Stats] Inserting stats div...');
                     actionContainer.insertBefore(statsDiv, menuButtonContainer);
                     actionContainer.style.setProperty('gap', '4px', 'important');
                     delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                    console.log('[Stats DISPLAY] Stats div inserted! Final content:', statsDiv.textContent);
+                    console.log('[Stats DISPLAY] Stats div is in DOM:', document.contains(statsDiv));
+                    console.log('[Stats DISPLAY] ===========================================');
                     debugLog('[Stats] Stats div inserted successfully!');
                 } else {
                     debugLog('[Stats] No menu button container found, cannot insert stats');
@@ -3940,121 +4271,745 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     }, 2000); // Check every 2 seconds
     */
 
-    // Function to manually trigger stats insertion for all visible messages
-    async function insertStatsForAllMessages() {
-        const statsEnabled = await storage.get('showGenerationStats', false);
-        if (!statsEnabled) return;
-        
-        const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
-        let botMessageIndex = 0;
-        
-        for (const wrapper of messageWrappers) {
-            // Check if this is a bot message (has character link) or user message
-            const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
-            const isBotMessage = !!characterLink;
-            
-            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center');
-            
-            // Check if stats already exist OR if we're already processing this message
-            if (!actionContainer || actionContainer.querySelector('.generation-stats') || actionContainer.dataset.statsProcessing) {
-                if (isBotMessage) botMessageIndex++;
-                continue;
-            }
-            
-            // Mark as processing immediately to prevent race conditions
-            actionContainer.dataset.statsProcessing = 'true';
-            
-            if (isBotMessage) {
-                // Bot message - show full stats
-                let messageId = extractMessageId(wrapper);
-                if (!messageId && messageIdToIndexMap[botMessageIndex] !== undefined) {
-                    messageId = messageIdToIndexMap[botMessageIndex];
-                }
-                
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                if (!generationStats && lastGenerationSettings) {
-                    generationStats = lastGenerationSettings;
-                }
-                
-                if (!generationStats) {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
-                    botMessageIndex++;
-                    continue;
-                }
-                
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
-                
-                if (generationStats.max_tokens && generationStats.model) {
-                    const statsText = `${generationStats.model} | Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`;
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    safeSetHTML(statsDiv, `${statsText}<br>${timestamp}`);
-                } else if (generationStats.timestamp) {
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    safeSetHTML(statsDiv, timestamp);
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if we skip
-                    botMessageIndex++;
-                    continue;
-                }
-                
-                // Insert before the menu button's parent container (for insertStatsForAllMessages function)
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                if (menuButtonContainer) {
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                }
-                
-                botMessageIndex++;
-            } else {
-                // User message - show only timestamp
-                let messageId = extractMessageId(wrapper);
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                
-                // Only display if we have a valid timestamp
-                if (!generationStats?.timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                const timestamp = await formatTimestamp(generationStats.timestamp);
-                if (!timestamp) {
-                    delete actionContainer.dataset.statsProcessing;
-                    continue;
-                }
-                
-                // Create timestamp div for user messages
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
-                
-                safeSetHTML(statsDiv, timestamp);
-                
-                // Insert before the menu button's parent container
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                if (menuButtonContainer) {
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                } else {
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                }
-            }
-        }
-    }
+    // Alias for backward compatibility - both names call the same unified function
+    const insertStatsForAllMessages = processMessagesForStats;
 
     // Initial check for existing messages after page load
+    if (DEBUG_MODE) console.log('[Stats] Scheduling initial check at 2000ms');
     setTimeout(insertStatsForAllMessages, 2000);
     
     // Also check again after a longer delay in case messages load slowly
+    if (DEBUG_MODE) console.log('[Stats] Scheduling delayed check at 5000ms');
     setTimeout(insertStatsForAllMessages, 5000);
 
     // Initial check in case modal is already open
     setTimeout(createProfileControls, 1000);
+
+    // =============================================================================
+    // ===                   MEMORY MANAGER AUTO-REFRESH                        ===
+    // =============================================================================
+    
+    let memoryRefreshInterval = null;
+    
+    /**
+     * Extracts conversation ID from current URL
+     */
+    function getConversationId() {
+        // Use the conversation ID captured from the messages GET request
+        // This is more reliable than parsing the URL
+        return currentConversationId;
+    }
+    
+    /**
+     * Fetches fresh memory data from the API by injecting into page context
+     */
+    async function refreshMemoryContent() {
+        console.log('[S.AI] Refreshing Memory Manager content via API...');
+        
+        // Find the Memories modal specifically by its unique z-index
+        // Use Array.from to check all modals and find the one with "Memories" heading
+        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
+        let memoryModal = null;
+        
+        for (const modal of allModals) {
+            const heading = modal.querySelector('p.text-heading-6');
+            if (heading && heading.textContent.trim() === 'Memories') {
+                memoryModal = modal;
+                break;
+            }
+        }
+        
+        if (!memoryModal) {
+            console.log('[S.AI] Memory modal not found');
+            return false;
+        }
+        
+        // Get conversation ID from captured API data
+        const conversationId = getConversationId();
+        if (!conversationId) {
+            console.log('[S.AI] Could not get conversation ID (not yet captured from messages API)');
+            return false;
+        }
+        console.log('[S.AI] Using conversation ID:', conversationId);
+        
+        try {
+            // Inject a script into the page context to make the fetch request
+            // This bypasses CORS restrictions that content scripts face
+            // We need to get the auth token from localStorage or the page's fetch interceptor
+            const script = document.createElement('script');
+            script.textContent = `
+                (async function() {
+                    try {
+                        // Try to get the auth token and other required headers
+                        let authToken = null;
+                        let guestUserId = null;
+                        let country = null;
+                        
+                        try {
+                            // Method 1: Check if we captured the Kinde access token from OAuth refresh
+                            if (window.__kindeAccessToken) {
+                                authToken = window.__kindeAccessToken;
+                                console.log('[S.AI] Using captured Kinde access token');
+                            }
+                            
+                            // Method 2: Check intercepted headers from API calls
+                            if (window.__lastAuthHeaders) {
+                                if (!authToken && window.__lastAuthHeaders.Authorization) {
+                                    authToken = window.__lastAuthHeaders.Authorization.replace('Bearer ', '');
+                                    console.log('[S.AI] Using intercepted Authorization header');
+                                }
+                                if (!guestUserId && window.__lastAuthHeaders['X-Guest-UserId']) {
+                                    guestUserId = window.__lastAuthHeaders['X-Guest-UserId'];
+                                }
+                                if (!country && window.__lastAuthHeaders['X-Country']) {
+                                    country = window.__lastAuthHeaders['X-Country'];
+                                }
+                            }
+                            
+                            // Method 3: Search localStorage for token (fallback)
+                            if (!authToken) {
+                                for (const key of Object.keys(localStorage)) {
+                                    try {
+                                        const value = localStorage.getItem(key);
+                                        if (!value) continue;
+                                        
+                                        // Try parsing as JSON
+                                        if (value.startsWith('{') || value.startsWith('[')) {
+                                            const parsed = JSON.parse(value);
+                                            
+                                            // Look for auth token
+                                            if (!authToken && (parsed.access_token || parsed.accessToken || parsed.token)) {
+                                                authToken = parsed.access_token || parsed.accessToken || parsed.token;
+                                            }
+                                            
+                                            // Look for user ID
+                                            if (!guestUserId && (parsed.userId || parsed.user_id || parsed.id)) {
+                                                guestUserId = parsed.userId || parsed.user_id || parsed.id;
+                                            }
+                                        } else if (!authToken && value.startsWith('eyJ')) {
+                                            // Raw JWT token
+                                            authToken = value;
+                                        }
+                                    } catch (e) {}
+                                }
+                            }
+                            
+                            console.log('[S.AI] Auth check - Token:', !!authToken, 'UserId:', !!guestUserId, 'Country:', !!country);
+                            
+                        } catch (e) {
+                            console.warn('[S.AI] Could not retrieve auth data:', e);
+                        }
+                        
+                        const headers = {
+                            'Accept': 'application/json, text/plain, */*',
+                            'X-App-Id': 'spicychat'
+                        };
+                        
+                        if (authToken) {
+                            headers['Authorization'] = \`Bearer \${authToken}\`;
+                        }
+                        
+                        if (guestUserId) {
+                            headers['X-Guest-UserId'] = guestUserId;
+                        }
+                        
+                        if (country) {
+                            headers['X-Country'] = country;
+                        }
+                        
+                        const response = await fetch('https://prod.nd-api.com/conversations/${conversationId}/memories', {
+                            method: 'GET',
+                            headers: headers,
+                            credentials: 'include'
+                        });
+                        
+                        if (response.ok) {
+                            const memories = await response.json();
+                            window.dispatchEvent(new CustomEvent('memoryDataFetched', {
+                                detail: { success: true, memories: memories, count: memories.length }
+                            }));
+                        } else {
+                            window.dispatchEvent(new CustomEvent('memoryDataFetched', {
+                                detail: { 
+                                    success: false, 
+                                    status: response.status, 
+                                    hasAuth: !!authToken,
+                                    hasUserId: !!guestUserId,
+                                    hasCountry: !!country
+                                }
+                            }));
+                        }
+                    } catch (error) {
+                        window.dispatchEvent(new CustomEvent('memoryDataFetched', {
+                            detail: { success: false, error: error.message }
+                        }));
+                    }
+                })();
+            `;
+            
+            // Set up listener for the response
+            const responsePromise = new Promise((resolve) => {
+                const handler = (event) => {
+                    window.removeEventListener('memoryDataFetched', handler);
+                    resolve(event.detail);
+                };
+                window.addEventListener('memoryDataFetched', handler);
+                
+                // Timeout after 10 seconds
+                setTimeout(() => {
+                    window.removeEventListener('memoryDataFetched', handler);
+                    resolve({ success: false, error: 'timeout' });
+                }, 10000);
+            });
+            
+            // Inject and execute the script
+            document.documentElement.appendChild(script);
+            script.remove();
+            
+            // Wait for the response
+            const result = await responsePromise;
+            
+            if (!result.success) {
+                console.error('[S.AI] Failed to fetch memories:', result.status || result.error);
+                if (result.status === 401) {
+                    console.error('[S.AI] Authentication failed - token may be invalid or expired. Auth token present:', result.hasAuth);
+                }
+                return false;
+            }
+            
+            console.log(`[S.AI] Fetched ${result.count} memories from API`);
+            
+            // Try multiple approaches to trigger React re-render
+            console.log('[S.AI] Attempting to trigger React re-render...');
+            console.log('[S.AI] Memory modal element:', memoryModal);
+            
+            // NEW Approach: Try to find and click the "Load More Memories" button
+            const loadMoreButton = Array.from(memoryModal.querySelectorAll('button'))
+                .find(btn => btn.textContent?.includes('Load More'));
+            
+            if (loadMoreButton) {
+                console.log('[S.AI] Found Load More button, clicking it');
+                loadMoreButton.click();
+                await new Promise(resolve => setTimeout(resolve, 500));
+                console.log('[S.AI] Load More clicked, checking if memories updated');
+                // The button click might trigger a refetch which would update the UI
+                // Fall through to close/reopen if this doesn't work
+            }
+            
+            // Approach 1: Find React component and manipulate state directly
+            try {
+                // Try the modal itself first
+                let elementToCheck = memoryModal;
+                let depth = 0;
+                
+                while (elementToCheck && depth < 5) {
+                    const allKeys = Object.keys(elementToCheck);
+                    const reactKeys = allKeys.filter(key => 
+                        key.startsWith('__react') || key.includes('react') || key.includes('fiber')
+                    );
+                    
+                    if (reactKeys.length > 0) {
+                        console.log('[S.AI] Found React keys at depth', depth, ':', reactKeys);
+                        
+                        const reactKey = reactKeys[0];
+                        const reactObj = elementToCheck[reactKey];
+                        
+                        // Walk the fiber tree
+                        let current = reactObj;
+                        let attempts = 0;
+                        while (current && attempts < 30) {
+                            if (current.stateNode && typeof current.stateNode.forceUpdate === 'function') {
+                                console.log('[S.AI] Found forceUpdate at level', attempts, '- calling it');
+                                current.stateNode.forceUpdate();
+                                await new Promise(resolve => setTimeout(resolve, 1000));
+                                console.log('[S.AI] Memory refresh completed (via forceUpdate)');
+                                return true;
+                            }
+                            current = current.return;
+                            attempts++;
+                        }
+                        break;
+                    }
+                    
+                    elementToCheck = elementToCheck.parentElement;
+                    depth++;
+                }
+                
+                console.log('[S.AI] No React fiber found after checking', depth, 'parent levels');
+            } catch (e) {
+                console.error('[S.AI] React manipulation failed:', e);
+            }
+            
+            // Approach 2: Close and reopen (most reliable)
+            console.log('[S.AI] Attempting close/reopen approach...');
+            
+            // Try multiple close button selectors - use aria-label="X-button"
+            let closeButton = memoryModal.querySelector('button[aria-label="X-button"]');
+            if (!closeButton) {
+                closeButton = memoryModal.querySelector('button[aria-label="Close"]');
+            }
+            if (!closeButton) {
+                // Look for button with X icon
+                const buttons = Array.from(memoryModal.querySelectorAll('button'));
+                console.log('[S.AI] Searching through', buttons.length, 'buttons for close button');
+                closeButton = buttons.find(btn => {
+                    const svg = btn.querySelector('svg');
+                    if (!svg) return false;
+                    // Close buttons typically have an X icon with crossing paths
+                    const paths = svg.querySelectorAll('path');
+                    return paths.length >= 2;
+                });
+            }
+            
+            if (closeButton) {
+                console.log('[S.AI] Found close button, closing modal...');
+                
+                // TRICK: Create a simple invisible placeholder div to hold the sidebar space
+                // This is cleaner than opening Generation Settings
+                let placeholderDiv = null;
+                
+                // Check if Generation Settings is already open
+                const allModals = Array.from(document.querySelectorAll('div.fixed'));
+                const hasGenerationSettings = allModals.some(modal => {
+                    const heading = modal.querySelector('p.text-heading-6');
+                    return heading && heading.textContent.includes('Generation Settings');
+                });
+                
+                if (!hasGenerationSettings) {
+                    console.log('[S.AI] Creating invisible placeholder to hold sidebar space');
+                    
+                    // Create a simple placeholder that looks like a sidebar to the layout engine
+                    placeholderDiv = document.createElement('div');
+                    placeholderDiv.id = 'sai-sidebar-placeholder';
+                    placeholderDiv.style.cssText = `
+                        position: fixed;
+                        top: 0;
+                        right: 0;
+                        width: 400px;
+                        height: 100vh;
+                        pointer-events: none;
+                        z-index: 1;
+                        background: transparent;
+                    `;
+                    
+                    document.body.appendChild(placeholderDiv);
+                    console.log('[S.AI] Placeholder div created');
+                }
+                
+                // Now close the Memories modal
+                closeButton.click();
+                closeButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                closeButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                closeButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+                
+                // Wait just long enough for close
+                await new Promise(resolve => setTimeout(resolve, 50));
+                
+                // Reopen quickly - search more thoroughly for the Memory Manager button
+                console.log('[S.AI] Looking for Memory Manager button to reopen...');
+                
+                // First, try to find and open the chat dropdown menu
+                const menuButton = document.querySelector('button[aria-label="chat-dropdown"]');
+                if (menuButton) {
+                    console.log('[S.AI] Found chat dropdown menu button, opening it...');
+                    menuButton.click();
+                    await new Promise(resolve => setTimeout(resolve, 30));
+                } else {
+                    console.log('[S.AI] Chat dropdown button not found');
+                }
+                
+                // Try multiple selectors for the Manage Memories button
+                console.log('[S.AI] Looking for Manage Memories button...');
+                let memoryButton = document.querySelector('button[aria-label="Manage Memories"]');
+                console.log('[S.AI] Direct selector result:', !!memoryButton);
+                
+                if (!memoryButton) {
+                    // Look through all buttons for one with "Manage Memories" text
+                    const allButtons = Array.from(document.querySelectorAll('button'));
+                    console.log('[S.AI] Searching through', allButtons.length, 'buttons on page');
+                    
+                    const memoryButtons = allButtons.filter(btn => {
+                        const text = btn.textContent || '';
+                        const ariaLabel = btn.getAttribute('aria-label') || '';
+                        return text.toLowerCase().includes('manage memor') || ariaLabel.toLowerCase().includes('manage memor');
+                    });
+                    
+                    console.log('[S.AI] Found', memoryButtons.length, 'buttons with "manage memor" in text/aria-label');
+                    if (memoryButtons.length > 0) {
+                        memoryButtons.forEach((btn, i) => {
+                            console.log(`[S.AI] Memory button ${i}:`, {
+                                text: btn.textContent?.substring(0, 50),
+                                ariaLabel: btn.getAttribute('aria-label'),
+                                visible: btn.offsetParent !== null,
+                                displayed: window.getComputedStyle(btn).display !== 'none'
+                            });
+                        });
+                    }
+                    
+                    // Use the first one found
+                    memoryButton = memoryButtons[0];
+                }
+                
+                if (memoryButton) {
+                    console.log('[S.AI] Found Memory Manager button:', memoryButton.textContent || memoryButton.getAttribute('aria-label'));
+                    memoryButton.click();
+                    
+                    // Wait a moment for the modal to reopen and re-style the Load More button
+                    setTimeout(() => {
+                        // Find the reopened Memories modal by checking all modals
+                        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
+                        let reopenedModal = null;
+                        
+                        for (const modal of allModals) {
+                            const heading = modal.querySelector('p.text-heading-6');
+                            if (heading && heading.textContent.trim() === 'Memories') {
+                                reopenedModal = modal;
+                                break;
+                            }
+                        }
+                        
+                        if (reopenedModal) {
+                            styleLoadMoreButton(reopenedModal);
+                        }
+                        
+                        // Remove the placeholder div if we created one
+                        if (placeholderDiv) {
+                            placeholderDiv.remove();
+                            console.log('[S.AI] Removed placeholder div');
+                        }
+                    }, 500);
+                    
+                    console.log('[S.AI] Memory refresh completed (via close/reopen)');
+                    return true;
+                } else {
+                    console.log('[S.AI] Could not find Memory Manager button to reopen');
+                    console.log('[S.AI] Tried aria-label and text content searches');
+                }
+            } else {
+                console.log('[S.AI] Could not find close button');
+                // Log the modal structure to help debug
+                console.log('[S.AI] Modal HTML structure:', memoryModal.outerHTML.substring(0, 500));
+            }
+            
+            // Clean up overlay and spacer if they still exist
+            const overlay = document.getElementById('sai-refresh-overlay');
+            const spacer = document.getElementById('sai-refresh-spacer');
+            if (overlay) overlay.remove();
+            if (spacer) spacer.remove();
+            
+            console.log('[S.AI] All refresh approaches attempted');
+            return true;
+            
+        } catch (error) {
+            console.error('[S.AI] Error refreshing memories:', error);
+            
+            // Clean up placeholder div if it exists
+            if (placeholderDiv) {
+                placeholderDiv.remove();
+                console.log('[S.AI] Removed placeholder div after error');
+            }
+            
+            return false;
+        }
+    }
+    
+    /**
+     * Starts the auto-refresh interval for the Memory Manager modal
+     * DISABLED: Auto-refresh is currently disabled to prevent issues
+     */
+    function startMemoryRefresh() {
+        // Auto-refresh disabled - use manual refresh button instead
+        console.log('[S.AI] Memory Manager auto-refresh is disabled');
+        return;
+        
+        // Clear any existing interval first
+        if (memoryRefreshInterval) {
+            clearInterval(memoryRefreshInterval);
+        }
+        
+        console.log('[S.AI] Memory Manager auto-refresh started (120 seconds)');
+        
+        // Set up interval to refresh every 120 seconds
+        memoryRefreshInterval = setInterval(() => {
+            // Check if modal is still open
+            const memoryModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2[class*="z-\\[900000\\]"]');
+            if (memoryModal) {
+                const memoryHeading = memoryModal.querySelector('p.text-heading-6');
+                if (memoryHeading && memoryHeading.textContent.trim() === 'Memories') {
+                    refreshMemoryContent();
+                } else {
+                    // Modal is open but it's not the Memory Manager, stop the interval
+                    console.log('[S.AI] Memory Manager closed, stopping auto-refresh');
+                    clearInterval(memoryRefreshInterval);
+                    memoryRefreshInterval = null;
+                }
+            } else {
+                // Modal is no longer open, stop the interval
+                console.log('[S.AI] Memory Manager closed, stopping auto-refresh');
+                clearInterval(memoryRefreshInterval);
+                memoryRefreshInterval = null;
+            }
+        }, 120000); // 120 seconds = 120000 milliseconds
+    }
+    
+    /**
+     * Stops the auto-refresh interval
+     */
+    function stopMemoryRefresh() {
+        if (memoryRefreshInterval) {
+            clearInterval(memoryRefreshInterval);
+            memoryRefreshInterval = null;
+            console.log('[S.AI] Memory Manager auto-refresh stopped');
+        }
+    }
+    
+    /**
+     * Adds a manual refresh button to the Memory Manager modal
+     */
+    function addManualRefreshButton(modal) {
+        // Mark modal as being processed to prevent duplicate calls
+        if (modal.dataset.saiButtonProcessing) {
+            console.log('[S.AI] Refresh button already being added');
+            return;
+        }
+        modal.dataset.saiButtonProcessing = 'true';
+        
+        // Check if button already exists
+        if (modal.querySelector('[data-sai-refresh-button]')) {
+            console.log('[S.AI] Refresh button already exists');
+            delete modal.dataset.saiButtonProcessing;
+            return;
+        }
+        
+        // Wait a bit for React to fully render the modal buttons
+        setTimeout(() => {
+            // Find the button container (with the + and ... buttons)
+            const buttonContainer = modal.querySelector('.flex.justify-end.items-undefined.m-0');
+            if (!buttonContainer) {
+                console.log('[S.AI] Could not find button container in Memory Manager');
+                console.log('[S.AI] Trying alternate selectors...');
+                
+                // Try finding any flex container with buttons
+                const altContainer = modal.querySelector('.flex.justify-end');
+                if (altContainer) {
+                    console.log('[S.AI] Found alternate container:', altContainer.className);
+                } else {
+                    console.log('[S.AI] No button container found at all');
+                }
+                return;
+            }
+            
+            console.log('[S.AI] Found button container:', buttonContainer.className);
+            console.log('[S.AI] Container children:', buttonContainer.children.length);
+            
+            // Find the + button (first button with lucide-square-plus SVG)
+            let addButton = buttonContainer.querySelector('svg.lucide-square-plus')?.closest('button');
+            
+            // If not found, try alternate approach
+            if (!addButton) {
+                console.log('[S.AI] Trying alternate add button selector...');
+                // Look for any button in the container
+                const buttons = buttonContainer.querySelectorAll('button');
+                console.log('[S.AI] Found buttons:', buttons.length);
+                
+                if (buttons.length > 0) {
+                    // Assume first button is the add button
+                    addButton = buttons[0];
+                    console.log('[S.AI] Using first button as reference');
+                } else {
+                    console.log('[S.AI] No buttons found in container');
+                    console.log('[S.AI] Container HTML:', buttonContainer.outerHTML.substring(0, 500));
+                    return;
+                }
+            }
+            
+            console.log('[S.AI] Found reference button, creating refresh button');
+            
+            // Create refresh button with the same styling as existing buttons
+            const refreshButton = document.createElement('button');
+            refreshButton.setAttribute('data-sai-refresh-button', 'true');
+            refreshButton.className = addButton.className; // Copy exact classes from add button
+            refreshButton.type = 'button';
+            refreshButton.title = 'Refresh memories';
+            refreshButton.setAttribute('default', '');
+            refreshButton.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-refresh-cw inline-flex items-center justify-center">
+                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                    <path d="M21 3v5h-5"></path>
+                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                    <path d="M3 21v-5h5"></path>
+                </svg>
+                <span class="flex items-center justify-center text-center gap-1.5"></span>
+            `;
+            
+            // Add click handler
+            refreshButton.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                console.log('[S.AI] Manual refresh triggered');
+                
+                // Visual feedback - spin the icon
+                const svg = refreshButton.querySelector('svg');
+                if (svg) {
+                    svg.style.transition = 'transform 0.5s ease';
+                    svg.style.transform = 'rotate(360deg)';
+                    setTimeout(() => {
+                        svg.style.transform = 'rotate(0deg)';
+                    }, 500);
+                }
+                
+                // Trigger refresh
+                await refreshMemoryContent();
+            });
+            
+            // Insert before the add button
+            buttonContainer.insertBefore(refreshButton, addButton);
+            
+            console.log('[S.AI] Manual refresh button added to Memory Manager');
+            console.log('[S.AI] Button visible in DOM:', !!modal.querySelector('[data-sai-refresh-button]'));
+            delete modal.dataset.saiButtonProcessing;
+        }, 500); // Wait 500ms for React to render
+    }
+    
+    /**
+     * Styles the "Load More Memories" button when sidebar layout is enabled
+     */
+    function styleLoadMoreButton(memoryModal) {
+        if (!memoryModal) return;
+        
+        const applyStyles = () => {
+            // Find the Load More Memories button
+            const buttons = memoryModal.querySelectorAll('button');
+            const loadMoreButton = Array.from(buttons).find(btn => 
+                btn.textContent?.includes('Load More Memories')
+            );
+            
+            if (loadMoreButton && !loadMoreButton.dataset.saiStyled) {
+                // Use !important to override React's inline styles
+                loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
+                loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
+                loadMoreButton.dataset.saiStyled = 'true';
+                console.log('[S.AI] Styled Load More Memories button for sidebar layout');
+                
+                // Watch for attribute changes in case React resets the style
+                const buttonObserver = new MutationObserver(() => {
+                    if (!loadMoreButton.style.marginTop || !loadMoreButton.style.marginBottom) {
+                        loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
+                        loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
+                    }
+                });
+                
+                buttonObserver.observe(loadMoreButton, {
+                    attributes: true,
+                    attributeFilter: ['style']
+                });
+                
+                return true; // Success
+            }
+            return false; // Button not found yet
+        };
+        
+        // Try immediately
+        if (!applyStyles()) {
+            // Button not rendered yet, wait and try again
+            setTimeout(() => {
+                if (!applyStyles()) {
+                    // Still not found, set up observer to watch for it
+                    const modalObserver = new MutationObserver((mutations) => {
+                        if (applyStyles()) {
+                            modalObserver.disconnect();
+                        }
+                    });
+                    
+                    modalObserver.observe(memoryModal, {
+                        childList: true,
+                        subtree: true
+                    });
+                    
+                    // Disconnect after 5 seconds to avoid memory leak
+                    setTimeout(() => modalObserver.disconnect(), 5000);
+                }
+            }, 500);
+        }
+    }
+    
+    /**
+     * Monitors for Memory Manager modal opening
+     */
+    function monitorMemoryModal() {
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        let foundModal = null;
+                        
+                        // Check if this is the Memory Manager modal
+                        if (node.classList && node.classList.contains('fixed')) {
+                            const heading = node.querySelector('p.text-heading-6');
+                            if (heading && heading.textContent.trim() === 'Memories') {
+                                foundModal = node;
+                            }
+                        }
+                        
+                        // Also check children in case modal was added in a container
+                        if (!foundModal) {
+                            const memoryModal = node.querySelector?.('div.fixed p.text-heading-6');
+                            if (memoryModal && memoryModal.textContent.trim() === 'Memories') {
+                                foundModal = node.querySelector('div.fixed');
+                            }
+                        }
+                        
+                        // If we found the modal, add button and start refresh
+                        if (foundModal) {
+                            console.log('[S.AI] Memory Manager detected, starting auto-refresh');
+                            addManualRefreshButton(foundModal);
+                            styleLoadMoreButton(foundModal);
+                            startMemoryRefresh();
+                            break; // Stop processing this mutation batch
+                        }
+                    }
+                }
+                
+                // Check for removed nodes to stop the interval if modal is closed
+                for (const node of mutation.removedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.classList && node.classList.contains('fixed')) {
+                            const heading = node.querySelector?.('p.text-heading-6');
+                            if (heading && heading.textContent.trim() === 'Memories') {
+                                console.log('[S.AI] Memory Manager removed from DOM');
+                                stopMemoryRefresh();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+        
+        console.log('[S.AI] Memory Manager auto-refresh monitor initialized');
+    }
+    
+    // Initialize the memory modal monitor
+    monitorMemoryModal();
+    
+    // Check if Memory Manager is already open on page load
+    setTimeout(() => {
+        const existingModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2');
+        if (existingModal) {
+            const heading = existingModal.querySelector('p.text-heading-6');
+            if (heading && heading.textContent.trim() === 'Memories') {
+                console.log('[S.AI] Memory Manager already open on page load');
+                addManualRefreshButton(existingModal);
+                styleLoadMoreButton(existingModal);
+                startMemoryRefresh();
+            }
+        }
+    }, 2000);
 
     // =============================================================================
     // =============================================================================
