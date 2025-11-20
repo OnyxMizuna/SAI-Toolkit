@@ -118,8 +118,8 @@ Continued use of the extension after updates indicates acceptance of the revised
 
 ## 9. Contact Us
 
-If you have any questions about this Privacy Policy or your data, please contact us at:  
-📧 **Email:** [support@sai-toolkit.com](mailto:support@sai-toolkit.com)
+If you have any questions about this Privacy Policy or your data, please contact us through:  
+📧 **GitHub:** [https://github.com/CLedebur/Spicychat.ai-Mods/issues](https://github.com/CLedebur/Spicychat.ai-Mods/issues)
 
 ---
 

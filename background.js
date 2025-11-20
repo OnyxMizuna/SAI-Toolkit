@@ -8,8 +8,6 @@ const storageAPI = typeof browser !== 'undefined' ? browser : chrome;
 
 // Log extension installation or update
 storageAPI.runtime.onInstalled.addListener((details) => {
-    console.log('[S.AI Toolkit] Extension installed/updated:', details.reason);
-    
     if (details.reason === 'install') {
         // Set default values on first install
         storageAPI.storage.local.set({
@@ -21,15 +19,12 @@ storageAPI.runtime.onInstalled.addListener((details) => {
             'timestampDateFirst': true
         });
         
-        // Open welcome page or instructions
-        console.log('[S.AI Toolkit] First install - defaults set');
+        // First install complete
     }
 });
 
 // Listen for messages from content script
 storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('[S.AI Toolkit Background] Received message:', message);
-    
     // Handle different message types
     if (message.type === 'getSettings') {
         // Return current settings
@@ -39,11 +34,9 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     if (message.type === 'notification') {
         // Could show browser notification here if needed
-        console.log('[S.AI Toolkit] Notification:', message.text);
     }
     
     return false;
 });
 
-// Log when extension is running
-console.log('[S.AI Toolkit] Background service worker active');
+// Background service worker active

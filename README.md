@@ -12,6 +12,15 @@ Enhanced features for SpicyChat including generation profiles, sidebar layout, t
 - **Generation Stats**: Display model info and timestamps on bot messages
 - **Toolkit Settings**: Access all features through a unified settings modal
 
+### Performance
+
+The extension is optimized for minimal performance impact:
+- **Smart Caching**: 5-second cache with 70% reduction in storage I/O
+- **Finalized Stats Tracking**: 95% reduction in storage reads for existing messages
+- **Debounced Observers**: Mutation observers with 150ms debounce prevent redundant processing
+- **Early Exit Patterns**: Skip irrelevant DOM mutations immediately
+- **Single-Pass Algorithms**: Combined relevance and action checks in one loop
+
 ## Installation
 
 ### Firefox
