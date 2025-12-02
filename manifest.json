@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "S.AI Toolkit",
-  "version": "1.0.18",
+  "version": "1.0.21",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
   "permissions": [
     "storage",
@@ -41,7 +41,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "sai-toolkit@spicychat.ai",
-      "strict_min_version": "79.0",
+      "strict_min_version": "142.0",
       "data_collection_permissions": {
         "required": ["none"]
       }

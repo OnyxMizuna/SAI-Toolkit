@@ -36,6 +36,11 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Could show browser notification here if needed
     }
     
+    if (message.type === 'ping') {
+        sendResponse({ pong: true });
+        return true;
+    }
+    
     return false;
 });
 

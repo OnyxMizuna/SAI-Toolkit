@@ -93,6 +93,24 @@ const prodLog = (...args) => {
     }
 }
 
+// Prevent duplicate initialization if script is injected multiple times
+if (window.__saiToolkitLoaded) {
+    console.log('[S.AI Toolkit] Already loaded, skipping duplicate initialization');
+} else {
+    window.__saiToolkitLoaded = true;
+}
+
+// Listen for ping from background script to confirm content script is running
+const runtimeAPI = typeof browser !== 'undefined' ? browser : chrome;
+if (runtimeAPI && runtimeAPI.runtime && runtimeAPI.runtime.onMessage) {
+    runtimeAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message.type === 'ping') {
+            sendResponse({ pong: true });
+            return true;
+        }
+    });
+}
+
 debugLog('[S.AI Toolkit] Content script starting...');
 debugLog('[S.AI Toolkit] URL:', window.location.href);
 debugLog('[S.AI Toolkit] Document ready state:', document.readyState);
@@ -391,7 +409,25 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const SIDEBAR_LAYOUT_KEY = 'enableSidebarLayout';      // Pin modals to right sidebar
     const CLASSIC_LAYOUT_KEY = 'enableClassicLayout';      // Classic message box layout
     const CLASSIC_STYLE_KEY = 'enableClassicStyle';        // Classic colors/styling
+    const CUSTOM_STYLE_KEY = 'enableCustomStyle';          // Custom colors/styling
+    const CUSTOM_STYLE_VALUES_KEY = 'customStyleValues';   // Stores custom color/font values
     const THEME_CUSTOMIZATION_KEY = 'enableThemeCustomization';  // DEPRECATED - migrated to CLASSIC_LAYOUT_KEY + CLASSIC_STYLE_KEY
+    
+    // Default custom style values
+    const DEFAULT_CUSTOM_STYLE = {
+        aiMessageBg: 'rgba(0, 100, 255, 0.1)',
+        userMessageBg: 'rgba(100, 100, 100, 0.1)',
+        bodyColor: '#ffffff',
+        spanQuoteColor: '#ffffff',
+        narrationColor: '#06B7DB',
+        highlightBgColor: '#06B7DB',
+        highlightTextColor: '#000000',
+        fontSize: '16px',
+        fontFamily: '',
+        fontWeight: 'normal',
+        fontStyle: 'normal',
+        textDecoration: 'none'
+    };
     
     // =============================================================================
     // STORAGE MIGRATION: Classic Theme -> Classic Layout + Classic Style
@@ -469,6 +505,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
     const classicLayoutEnabled = await storage.get(CLASSIC_LAYOUT_KEY, false);
     const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
+    const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
+    const customStyleValues = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
     
     // -------------------------------------------------------------------------
     // COMPOSER CSS INJECTION (Dependency: Sidebar Layout)
@@ -476,7 +514,9 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // The composer CSS (message input area styling) only works correctly with
     // sidebar layout enabled. It's designed specifically for that layout mode.
     // Without sidebar, the default SpicyChat layout is fine.
-    if (sidebarEnabled) {
+    // 
+    // Skip on lorebook pages - no chat interface there
+    if (sidebarEnabled && !window.location.pathname.startsWith('/lorebook')) {
         const injectComposerCSS = () => {
             // Wait for document.head to exist (very early in page lifecycle)
             if (!document.head) {
@@ -513,7 +553,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     }
     
     // Inject Sidebar Layout CSS early if enabled
-    if (sidebarEnabled) {
+    // Skip on lorebook pages - no modals to pin there
+    if (sidebarEnabled && !window.location.pathname.startsWith('/lorebook')) {
         const injectSidebarCSS = () => {
             if (!document.head) {
                 if (document.readyState === 'loading') {
@@ -606,6 +647,38 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         };
         
         injectClassicStyleCSS();
+    }
+    
+    // Inject Custom Style CSS early if enabled
+    if (customStyleEnabled) {
+        const injectCustomStyleCSS = () => {
+            if (!document.head) {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', injectCustomStyleCSS, { once: true });
+                } else {
+                    setTimeout(injectCustomStyleCSS, TIMING.CSS_RETRY_SHORT);
+                }
+                return;
+            }
+            
+            if (document.getElementById('sai-toolkit-custom-style-early')) {
+                return;
+            }
+            
+            const style = document.createElement('style');
+            style.id = 'sai-toolkit-custom-style-early';
+            style.textContent = getCustomStyleCSSEarly(customStyleValues);
+            
+            if (document.head.firstChild) {
+                document.head.insertBefore(style, document.head.firstChild);
+            } else {
+                document.head.appendChild(style);
+            }
+            
+            debugLog('[Toolkit] Custom Style CSS injected EARLY (before React initialization)');
+        };
+        
+        injectCustomStyleCSS();
     }
     
     // =============================================================================
@@ -1210,6 +1283,106 @@ button:hover {
 
 .py-md.rounded-\\[4px_20px_20px_20px\\] {
   background-color: rgba(100, 100, 100, .1) !important;
+}
+`;
+    }
+    
+    // =============================================================================
+    // CSS GENERATION FUNCTIONS - Custom Style
+    // =============================================================================
+    // FUNCTION: getCustomStyleCSSEarly()
+    // PURPOSE: Applies user-defined custom colors and font size to messages
+    // FEATURE: "Custom Style" checkbox (colors and font size)
+    // 
+    // WHY NEEDED:
+    // - Allows users to customize message appearance without preset themes
+    // - Provides fine-grained control over colors and typography
+    // - Mutually exclusive with Classic Style to prevent conflicts
+    // 
+    // PARAMETERS:
+    // - valuesJson: JSON string containing custom style values:
+    //   - aiMessageBg: AI message background color
+    //   - userMessageBg: User message background color
+    //   - textColor: Main text color
+    //   - italicColor: Italic/narration text color
+    //   - fontSize: Font size for message text
+    // =============================================================================
+    function getCustomStyleCSSEarly(valuesJson) {
+        let values;
+        try {
+            values = JSON.parse(valuesJson);
+        } catch (e) {
+            debugLog('[Custom Style] Error parsing custom style values, using defaults');
+            values = DEFAULT_CUSTOM_STYLE;
+        }
+        
+        return `
+/* Custom Style - User Defined Colors and Font Size */
+
+/* Body Text Color and Font Settings */
+div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] body,
+div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] html,
+div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"],
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
+  color: ${values.bodyColor} !important;
+  font-size: ${values.fontSize} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.fontWeight} !important;
+  font-style: ${values.fontStyle} !important;
+  text-decoration: ${values.textDecoration} !important;
+}
+
+/* Body Text - Spans (color and font) */
+div.p-0[style*="width: 100%"] span.leading-6,
+div.p-0[style*="width: 100%"] span.text-white,
+div.bg-gray-2 span.leading-6,
+div.bg-gray-2 span.text-white {
+  color: ${values.bodyColor} !important;
+  font-size: ${values.fontSize} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.fontWeight} !important;
+  font-style: ${values.fontStyle} !important;
+  text-decoration: ${values.textDecoration} !important;
+}
+
+/* Quote Text Color (q elements inside spans) */
+div.p-0[style*="width: 100%"] span.text-white q.text-colorQuote,
+div.p-0[style*="width: 100%"] span.text-white q.text-white,
+div.p-0[style*="width: 100%"] span.leading-6 q.text-colorQuote,
+div.p-0[style*="width: 100%"] span.leading-6 q.text-white,
+div.bg-gray-2 span.text-white q.text-colorQuote,
+div.bg-gray-2 span.text-white q.text-white,
+div.bg-gray-2 span.leading-6 q.text-colorQuote,
+div.bg-gray-2 span.leading-6 q.text-white {
+  color: ${values.spanQuoteColor} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+
+/* Narration Color (em, i, .narration, .styled) */
+div.p-0[style*="width: 100%"] em,
+div.p-0[style*="width: 100%"] i,
+div.p-0[style*="width: 100%"] .narration,
+div.p-0[style*="width: 100%"] .styled,
+div.bg-gray-2 em,
+div.bg-gray-2 i,
+div.bg-gray-2 .narration,
+div.bg-gray-2 .styled { 
+  color: ${values.narrationColor} !important;
+  font-style: italic !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+
+/* Highlight Color (blockquote.bg-colorHighlight) */
+div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight,
+div.bg-gray-2 blockquote.bg-colorHighlight {
+  background-color: ${values.highlightBgColor} !important;
+  color: ${values.highlightTextColor} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+
+/* Message Boxes - Custom Colors */
+
+.py-md.rounded-\\[20px_4px_20px_20px\\] {
+  background-color: ${values.aiMessageBg} !important;
+}
+
+.py-md.rounded-\\[4px_20px_20px_20px\\] {
+  background-color: ${values.userMessageBg} !important;
 }
 `;
     }
@@ -2026,7 +2199,26 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Listen for network interception data from page context
         if (event.data.type === 'SAI_MESSAGES_LOADED') {
             debugLog('[Stats] Received SAI_MESSAGES_LOADED from page context');
-            const { conversationId, botMessages, userMessages } = event.data;
+            const { conversationId, botMessages, userMessages, label } = event.data;
+            
+            // =================================================================
+            // HANDLE CHAT LABEL FOR PAGE TITLE (extracted from GET /messages)
+            // =================================================================
+            debugLog('[ChatTitle CONTENT] ========== SAI_MESSAGES_LOADED RECEIVED ==========');
+            debugLog('[ChatTitle CONTENT] Event data has label:', !!label);
+            debugLog('[ChatTitle CONTENT] Label value:', label);
+            
+            // Store label (even if null) and always update title
+            window.__saiChatLabel = label;
+            debugLog('[ChatTitle CONTENT] Stored in window.__saiChatLabel:', window.__saiChatLabel);
+            debugLog('[ChatTitle CONTENT] Calling updatePageTitle()...');
+            
+            // Always call updatePageTitle - it will handle both cases (with and without label)
+            updatePageTitle();
+            
+            // =================================================================
+            // HANDLE MESSAGE STATS PROCESSING
+            // =================================================================
             
             // Store the conversation ID globally for buildIndexMapFromStats to use
             currentConversationId = conversationId;
@@ -2249,49 +2441,73 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }, 500);
         }
-        
-        // Listen for label data (for page title feature)
-        if (event.data.type === 'SAI_MESSAGES_LOADED') {
-            debugLog('[ChatTitle CONTENT] ========== SAI_MESSAGES_LOADED RECEIVED ==========');
-            debugLog('[ChatTitle CONTENT] Event data has label:', !!event.data.label);
-            debugLog('[ChatTitle CONTENT] Label value:', event.data.label);
-            
-            debugLog('[ChatTitle] Received SAI_MESSAGES_LOADED, label:', event.data.label);
-            
-            // Store label (even if null) and always update title
-            window.__saiChatLabel = event.data.label;
-            debugLog('[ChatTitle CONTENT] Stored in window.__saiChatLabel:', window.__saiChatLabel);
-            debugLog('[ChatTitle CONTENT] Calling updatePageTitle()...');
-            
-            // Always call updatePageTitle - it will handle both cases (with and without label)
-            updatePageTitle();
-        }
     });
     
-    // Update page title with character name and label
+    // Cache for title update feature setting (avoid repeated storage reads)
+    let cachedShowChatNameInTitle = null;
+    let cacheInitialized = false;
+    let titleUpdateRetries = 0;
+    const MAX_TITLE_RETRIES = 20; // Max 2 seconds of retries
+    
+    // Update page title with character name and label (synchronous for speed)
     async function updatePageTitle() {
         debugLog('[ChatTitle UPDATE] ========== updatePageTitle() CALLED ==========');
-        const showChatNameInTitle = await storage.get('showChatNameInTitle', false);
-        debugLog('[ChatTitle UPDATE] Feature enabled:', showChatNameInTitle);
         
-        if (!showChatNameInTitle) {
-            debugLog('[ChatTitle UPDATE] Feature is disabled, exiting');
+        // If cache not initialized yet, initialize it now (shouldn't happen but safety check)
+        if (!cacheInitialized) {
+            debugLog('[ChatTitle UPDATE] Cache not initialized, initializing now...');
+            cachedShowChatNameInTitle = await storage.get('showChatNameInTitle', false);
+            cacheInitialized = true;
+            debugLog('[ChatTitle UPDATE] Cache initialized to:', cachedShowChatNameInTitle);
+        }
+        
+        // Check cached setting (set by initial load and settings changes)
+        if (!cachedShowChatNameInTitle) {
+            debugLog('[ChatTitle UPDATE] Feature is disabled (cached value:', cachedShowChatNameInTitle, '), exiting');
             return;
         }
         
         const label = window.__saiChatLabel;
+        const currentTitle = document.title;
+        const titleIsEmpty = !currentTitle || currentTitle.trim() === '';
         
         debugLog('[ChatTitle UPDATE] Current state:');
         debugLog('[ChatTitle UPDATE]   - Label:', label);
-        debugLog('[ChatTitle UPDATE]   - Current document.title:', document.title);
+        debugLog('[ChatTitle UPDATE]   - Current document.title:', currentTitle || '<empty string>');
+        debugLog('[ChatTitle UPDATE]   - Title is empty?:', titleIsEmpty);
+        debugLog('[ChatTitle UPDATE]   - Retry count:', titleUpdateRetries, '/', MAX_TITLE_RETRIES);
+        
+        // If title is empty or not set yet, wait a bit and retry
+        if (titleIsEmpty) {
+            if (titleUpdateRetries < MAX_TITLE_RETRIES) {
+                titleUpdateRetries++;
+                debugLog('[ChatTitle UPDATE] Title is empty, waiting 100ms and retrying... (attempt', titleUpdateRetries, '/', MAX_TITLE_RETRIES, ')');
+                setTimeout(() => updatePageTitle(), 100);
+                return;
+            } else {
+                debugLog('[ChatTitle UPDATE] Max retries reached, giving up');
+                titleUpdateRetries = 0; // Reset for next time
+                return;
+            }
+        }
+        
+        // Reset retry counter on success
+        titleUpdateRetries = 0;
         
         // Extract character name from existing title
         // Format: "Chat with {name} on Spicychat" -> "{name}"
+        // Also handle already-shortened format: just "{name}" or "{name} (label)"
         let characterName = null;
-        const titleMatch = document.title.match(/^Chat with (.+) on Spicychat$/);
-        if (titleMatch) {
-            characterName = titleMatch[1];
-            debugLog('[ChatTitle UPDATE]   - Extracted character name from title:', characterName);
+        const fullTitleMatch = document.title.match(/^Chat with (.+) on Spicychat$/);
+        const shortTitleMatch = document.title.match(/^([^(]+?)(?:\s*\([^)]+\))?$/);
+        
+        if (fullTitleMatch) {
+            characterName = fullTitleMatch[1];
+            debugLog('[ChatTitle UPDATE]   - Extracted character name from full title:', characterName);
+        } else if (shortTitleMatch && !document.title.includes('Spicychat')) {
+            // Already shortened, extract base name (before any label in parentheses)
+            characterName = shortTitleMatch[1].trim();
+            debugLog('[ChatTitle UPDATE]   - Extracted character name from shortened title:', characterName);
         } else {
             debugLog('[ChatTitle UPDATE]   - Could not extract character name from title format');
         }
@@ -2319,15 +2535,31 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Track the last user message timestamp for later tagging
     let lastUserMessageTimestamp = null;
     
-    // Try to update page title immediately on page load (before API calls)
-    // This will shorten "Chat with X on Spicychat" to just "X"
-    setTimeout(async () => {
-        const showChatNameInTitle = await storage.get('showChatNameInTitle', false);
-        if (showChatNameInTitle && document.title.startsWith('Chat with ')) {
+    // Initialize the cached setting and try initial title update
+    // This happens early on page load to shorten title ASAP
+    (async () => {
+        cachedShowChatNameInTitle = await storage.get('showChatNameInTitle', false);
+        cacheInitialized = true;
+        debugLog('[ChatTitle] Cached setting initialized:', cachedShowChatNameInTitle);
+        
+        if (cachedShowChatNameInTitle && document.title.startsWith('Chat with ')) {
             debugLog('[ChatTitle] Attempting initial title update on page load');
-            updatePageTitle();
+            await updatePageTitle();
         }
-    }, TIMING.TITLE_UPDATE_DELAY);
+    })();
+    
+    // Also listen for setting changes to update the cache
+    window.addEventListener('message', async (event) => {
+        if (event.source !== window) return;
+        if (event.data.type === 'SAI_SETTINGS_CHANGED' && event.data.key === 'showChatNameInTitle') {
+            cachedShowChatNameInTitle = event.data.value;
+            cacheInitialized = true;
+            debugLog('[ChatTitle] Setting cache updated:', cachedShowChatNameInTitle);
+            if (cachedShowChatNameInTitle) {
+                await updatePageTitle();
+            }
+        }
+    });
 
     // =============================================================================
     // SLIDER UPDATE HELPER - Shared React-compatible slider update logic (Issue #16)
@@ -3800,37 +4032,131 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     transform: translate(-50%, -50%);
                     background: white;
                     border-radius: 12px;
-                    width: 400px;
-                    max-width: 90vw;
-                    max-height: 600px;
+                    width: 420px;
+                    max-width: 95vw;
+                    max-height: 85vh;
                     z-index: 10000004;
                     pointer-events: auto;
                     display: flex;
                     flex-direction: column;
-                    padding: 1.5rem;
-                    gap: 1.5rem;
+                    padding: 1rem;
+                    gap: 0.75rem;
+                }
+                @media (max-width: 480px) {
+                    .modal {
+                        width: 100%;
+                        max-width: 100vw;
+                        max-height: 100vh;
+                        border-radius: 0;
+                        padding: 0.75rem;
+                    }
                 }
                 @media (prefers-color-scheme: dark) {
                     .modal { background: #1a1a1a; color: white; }
                 }
                 .modal-header {
                     text-align: center;
-                    font-size: 1.25rem;
+                    font-size: 1.1rem;
                     font-weight: bold;
+                    padding-bottom: 0.5rem;
                 }
+                
+                /* Tab Navigation */
+                .tab-nav {
+                    display: flex;
+                    gap: 0.25rem;
+                    border-bottom: 1px solid #e5e7eb;
+                    padding-bottom: 0.5rem !important;
+                    margin-bottom: 0.5rem;
+                    overflow-x: auto;
+                    -webkit-overflow-scrolling: touch;
+                    scrollbar-width: none;
+                    flex-shrink: 0;
+                }
+                .tab-nav::-webkit-scrollbar {
+                    display: none;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .tab-nav { border-color: #404040; }
+                }
+                .tab-btn {
+                    flex: 1;
+                    min-width: 70px;
+                    min-height: 52px;
+                    padding: 0.5rem 0.5rem;
+                    border: none;
+                    background: transparent;
+                    color: #6b7280;
+                    font-size: 12px !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    font-weight: 500 !important;
+                    font-style: normal !important;
+                    text-decoration: none !important;
+                    line-height: 1.2 !important;
+                    cursor: pointer;
+                    border-radius: 6px;
+                    transition: all 0.2s;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 0.25rem;
+                    white-space: nowrap;
+                }
+                .tab-btn:hover {
+                    background: #f3f4f6;
+                    color: #374151;
+                }
+                .tab-btn.active {
+                    background: #3b82f6;
+                    color: white;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .tab-btn { color: #9ca3af; }
+                    .tab-btn:hover { background: #2a2a2a; color: #d1d5db; }
+                    .tab-btn.active { background: #3b82f6; color: white; }
+                }
+                .tab-icon {
+                    width: 18px;
+                    height: 18px;
+                    min-width: 18px;
+                    min-height: 18px;
+                    flex-shrink: 0;
+                }
+                @media (max-width: 380px) {
+                    .tab-btn span { display: none; }
+                    .tab-btn { min-width: 44px; padding: 0.5rem; }
+                    .tab-icon { width: 20px; height: 20px; min-width: 20px; min-height: 20px; }
+                }
+                
+                /* Tab Content */
+                .tab-content {
+                    display: none;
+                    flex-direction: column;
+                    gap: 0.5rem;
+                    overflow-y: auto;
+                    flex: 1;
+                    min-height: 0;
+                }
+                .tab-content.active {
+                    display: flex;
+                }
+                
                 .modal-body {
                     overflow-y: auto;
                     display: flex;
                     flex-direction: column;
-                    gap: 1rem;
+                    gap: 0.5rem;
+                    flex: 1;
+                    min-height: 0;
                 }
                 .setting-row {
                     background: #f3f4f6;
-                    padding: 1rem;
-                    border-radius: 1rem;
+                    padding: 0.6rem 0.75rem;
+                    border-radius: 0.75rem;
                     display: flex;
                     align-items: center;
-                    gap: 0.75rem;
+                    gap: 0.5rem;
                 }
                 @media (prefers-color-scheme: dark) {
                     .setting-row { background: #2a2a2a; }
@@ -3842,8 +4168,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     .setting-row:hover { background: #333; }
                 }
                 .setting-checkbox {
-                    width: 20px;
-                    height: 20px;
+                    width: 18px;
+                    height: 18px;
                     cursor: pointer;
                     flex-shrink: 0;
                 }
@@ -3852,24 +4178,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     cursor: pointer;
                 }
                 .setting-title {
-                    font-size: 14px;
+                    font-size: 13px;
                     font-weight: 500;
-                    margin-bottom: 4px;
+                    margin-bottom: 2px;
                 }
                 .setting-desc {
-                    font-size: 12px;
+                    font-size: 11px;
                     color: #6b7280;
+                    line-height: 1.3;
                 }
                 .sub-setting-row {
                     background: #e5e7eb;
-                    padding: 0.75rem;
+                    padding: 0.5rem 0.6rem;
                     padding-left: 0.5rem;
                     border-radius: 0.5rem;
                     margin-top: -0.25rem;
                     display: flex;
                     align-items: center;
                     gap: 0.5rem;
-                    margin-left: 2rem;
+                    margin-left: 1.5rem;
                 }
                 @media (prefers-color-scheme: dark) {
                     .sub-setting-row { background: #1f1f1f; }
@@ -3885,28 +4212,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     cursor: pointer;
                 }
                 .sub-setting-title {
-                    font-size: 13px;
+                    font-size: 12px;
                     font-weight: 400;
                 }
                 .hidden {
                     display: none !important;
                 }
-                .data-management-section {
-                    margin-top: 1.5rem;
-                    padding-top: 1rem;
-                }
-                .section-divider {
-                    height: 1px;
-                    background: #e5e7eb;
-                    margin-bottom: 1rem;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .section-divider { background: #404040; }
-                }
                 .section-title {
-                    font-size: 13px;
+                    font-size: 12px;
                     font-weight: 600;
                     margin-bottom: 0.25rem;
+                    margin-top: 0.5rem;
                     color: #374151;
                 }
                 @media (prefers-color-scheme: dark) {
@@ -3915,33 +4231,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 .section-desc {
                     font-size: 11px;
                     color: #6b7280;
-                    margin-bottom: 0.75rem;
+                    margin-bottom: 0.5rem;
                 }
                 .data-buttons {
                     display: flex;
                     gap: 0.5rem;
+                    flex-wrap: wrap;
                 }
                 .version-text {
-                    margin-top: 1rem;
+                    margin-top: 0.75rem;
                     text-align: center;
-                    font-size: 12px;
+                    font-size: 11px;
                     color: #9ca3af;
                     font-weight: 400;
                 }
                 @media (prefers-color-scheme: dark) {
-                    .version-text {
-                        color: #6b7280;
-                    }
+                    .version-text { color: #6b7280; }
                 }
                 .btn-data {
                     flex: 1;
-                    padding: 0.5rem 0.75rem;
+                    min-width: 120px;
+                    padding: 0.4rem 0.6rem;
                     border-radius: 6px;
                     border: 1px solid #d1d5db;
                     background: #f9fafb;
                     color: #374151;
                     cursor: pointer;
-                    font-size: 12px;
+                    font-size: 11px;
                     font-weight: 500;
                     transition: all 0.2s;
                 }
@@ -3975,7 +4291,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     border-radius: 8px;
                     border: none;
                     cursor: pointer;
-                    font-size: 14px;
+                    font-size: 13px !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    font-weight: 500 !important;
+                    font-style: normal !important;
+                    text-decoration: none !important;
                     transition: all 0.2s;
                 }
                 .btn-cancel {
@@ -3996,6 +4316,93 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 .btn-save:hover {
                     background: #2563eb;
                 }
+                
+                /* Custom Style Options */
+                .custom-style-options {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.5rem;
+                    padding: 0.75rem;
+                    background: rgba(255,255,255,0.05);
+                    border-radius: 8px;
+                    border: 1px solid rgba(255,255,255,0.1);
+                    margin-top: 0.25rem;
+                }
+                .style-input-row {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.75rem;
+                }
+                .style-label {
+                    min-width: 100px;
+                    flex-shrink: 0;
+                    color: #d1d5db;
+                    font-size: 12px;
+                    font-weight: 500;
+                }
+                @media (max-width: 380px) {
+                    .style-label { min-width: 80px; font-size: 11px; }
+                }
+                .style-input {
+                    flex: 1;
+                    min-width: 0;
+                    padding: 0.5rem;
+                    background: #2a2a2a;
+                    border: 1px solid #555;
+                    color: #fff;
+                    border-radius: 6px;
+                    font-size: 12px;
+                    font-family: 'Courier New', monospace;
+                }
+                .style-select {
+                    flex: 1;
+                    min-width: 0;
+                    padding: 0.5rem;
+                    background: #2a2a2a;
+                    border: 1px solid #555;
+                    color: #fff;
+                    border-radius: 6px;
+                    font-size: 12px;
+                }
+                .color-preview {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 4px;
+                    border: 1px solid #555;
+                    flex-shrink: 0;
+                    background: transparent;
+                    background-image: linear-gradient(45deg, #666 25%, transparent 25%), linear-gradient(-45deg, #666 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #666 75%), linear-gradient(-45deg, transparent 75%, #666 75%);
+                    background-size: 8px 8px;
+                    background-position: 0 0, 0 4px, 4px -4px, -4px 0px;
+                }
+                .color-preview-inner {
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 3px;
+                }
+                .font-preview {
+                    padding: 0.5rem 0.75rem;
+                    background: #1a1a1a;
+                    border: 1px solid #555;
+                    border-radius: 6px;
+                    margin-top: 0.5rem;
+                    text-align: left;
+                }
+                .font-preview-text {
+                    color: #fff;
+                    font-size: 16px;
+                    line-height: 1.6;
+                }
+                .preview-quote {
+                    color: #fff;
+                }
+                .preview-narration {
+                    font-style: italic;
+                }
+                .preview-highlight {
+                    padding: 0 0.25em;
+                    border-radius: 2px;
+                }
             `;
             shadow.appendChild(style);
         }
@@ -4015,6 +4422,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
         let classicLayoutEnabled = await storage.get(CLASSIC_LAYOUT_KEY, false);
         let classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
+        let customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
+        let customStyleValues = JSON.parse(await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE)));
         let hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
         let pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
         let showStatsEnabled = await storage.get('showGenerationStats', false);
@@ -4023,7 +4432,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let timestampDateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
         let showChatNameInTitleEnabled = await storage.get('showChatNameInTitle', false);
         
-        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
+        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
         
         // Create backdrop
         debugLog('[Toolkit] Creating backdrop and modal elements');
@@ -4036,128 +4445,265 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Using static HTML template - checkboxes will be set programmatically below
         modal.innerHTML = `
             <div class="modal-header">S.AI Toolkit Settings</div>
+            
+            <!-- Tab Navigation -->
+            <div class="tab-nav">
+                <button class="tab-btn active" data-tab="layout">
+                    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="9" y1="3" x2="9" y2="21"></line>
+                    </svg>
+                    <span>Layout</span>
+                </button>
+                <button class="tab-btn" data-tab="style">
+                    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="13.5" cy="6.5" r="0.5" fill="currentColor"></circle>
+                        <circle cx="17.5" cy="10.5" r="0.5" fill="currentColor"></circle>
+                        <circle cx="8.5" cy="7.5" r="0.5" fill="currentColor"></circle>
+                        <circle cx="6.5" cy="12.5" r="0.5" fill="currentColor"></circle>
+                        <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.555C21.965 6.012 17.461 2 12 2z"></path>
+                    </svg>
+                    <span>Style</span>
+                </button>
+                <button class="tab-btn" data-tab="features">
+                    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                    </svg>
+                    <span>Features</span>
+                </button>
+                <button class="tab-btn" data-tab="data">
+                    <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <span>Data</span>
+                </button>
+            </div>
+            
             <div class="modal-body">
-
-            <div class="modal-sub-header">Visuals</div>
-            <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Sidebar Layout</div>
-                        <div class="setting-desc">Pin the Generation Settings and Memories modals to sidebar.</div>
-                    </div>
-                </label>
-                <label class="sub-setting-row hidden" id="compact-generation-row">
-                    <input type="checkbox" class="setting-checkbox" id="compact-generation-checkbox" autocomplete="off">
-                    <div class="sub-setting-text">
-                        <div class="sub-setting-title">Compact Generation Settings</div>
-                        <div class="setting-desc">Hide descriptive text for each inference setting to make the modal more compact</div>
-                    </div>
-                </label>
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="classic-layout-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Classic Chat Layout</div>
-                        <div class="setting-desc">Applies the classic message box layout with centered positioning and proper sizing. Credit goes to <strong>MssAcc</strong> on Discord.</div>
-                    </div>
-                </label>
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="classic-style-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Classic Style</div>
-                        <div class="setting-desc">Applies the classic colors and styling (text colors, link colors, message box backgrounds). Credit goes to <strong>MssAcc</strong> on Discord.</div>
-                    </div>
-                </label>
+                <!-- Layout Tab -->
+                <div class="tab-content active" id="tab-layout">
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="sidebar-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Sidebar Layout</div>
+                            <div class="setting-desc">Pin Generation Settings and Memories modals to sidebar</div>
+                        </div>
+                    </label>
+                    <label class="sub-setting-row hidden" id="compact-generation-row">
+                        <input type="checkbox" class="setting-checkbox" id="compact-generation-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Compact Generation Settings</div>
+                            <div class="setting-desc">Hide descriptive text for each setting</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="classic-layout-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Classic Chat Layout</div>
+                            <div class="setting-desc">Centered message boxes with proper sizing (by MssAcc)</div>
+                        </div>
+                    </label>
+                </div>
                 
-            <br>
-            <div class="modal-sub-header">Main Page</div>
-
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Hide "For You" Characters</div>
-                        <div class="setting-desc">Hide character tiles with purple "For You" badge on page 1</div>
+                <!-- Style Tab -->
+                <div class="tab-content" id="tab-style">
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="classic-style-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Classic Style</div>
+                            <div class="setting-desc">Classic colors and styling (by MssAcc)</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="custom-style-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Custom Style</div>
+                            <div class="setting-desc">Custom colors and fonts (only one style at a time)</div>
+                        </div>
+                    </label>
+                    <div id="custom-style-options" class="custom-style-options hidden">
+                        <div class="style-input-row">
+                            <label class="style-label">Bot Message BG:</label>
+                            <input type="text" id="custom-ai-bg" class="style-input" placeholder="rgba(0, 100, 255, 0.1)">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-ai-bg"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">User Message BG:</label>
+                            <input type="text" id="custom-user-bg" class="style-input" placeholder="rgba(100, 100, 100, 0.1)">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-user-bg"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Body Text:</label>
+                            <input type="text" id="custom-body-color" class="style-input" placeholder="#ffffff">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-body-color"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Dialogue:</label>
+                            <input type="text" id="custom-span-quote-color" class="style-input" placeholder="#ffffff">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-quote-color"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Narration:</label>
+                            <input type="text" id="custom-narration-color" class="style-input" placeholder="#06B7DB">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-narration-color"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Highlight BG:</label>
+                            <input type="text" id="custom-highlight-bg-color" class="style-input" placeholder="#ffdd6d">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-bg"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Highlight Text:</label>
+                            <input type="text" id="custom-highlight-text-color" class="style-input" placeholder="#000000">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-text"></div></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Font Size:</label>
+                            <input type="text" id="custom-font-size" class="style-input" placeholder="16px">
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Font Family:</label>
+                            <input type="text" id="custom-font-family" class="style-input" placeholder="Arial, sans-serif">
+                        </div>
+                        <div class="font-preview" id="font-preview-box">
+                            <div class="font-preview-text" id="font-preview-text"><span class="preview-quote" id="preview-text-quote">&quot;Go right ahead, dearie!&quot;</span> <span class="preview-narration" id="preview-text-narration">Elara smiles. Her phone buzzes.</span> <span class="preview-highlight" id="preview-text-highlight">The drop has been made.</span></div>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Font Weight:</label>
+                            <select id="custom-font-weight" class="style-select">
+                                <option value="normal">Normal</option>
+                                <option value="bold">Bold</option>
+                                <option value="lighter">Lighter</option>
+                                <option value="100">100</option>
+                                <option value="200">200</option>
+                                <option value="300">300</option>
+                                <option value="400">400</option>
+                                <option value="500">500</option>
+                                <option value="600">600</option>
+                                <option value="700">700</option>
+                                <option value="800">800</option>
+                                <option value="900">900</option>
+                            </select>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Font Style:</label>
+                            <select id="custom-font-style" class="style-select">
+                                <option value="normal">Normal</option>
+                                <option value="italic">Italic</option>
+                                <option value="oblique">Oblique</option>
+                            </select>
+                        </div>
+                        <div class="style-input-row">
+                            <label class="style-label">Text Decoration:</label>
+                            <select id="custom-text-decoration" class="style-select">
+                                <option value="none">None</option>
+                                <option value="underline">Underline</option>
+                                <option value="overline">Overline</option>
+                                <option value="line-through">Line Through</option>
+                            </select>
+                        </div>
                     </div>
-                </label>
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Page Jump Modal</div>
-                        <div class="setting-desc">Click "..." pagination button to jump to any page</div>
-                    </div>
-                </label>
+                </div>
                 
-            <br>
-            <div class="modal-sub-header">Chat</div>
-
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Show generation stats in messages</div>
-                        <div class="setting-desc">Display model and generation settings below bot messages</div>
-                    </div>
-                </label>
+                <!-- Features Tab -->
+                <div class="tab-content" id="tab-features">
+                    <div class="section-title">Main Page</div>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="hideforyou-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Hide "For You" Characters</div>
+                            <div class="setting-desc">Hide tiles with purple "For You" badge on page 1</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="pagejump-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Page Jump Modal</div>
+                            <div class="setting-desc">Click "..." to jump to any page</div>
+                        </div>
+                    </label>
+                    
+                    <div class="section-title">Chat</div>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="showstats-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Show Generation Stats</div>
+                            <div class="setting-desc">Display model and settings below bot messages</div>
+                        </div>
+                    </label>
                     <label class="sub-setting-row hidden" id="generation-model-details-row">
                         <input type="checkbox" class="setting-checkbox" id="generation-model-details-checkbox" autocomplete="off">
                         <div class="sub-setting-text">
                             <div class="sub-setting-title">Show full model details</div>
-                            <div class="setting-desc">Show "Model → Engine" format. When disabled, shows only the requested model name.</div>
+                            <div class="setting-desc">Show "Model → Engine" format</div>
                         </div>
                     </label>
-
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="showtimestamp-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Show timestamps in messages</div>
-                        <div class="setting-desc">Display message timestamps below bot messages</div>
-                    </div>
-                </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="showtimestamp-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Show Timestamps</div>
+                            <div class="setting-desc">Display message timestamps</div>
+                        </div>
+                    </label>
                     <label class="sub-setting-row hidden" id="timestamp-format-row">
                         <input type="checkbox" class="setting-checkbox" id="timestamp-format-checkbox" autocomplete="off">
                         <div class="sub-setting-text">
                             <div class="sub-setting-title">Show date first</div>
-                            <div class="setting-desc">Format as "date @ time" instead of "time @ date"</div>
+                            <div class="setting-desc">Format: "date @ time"</div>
                         </div>
                     </label>
-
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="showchatnametitle-checkbox" autocomplete="off">
-                    <div class="setting-text">
-                        <div class="setting-title">Show chat name in page title</div>
-                        <div class="setting-desc">Display format: "Character Name (Label)" in browser tab title</div>
-                    </div>
-                </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="showchatnametitle-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Chat Name in Title</div>
+                            <div class="setting-desc">Show "Character (Label)" in browser tab</div>
+                        </div>
+                    </label>
+                    
+                    <div class="section-title">Memories</div>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="memories-auto-injection-checkbox" autocomplete="off" disabled>
+                        <div class="setting-text">
+                            <div class="setting-title">Memories Auto-Injection</div>
+                            <div class="setting-desc">Coming soon...</div>
+                        </div>
+                    </label>
+                </div>
                 
-            <br>
-            <div class="modal-sub-header">Memories</div>
-
-                <label class="setting-row">
-                    <input type="checkbox" class="setting-checkbox" id="memories-auto-injection-checkbox" autocomplete="off" disabled>
-                    <div class="setting-text">
-                        <div class="setting-title">Memories Auto-Injection</div>
-                        <div class="setting-desc">Automatically inject memories into conversations (Not yet implemented)</div>
-                    </div>
-                </label>
-
-                <div class="data-management-section">
-                    <div class="section-divider"></div>
-                    <div class="section-title">Data Management</div>
-                <div class="section-desc">Export or import all image generation profiles</div>
+                <!-- Data Tab -->
+                <div class="tab-content" id="tab-data">
+                    <div class="section-title">Generation Profiles</div>
+                    <div class="section-desc">Export or import image generation profiles</div>
                     <div class="data-buttons">
-                        <button class="btn-data" id="export-profiles-btn">Export Profiles</button>
-                        <button class="btn-data" id="import-profiles-btn">Import Profiles</button>
+                        <button class="btn-data" id="export-profiles-btn">Export</button>
+                        <button class="btn-data" id="import-profiles-btn">Import</button>
                     </div>
-                <br>
-                    <div class="section-desc">Export or import all settings, profiles, and message stats</div>
+                    
+                    <div class="section-title">Custom Style</div>
+                    <div class="section-desc">Export or import custom style settings</div>
                     <div class="data-buttons">
-                        <button class="btn-data" id="export-all-btn">Export All Data</button>
-                        <button class="btn-data" id="import-all-btn">Import All Data</button>
-                        <button class="btn-data" id="clear-all-btn">Clear All Data</button>
+                        <button class="btn-data" id="export-custom-style-btn">Export</button>
+                        <button class="btn-data" id="import-custom-style-btn">Import</button>
                     </div>
-                    <div class="version-text">v1.0.18</div>
+                    
+                    <div class="section-title">All Data</div>
+                    <div class="section-desc">Export/import everything (settings, profiles, stats)</div>
+                    <div class="data-buttons">
+                        <button class="btn-data" id="export-all-btn">Export All</button>
+                        <button class="btn-data" id="import-all-btn">Import All</button>
+                    </div>
+                    <div class="data-buttons" style="margin-top: 0.5rem;">
+                        <button class="btn-data" id="clear-all-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Clear All Data</button>
+                    </div>
+                    
+                    <div class="version-text">v1.0.23</div>
                 </div>
             </div>
+            
             <div class="button-row">
-                <button class="btn-cancel" id="cancel-btn">Cancel & Refresh</button>
+                <button class="btn-cancel" id="cancel-btn">Cancel</button>
                 <button class="btn-save" id="save-btn">Save & Refresh</button>
             </div>
         `;
@@ -4173,6 +4719,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const compactGenerationCheckbox = shadow.querySelector('#compact-generation-checkbox');
         const classicLayoutCheckbox = shadow.querySelector('#classic-layout-checkbox');
         const classicStyleCheckbox = shadow.querySelector('#classic-style-checkbox');
+        const customStyleCheckbox = shadow.querySelector('#custom-style-checkbox');
+        const customStyleOptions = shadow.querySelector('#custom-style-options');
+        const customAiBgInput = shadow.querySelector('#custom-ai-bg');
+        const customUserBgInput = shadow.querySelector('#custom-user-bg');
+        const customBodyColorInput = shadow.querySelector('#custom-body-color');
+        const customSpanQuoteColorInput = shadow.querySelector('#custom-span-quote-color');
+        const customNarrationColorInput = shadow.querySelector('#custom-narration-color');
+        const customHighlightBgColorInput = shadow.querySelector('#custom-highlight-bg-color');
+        const customHighlightTextColorInput = shadow.querySelector('#custom-highlight-text-color');
+        const customFontSizeInput = shadow.querySelector('#custom-font-size');
+        const customFontFamilyInput = shadow.querySelector('#custom-font-family');
+        const customFontWeightSelect = shadow.querySelector('#custom-font-weight');
+        const customFontStyleSelect = shadow.querySelector('#custom-font-style');
+        const customTextDecorationSelect = shadow.querySelector('#custom-text-decoration');
         const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
         const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
@@ -4189,6 +4749,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         compactGenerationCheckbox.checked = compactGenerationEnabled;
         classicLayoutCheckbox.checked = classicLayoutEnabled;
         classicStyleCheckbox.checked = classicStyleEnabled;
+        customStyleCheckbox.checked = customStyleEnabled;
+        customAiBgInput.value = customStyleValues.aiMessageBg;
+        customUserBgInput.value = customStyleValues.userMessageBg;
+        customBodyColorInput.value = customStyleValues.bodyColor;
+        customSpanQuoteColorInput.value = customStyleValues.spanQuoteColor;
+        customNarrationColorInput.value = customStyleValues.narrationColor;
+        customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
+        customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
+        customFontSizeInput.value = customStyleValues.fontSize;
+        customFontFamilyInput.value = customStyleValues.fontFamily || '';
+        customFontWeightSelect.value = customStyleValues.fontWeight || 'normal';
+        customFontStyleSelect.value = customStyleValues.fontStyle || 'normal';
+        customTextDecorationSelect.value = customStyleValues.textDecoration || 'none';
         hideForYouCheckbox.checked = hideForYouEnabled;
         pageJumpCheckbox.checked = pageJumpEnabled;
         showStatsCheckbox.checked = showStatsEnabled;
@@ -4218,6 +4791,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             compactGenerationRow.classList.add('hidden');
         }
         
+        // Show/hide custom style options based on custom style checkbox
+        if (customStyleEnabled) {
+            customStyleOptions.classList.remove('hidden');
+        } else {
+            customStyleOptions.classList.add('hidden');
+        }
+        
         debugLog('[Toolkit] Checkbox states set programmatically');
         
         // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
@@ -4233,11 +4813,34 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         });
         debugLog('[Toolkit] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
         
+        // Tab switching logic
+        const tabBtns = shadow.querySelectorAll('.tab-btn');
+        const tabContents = shadow.querySelectorAll('.tab-content');
+        tabBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const targetTab = btn.dataset.tab;
+                debugLog('[Toolkit] Tab switched to:', targetTab);
+                
+                // Update active states
+                tabBtns.forEach(b => b.classList.remove('active'));
+                tabContents.forEach(c => c.classList.remove('active'));
+                
+                btn.classList.add('active');
+                const targetContent = shadow.querySelector(`#tab-${targetTab}`);
+                if (targetContent) {
+                    targetContent.classList.add('active');
+                }
+            });
+        });
+        debugLog('[Toolkit] Tab switching initialized');
+        
         // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
         const exportProfilesBtn = shadow.querySelector('#export-profiles-btn');
         const importProfilesBtn = shadow.querySelector('#import-profiles-btn');
+        const exportCustomStyleBtn = shadow.querySelector('#export-custom-style-btn');
+        const importCustomStyleBtn = shadow.querySelector('#import-custom-style-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
         const clearAllBtn = shadow.querySelector('#clear-all-btn');
@@ -4298,7 +4901,120 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Toolkit] CLASSIC STYLE CHECKBOX CHANGED');
             classicStyleEnabled = e.target.checked;
             debugLog('[Toolkit] Classic Style:', classicStyleEnabled);
+            
+            // Mutual exclusivity: Disable Custom Style if Classic Style is enabled
+            if (classicStyleEnabled && customStyleEnabled) {
+                customStyleEnabled = false;
+                customStyleCheckbox.checked = false;
+                customStyleOptions.classList.add('hidden');
+            }
         };
+        
+        customStyleCheckbox.onchange = (e) => {
+            debugLog('[Toolkit] CUSTOM STYLE CHECKBOX CHANGED');
+            customStyleEnabled = e.target.checked;
+            debugLog('[Toolkit] Custom Style:', customStyleEnabled);
+            
+            // Mutual exclusivity: Disable Classic Style if Custom Style is enabled
+            if (customStyleEnabled && classicStyleEnabled) {
+                classicStyleEnabled = false;
+                classicStyleCheckbox.checked = false;
+            }
+            
+            // Toggle custom style options visibility
+            if (customStyleEnabled) {
+                customStyleOptions.classList.remove('hidden');
+            } else {
+                customStyleOptions.classList.add('hidden');
+            }
+        };
+        
+        // Update custom style values when inputs change
+        // Get preview elements
+        const previewAiBg = shadow.querySelector('#preview-ai-bg');
+        const previewUserBg = shadow.querySelector('#preview-user-bg');
+        const previewBodyColor = shadow.querySelector('#preview-body-color');
+        const previewQuoteColor = shadow.querySelector('#preview-quote-color');
+        const previewNarrationColor = shadow.querySelector('#preview-narration-color');
+        const previewHighlightBg = shadow.querySelector('#preview-highlight-bg');
+        const previewHighlightText = shadow.querySelector('#preview-highlight-text');
+        const fontPreviewText = shadow.querySelector('#font-preview-text');
+        const previewTextQuote = shadow.querySelector('#preview-text-quote');
+        const previewTextNarration = shadow.querySelector('#preview-text-narration');
+        const previewTextHighlight = shadow.querySelector('#preview-text-highlight');
+        
+        // Function to update font preview
+        const updateFontPreview = () => {
+            if (fontPreviewText) {
+                fontPreviewText.style.fontSize = customStyleValues.fontSize || '16px';
+                fontPreviewText.style.fontFamily = customStyleValues.fontFamily || 'inherit';
+                fontPreviewText.style.fontWeight = customStyleValues.fontWeight || 'normal';
+                fontPreviewText.style.fontStyle = customStyleValues.fontStyle || 'normal';
+                fontPreviewText.style.textDecoration = customStyleValues.textDecoration || 'none';
+                fontPreviewText.style.color = customStyleValues.bodyColor || '#fff';
+            }
+            if (previewTextQuote) {
+                previewTextQuote.style.color = customStyleValues.spanQuoteColor || '#fff';
+            }
+            if (previewTextNarration) {
+                previewTextNarration.style.color = customStyleValues.narrationColor || '#06B7DB';
+                previewTextNarration.style.fontFamily = customStyleValues.fontFamily || 'inherit';
+            }
+            if (previewTextHighlight) {
+                previewTextHighlight.style.backgroundColor = customStyleValues.highlightBgColor || '#ffdd6d';
+                previewTextHighlight.style.color = customStyleValues.highlightTextColor || '#000';
+            }
+        };
+        
+        // Initialize color previews
+        if (previewAiBg) previewAiBg.style.background = customStyleValues.aiMessageBg || 'transparent';
+        if (previewUserBg) previewUserBg.style.background = customStyleValues.userMessageBg || 'transparent';
+        if (previewBodyColor) previewBodyColor.style.background = customStyleValues.bodyColor || 'transparent';
+        if (previewQuoteColor) previewQuoteColor.style.background = customStyleValues.spanQuoteColor || 'transparent';
+        if (previewNarrationColor) previewNarrationColor.style.background = customStyleValues.narrationColor || 'transparent';
+        if (previewHighlightBg) previewHighlightBg.style.background = customStyleValues.highlightBgColor || 'transparent';
+        if (previewHighlightText) previewHighlightText.style.background = customStyleValues.highlightTextColor || 'transparent';
+        updateFontPreview();
+        
+        // Update custom style values when inputs change (with preview updates)
+        customAiBgInput.oninput = (e) => { 
+            customStyleValues.aiMessageBg = e.target.value;
+            if (previewAiBg) previewAiBg.style.background = e.target.value || 'transparent';
+        };
+        customUserBgInput.oninput = (e) => { 
+            customStyleValues.userMessageBg = e.target.value;
+            if (previewUserBg) previewUserBg.style.background = e.target.value || 'transparent';
+        };
+        customBodyColorInput.oninput = (e) => { 
+            customStyleValues.bodyColor = e.target.value;
+            if (previewBodyColor) previewBodyColor.style.background = e.target.value || 'transparent';
+            updateFontPreview();
+        };
+        customSpanQuoteColorInput.oninput = (e) => { 
+            customStyleValues.spanQuoteColor = e.target.value;
+            if (previewQuoteColor) previewQuoteColor.style.background = e.target.value || 'transparent';
+            updateFontPreview();
+        };
+        customNarrationColorInput.oninput = (e) => { 
+            customStyleValues.narrationColor = e.target.value;
+            if (previewNarrationColor) previewNarrationColor.style.background = e.target.value || 'transparent';
+            updateFontPreview();
+        };
+        customHighlightBgColorInput.oninput = (e) => { 
+            customStyleValues.highlightBgColor = e.target.value;
+            if (previewHighlightBg) previewHighlightBg.style.background = e.target.value || 'transparent';
+            updateFontPreview();
+        };
+        customHighlightTextColorInput.oninput = (e) => { 
+            customStyleValues.highlightTextColor = e.target.value;
+            if (previewHighlightText) previewHighlightText.style.background = e.target.value || 'transparent';
+            updateFontPreview();
+        };
+        customFontSizeInput.oninput = (e) => { customStyleValues.fontSize = e.target.value; updateFontPreview(); };
+        customFontFamilyInput.oninput = (e) => { customStyleValues.fontFamily = e.target.value; updateFontPreview(); };
+        customFontWeightSelect.onchange = (e) => { customStyleValues.fontWeight = e.target.value; updateFontPreview(); };
+        customFontStyleSelect.onchange = (e) => { customStyleValues.fontStyle = e.target.value; updateFontPreview(); };
+        customTextDecorationSelect.onchange = (e) => { customStyleValues.textDecoration = e.target.value; updateFontPreview(); };
         
         hideForYouCheckbox.onchange = (e) => {
             debugLog('[Toolkit] HIDE FOR YOU CHECKBOX CHANGED');
@@ -4415,15 +5131,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Do nothing - force user to use buttons
         };
         
-        // Cancel button - now refreshes page to avoid React conflicts
+        // Cancel button - just closes modal without saving or refreshing
         cancelBtn.onclick = (e) => {
-            debugLog('[Toolkit] Cancel & Refresh button clicked');
+            debugLog('[Toolkit] Cancel button clicked');
             e.stopPropagation();
-            showNotification('Refreshing page...');
-            setTimeout(() => {
-                debugLog('[Toolkit] Reloading page...');
-                window.location.reload();
-            }, 300);
+            closeModal();
         };
         
         // Clear All Data button - with confirmation dialog
@@ -4503,11 +5215,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         saveBtn.onclick = async (e) => {
             debugLog('[Toolkit] Save & Refresh button clicked');
             e.stopPropagation();
-            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
+            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
             await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
             await storage.set(COMPACT_GENERATION_KEY, compactGenerationEnabled);
             await storage.set(CLASSIC_LAYOUT_KEY, classicLayoutEnabled);
             await storage.set(CLASSIC_STYLE_KEY, classicStyleEnabled);
+            await storage.set(CUSTOM_STYLE_KEY, customStyleEnabled);
+            await storage.set(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(customStyleValues));
             await storage.set(HIDE_FOR_YOU_KEY, hideForYouEnabled);
             await storage.set(PAGE_JUMP_KEY, pageJumpEnabled);
             await storage.set('showGenerationStats', showStatsEnabled);
@@ -4576,6 +5290,72 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             };
         }
         
+        // Export Custom Style button
+        if (exportCustomStyleBtn) {
+            exportCustomStyleBtn.onclick = async (e) => {
+                e.stopPropagation();
+                try {
+                    const customStyleValuesJson = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+                    const customStyleValues = JSON.parse(customStyleValuesJson);
+                    const dataStr = JSON.stringify(customStyleValues, null, 2);
+                    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+                    const url = URL.createObjectURL(dataBlob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'spicychat-custom-style.json';
+                    link.click();
+                    URL.revokeObjectURL(url);
+                    showNotification('Custom Style exported');
+                } catch (error) {
+                    console.error('[Toolkit] Error exporting custom style:', error);
+                    alert('Error exporting custom style: ' + error.message);
+                }
+            };
+        }
+        
+        // Import Custom Style button
+        if (importCustomStyleBtn) {
+            importCustomStyleBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json';
+                input.addEventListener('change', async function(e) {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = async function(event) {
+                            try {
+                                const imported = JSON.parse(event.target.result);
+                                // Merge with defaults to ensure all fields exist
+                                const mergedValues = { ...DEFAULT_CUSTOM_STYLE, ...imported };
+                                // Update the in-memory values
+                                Object.assign(customStyleValues, mergedValues);
+                                // Update the UI inputs
+                                customAiBgInput.value = customStyleValues.aiMessageBg;
+                                customUserBgInput.value = customStyleValues.userMessageBg;
+                                customBodyColorInput.value = customStyleValues.bodyColor;
+                                customSpanQuoteColorInput.value = customStyleValues.spanQuoteColor;
+                                customNarrationColorInput.value = customStyleValues.narrationColor;
+                                customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
+                                customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
+                                customFontSizeInput.value = customStyleValues.fontSize;
+                                customFontFamilyInput.value = customStyleValues.fontFamily || '';
+                                customFontWeightSelect.value = customStyleValues.fontWeight || 'normal';
+                                customFontStyleSelect.value = customStyleValues.fontStyle || 'normal';
+                                customTextDecorationSelect.value = customStyleValues.textDecoration || 'none';
+                                showNotification('Custom Style imported - click Save to apply');
+                            } catch (err) {
+                                alert('Error importing custom style: ' + err.message);
+                            }
+                        };
+                        reader.readAsText(file);
+                    }
+                });
+                input.click();
+            };
+        }
+        
         // Export All Data button
         debugLog('[Toolkit] Attaching exportAllBtn onclick handler...');
         debugLog('[Toolkit] exportAllBtn element:', exportAllBtn);
@@ -4604,6 +5384,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 debugLog('[Toolkit] Fetching enableClassicStyle...');
                 const enableClassicStyle = await storage.get(CLASSIC_STYLE_KEY, false);
                 debugLog('[Toolkit] enableClassicStyle result:', enableClassicStyle, 'Type:', typeof enableClassicStyle);
+                
+                debugLog('[Toolkit] Fetching enableCustomStyle...');
+                const enableCustomStyle = await storage.get(CUSTOM_STYLE_KEY, false);
+                debugLog('[Toolkit] enableCustomStyle result:', enableCustomStyle, 'Type:', typeof enableCustomStyle);
+                
+                debugLog('[Toolkit] Fetching customStyleValues...');
+                const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+                debugLog('[Toolkit] customStyleValues result:', customStyleValuesStr, 'Type:', typeof customStyleValuesStr);
                 
                 debugLog('[Toolkit] Fetching enableCompactGeneration...');
                 const enableCompactGeneration = await storage.get(COMPACT_GENERATION_KEY, false);
@@ -4652,6 +5440,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     enableSidebarLayout,
                     enableClassicLayout,
                     enableClassicStyle,
+                    enableCustomStyle,
+                    customStyleValues: customStyleValuesStr,
                     enableCompactGeneration,
                     enableHideForYou,
                     enablePageJump,
@@ -4758,6 +5548,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
                         if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
                         if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
+                        if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
+                        if (imported.customStyleValues !== undefined) updates.customStyleValues = imported.customStyleValues;
                         // Support legacy key for backwards compatibility
                         if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
                             updates.enableClassicLayout = imported.enableThemeCustomization;
@@ -6160,14 +6952,28 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     const hasAlreadyReloaded = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
     
     // For new tab detection: check if this is a fresh navigation (not a reload)
-    const isNewTab = !hasAlreadyReloaded && 
-                     window.performance && 
-                     window.performance.navigation &&
-                     window.performance.navigation.type === 0; // 0 = TYPE_NAVIGATE (fresh load)
+    // Use newer PerformanceNavigationTiming API with fallback to deprecated API
+    function getNavigationType() {
+        // Try modern API first
+        const navEntries = performance.getEntriesByType('navigation');
+        if (navEntries && navEntries.length > 0) {
+            return navEntries[0].type; // 'navigate', 'reload', 'back_forward', 'prerender'
+        }
+        // Fallback to deprecated API
+        if (window.performance && window.performance.navigation) {
+            const types = ['navigate', 'reload', 'back_forward', 'reserved'];
+            return types[window.performance.navigation.type] || 'navigate';
+        }
+        return 'navigate';
+    }
+    
+    const navigationType = getNavigationType();
+    const isNewTab = !hasAlreadyReloaded && navigationType === 'navigate';
     
     console.log('[Toolkit] ==== NEW TAB CHECK ====');
     console.log('[Toolkit] URL:', location.href);
     console.log('[Toolkit] hasAlreadyReloaded:', hasAlreadyReloaded);
+    console.log('[Toolkit] navigationType:', navigationType);
     console.log('[Toolkit] isNewTab:', isNewTab);
     console.log('[Toolkit] readyState:', document.readyState);
     
@@ -6185,9 +6991,14 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             return;
         }
         
+        // Check if our toolkit UI was actually injected
+        const toolkitInjected = document.querySelector('sai-toolkit-modal') !== null;
+        console.log('[Toolkit] toolkitInjected:', toolkitInjected);
+        
         // If this is a new tab (fresh navigation) and we haven't reloaded yet, do it
-        if (isNewTab) {
-            console.log('[Toolkit] NEW TAB DETECTED - Setting reload flag and reloading...');
+        // OR if the toolkit wasn't injected properly
+        if ((isNewTab || !toolkitInjected) && !hasAlreadyReloaded) {
+            console.log('[Toolkit] NEW TAB DETECTED or toolkit not injected - Setting reload flag and reloading...');
             sessionStorage.setItem(RELOAD_FLAG_KEY, 'true');
             // Use a small delay to ensure sessionStorage is written
             setTimeout(() => {
@@ -6199,12 +7010,35 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
     }
     
+    // Handle visibility changes - for prerendered pages or tabs opened in background
+    let hasInitialized = false;
+    
+    async function initWhenVisible() {
+        if (hasInitialized) return;
+        
+        if (document.visibilityState === 'visible') {
+            hasInitialized = true;
+            console.log('[Toolkit] Page is visible, initializing...');
+            await checkAndReloadIfNeeded();
+        } else {
+            console.log('[Toolkit] Page not visible yet, waiting...');
+            document.addEventListener('visibilitychange', async function onVisible() {
+                if (document.visibilityState === 'visible' && !hasInitialized) {
+                    hasInitialized = true;
+                    console.log('[Toolkit] Page became visible, initializing...');
+                    document.removeEventListener('visibilitychange', onVisible);
+                    await checkAndReloadIfNeeded();
+                }
+            });
+        }
+    }
+    
     // Call initialization when DOM is ready
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', checkAndReloadIfNeeded);
+        document.addEventListener('DOMContentLoaded', initWhenVisible);
     } else {
         // DOM is already loaded
-        checkAndReloadIfNeeded();
+        initWhenVisible();
     }
     
 })(); // End of async IIFE
