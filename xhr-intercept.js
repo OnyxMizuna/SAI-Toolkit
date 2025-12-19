@@ -78,6 +78,50 @@
     let loadedMessageIds = [];
     let messageIdToIndexMap = {};
     
+    // NSFW Mode state - can be toggled via postMessage from content script
+    // Initialize from localStorage if available
+    let nsfwModeOverride = null; // null = use site default, true/false = override
+    try {
+        const stored = localStorage.getItem('sai_nsfw_mode_override');
+        if (stored !== null) {
+            nsfwModeOverride = stored === 'true';
+            debugLog('[NSFW] Loaded NSFW mode override from localStorage:', nsfwModeOverride);
+        }
+    } catch (e) {
+        // localStorage not available
+    }
+    
+    // Listen for NSFW mode toggle from content script
+    window.addEventListener('message', function(event) {
+        if (event.data && event.data.type === 'SAI_SET_NSFW_MODE') {
+            nsfwModeOverride = event.data.enabled;
+            debugLog('[NSFW] NSFW mode override set to:', nsfwModeOverride);
+            // Persist to localStorage
+            try {
+                if (nsfwModeOverride === null) {
+                    localStorage.removeItem('sai_nsfw_mode_override');
+                } else {
+                    localStorage.setItem('sai_nsfw_mode_override', String(nsfwModeOverride));
+                }
+            } catch (e) {
+                // localStorage not available
+            }
+            // Send confirmation back
+            window.postMessage({
+                type: 'SAI_NSFW_MODE_UPDATED',
+                enabled: nsfwModeOverride
+            }, '*');
+        }
+        
+        // Handle request for current NSFW state
+        if (event.data && event.data.type === 'SAI_GET_NSFW_MODE') {
+            window.postMessage({
+                type: 'SAI_NSFW_MODE_STATE',
+                enabled: nsfwModeOverride
+            }, '*');
+        }
+    });
+    
     // Intercept XMLHttpRequest
     const originalXHROpen = XMLHttpRequest.prototype.open;
     const originalXHRSend = XMLHttpRequest.prototype.send;
@@ -138,7 +182,9 @@
                                 id: msg.id,
                                 createdAt: msg.createdAt,
                                 inference_model: msg.inference_model,
-                                inference_settings: msg.inference_settings
+                                inference_settings: msg.inference_settings,
+                                is_alternative: msg.is_alternative || false,
+                                prev_id: msg.prev_id || null
                             })),
                             userMessages: userMessages.map(msg => ({
                                 id: msg.id,
@@ -196,22 +242,48 @@
                                 const createdAt = response.message.createdAt || response.message.created_at || null;
                                 const conversationId = response.message.conversation_id || response.message.chat_id || response.chat_id || response.conversation_id || null;
                                 
+                                // Check if this is a regeneration (alternative message)
+                                // IMPORTANT: prev_id exists for ALL messages (points to preceding message in conversation)
+                                // It does NOT indicate a regeneration! The API only sets is_alternative in GET /messages responses.
+                                // 
+                                // We can only detect regenerations at POST time by checking the request:
+                                // - continue_chat: true with empty message = regeneration/continue
+                                // - alt_message_id present = regenerating a specific alternative
+                                //
+                                // For now, we'll be conservative and NOT mark anything as alternative at POST time.
+                                // The SAI_MESSAGES_LOADED handler will correctly identify alternatives when the full
+                                // message list is loaded with is_alternative flags.
+                                const prevId = response.message.prev_id || null;
+                                const isAlternative = false; // Cannot reliably detect at POST time - let GET /messages handle it
+                                
                                 debugLog('[Stats XHR] ========== NEW BOT MESSAGE ==========');
                                 debugLog('[Stats XHR] Bot message ID:', messageId);
                                 debugLog('[Stats XHR] Raw response.message.createdAt:', response.message.createdAt);
                                 debugLog('[Stats XHR] Extracted createdAt value:', createdAt);
                                 debugLog('[Stats XHR] createdAt type:', typeof createdAt);
                                 debugLog('[Stats XHR] createdAt as Date:', new Date(createdAt).toISOString());
+                                debugLog('[Stats XHR] Is regeneration:', isAlternative, '(always false at POST time - see comment above)');
+                                debugLog('[Stats XHR] Previous message ID:', prevId);
                                 debugLog('[Stats XHR] =======================================');
                                 
-                                // Extract both request and response model names
-                                const requestModel = lastGenerationSettings.model;
-                                const responseModel = response.engine || requestModel;
-                                const modelDisplay = requestModel && responseModel && requestModel !== responseModel 
-                                    ? `${requestModel} → ${responseModel}` 
-                                    : responseModel;
+                                // Extract model info - use response.engine first (actual model used)
+                                // Fall back to lastGenerationSettings (requested model)
+                                const responseModel = response.engine || null;
+                                const requestModel = lastGenerationSettings?.model || null;
                                 
-                                debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel);
+                                // Build model display string
+                                let modelDisplay;
+                                if (requestModel && responseModel && requestModel !== responseModel) {
+                                    modelDisplay = `${requestModel} → ${responseModel}`;
+                                } else if (responseModel) {
+                                    modelDisplay = responseModel;
+                                } else if (requestModel) {
+                                    modelDisplay = requestModel;
+                                } else {
+                                    modelDisplay = null;
+                                }
+                                
+                                debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel, 'Display:', modelDisplay);
                             debugLog('[Stats XHR] About to postMessage with createdAt:', createdAt);
                                 
                                 // Send to content script
@@ -220,9 +292,11 @@
                                     messageId: messageId,
                                     conversationId: conversationId,
                                     model: modelDisplay,
-                                    settings: lastGenerationSettings.settings,
+                                    settings: lastGenerationSettings?.settings || null,
                                     createdAt: createdAt,
-                                    role: 'bot'
+                                    role: 'bot',
+                                    isAlternative: isAlternative,
+                                    prevId: prevId
                                 }, '*');
                                 
                                 // Update local tracking
@@ -252,13 +326,34 @@
             }
         }
         
+        // Intercept image generation requests to inject NSFW mode override
+        // The endpoint is: POST /chat/conversation-image with field "nsfw_mode"
+        if (this._method === 'POST' && this._url && nsfwModeOverride !== null) {
+            const urlLower = this._url.toLowerCase();
+            if (urlLower.includes('conversation-image') || urlLower.includes('/image') || urlLower.includes('/generate')) {
+                debugLog('[NSFW] Intercepted image generation request:', this._url);
+                try {
+                    if (body && typeof body === 'string') {
+                        const parsedBody = JSON.parse(body);
+                        // Set nsfw_mode - this is the field used by SpicyChat API
+                        debugLog('[NSFW] Modifying request body, setting nsfw_mode to:', nsfwModeOverride);
+                        parsedBody.nsfw_mode = nsfwModeOverride;
+                        body = JSON.stringify(parsedBody);
+                        debugLog('[NSFW] Modified body:', body);
+                    }
+                } catch (e) {
+                    debugLog('[NSFW] Could not parse body for NSFW injection:', e);
+                }
+            }
+        }
+        
         return originalXHRSend.apply(this, [body]);
     };
     
     // Also intercept fetch as backup
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
-        const [url, options] = args;
+        let [url, options] = args;
         
         debugLog('[Stats] Fetch intercepted:', typeof url === 'string' ? url : url?.toString(), options?.method || 'GET');
         
@@ -266,6 +361,29 @@
         if (url && typeof url === 'string' && url.includes('characters')) {
             console.log('[ChatTitle FETCH DEBUG] Character-related URL detected:', url);
             console.log('[ChatTitle FETCH DEBUG] Method:', options?.method || 'GET');
+        }
+        
+        // Intercept image generation requests to inject NSFW mode override (fetch version)
+        // The endpoint is: POST /chat/conversation-image with field "nsfw_mode"
+        const urlString = typeof url === 'string' ? url : url?.toString();
+        if (options && options.method === 'POST' && urlString && nsfwModeOverride !== null) {
+            const urlLower = urlString.toLowerCase();
+            if (urlLower.includes('conversation-image') || urlLower.includes('/image') || urlLower.includes('/generate')) {
+                debugLog('[NSFW FETCH] Intercepted image generation request:', urlString);
+                try {
+                    if (options.body && typeof options.body === 'string') {
+                        const parsedBody = JSON.parse(options.body);
+                        // Set nsfw_mode - this is the field used by SpicyChat API
+                        debugLog('[NSFW FETCH] Modifying request body, setting nsfw_mode to:', nsfwModeOverride);
+                        parsedBody.nsfw_mode = nsfwModeOverride;
+                        options = { ...options, body: JSON.stringify(parsedBody) };
+                        args = [url, options];
+                        debugLog('[NSFW FETCH] Modified body');
+                    }
+                } catch (e) {
+                    debugLog('[NSFW FETCH] Could not parse body for NSFW injection:', e);
+                }
+            }
         }
         
         // Capture timestamp when POST /chat is sent
@@ -294,8 +412,8 @@
         
         // Intercept GET /v2/characters/{id} - character details for page title
         // Try multiple patterns to catch the actual endpoint
-        const urlString = typeof url === 'string' ? url : url?.toString();
-        console.log('[ChatTitle FETCH DEBUG] Checking URL:', urlString);
+        const fetchUrlString = typeof url === 'string' ? url : url?.toString();
+        console.log('[ChatTitle FETCH DEBUG] Checking URL:', fetchUrlString);
         
         // Pattern 1: /v2/characters/{uuid}
         const v2Pattern = /\/v2\/characters\/[a-f0-9-]+/;
@@ -304,10 +422,10 @@
         // Pattern 3: Any characters endpoint
         const anyCharPattern = /\/characters\/[a-f0-9-]+/;
         
-        if (urlString && (v2Pattern.test(urlString) || v1Pattern.test(urlString) || anyCharPattern.test(urlString)) && (!options || !options.method || options.method === 'GET')) {
+        if (fetchUrlString && (v2Pattern.test(fetchUrlString) || v1Pattern.test(fetchUrlString) || anyCharPattern.test(fetchUrlString)) && (!options || !options.method || options.method === 'GET')) {
             console.log('[ChatTitle FETCH] ========== CHARACTER API MATCHED ==========');
-            console.log('[ChatTitle FETCH] URL:', urlString);
-            console.log('[ChatTitle FETCH] Matched pattern:', v2Pattern.test(urlString) ? 'v2' : v1Pattern.test(urlString) ? 'v1' : 'any');
+            console.log('[ChatTitle FETCH] URL:', fetchUrlString);
+            console.log('[ChatTitle FETCH] Matched pattern:', v2Pattern.test(fetchUrlString) ? 'v2' : v1Pattern.test(fetchUrlString) ? 'v1' : 'any');
             const clonedResponse = response.clone();
             try {
                 const data = await clonedResponse.json();
@@ -337,30 +455,55 @@
             try {
                 const data = await clonedResponse.json();
                 
-                if (data.message && data.message.id && lastGenerationSettings) {
+                if (data.message && data.message.id) {
                     const messageId = data.message.id;
                     const createdAt = data.message.createdAt || data.message.created_at || null;
                     const conversationId = data.message.conversation_id || data.message.chat_id || data.chat_id || data.conversation_id || null;
                     
-                    // Extract both request and response model names
-                    const requestModel = lastGenerationSettings.model;
-                    const responseModel = data.engine || requestModel;
-                    const modelDisplay = requestModel && responseModel && requestModel !== responseModel 
-                        ? `${requestModel} → ${responseModel}` 
-                        : responseModel;
+                    // Check if this is a regeneration (alternative message)
+                    // IMPORTANT: prev_id exists for ALL messages (points to preceding message in conversation)
+                    // It does NOT indicate a regeneration! See detailed comment in XHR handler above.
+                    const prevId = data.message.prev_id || null;
+                    const isAlternative = false; // Cannot reliably detect at POST time - let GET /messages handle it
+                    
+                    debugLog('[Stats FETCH] Is regeneration:', isAlternative, '(always false at POST time)');
+                    debugLog('[Stats FETCH] Previous message ID:', prevId);
+                    
+                    // Extract model info - use response.engine first (actual model used)
+                    // Fall back to lastGenerationSettings (requested model)
+                    const responseModel = data.engine || null;
+                    const requestModel = lastGenerationSettings?.model || null;
+                    
+                    // Build model display string
+                    let modelDisplay;
+                    if (requestModel && responseModel && requestModel !== responseModel) {
+                        modelDisplay = `${requestModel} → ${responseModel}`;
+                    } else if (responseModel) {
+                        modelDisplay = responseModel;
+                    } else if (requestModel) {
+                        modelDisplay = requestModel;
+                    } else {
+                        modelDisplay = null;
+                    }
+                    
+                    // Get settings from lastGenerationSettings if available
+                    const settings = lastGenerationSettings?.settings || null;
                     
                     debugLog('[Stats] Got message ID from fetch response:', messageId, 'conversation:', conversationId);
-                    debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel);
+                    debugLog('[Stats] Request model:', requestModel, 'Response model:', responseModel, 'Display:', modelDisplay);
                     
-                    // Send to content script
+                    // Send to content script - even if we don't have full settings, send what we have
+                    // This ensures the message timestamp is captured
                     window.postMessage({
                         type: 'SAI_NEW_MESSAGE',
                         messageId: messageId,
                         conversationId: conversationId,
                         model: modelDisplay,
-                        settings: lastGenerationSettings.settings,
+                        settings: settings,
                         createdAt: createdAt,
-                        role: 'bot'
+                        role: 'bot',
+                        isAlternative: isAlternative,
+                        prevId: prevId
                     }, '*');
                     
                     // Send user message notification

@@ -1,7 +1,8 @@
 # Privacy Policy for S.AI Toolkit Extension
 
-**Effective Date:** November 5, 2025  
-**Version:** 1.1  
+
+**Effective Date:** December 19, 2025  
+**Version:** 1.2  
 
 Thank you for using the **S.AI Toolkit Extension**. Your privacy is important to us.  
 This Privacy Policy explains how we collect, use, and protect your data when you use our browser extension.
@@ -13,27 +14,34 @@ This Privacy Policy explains how we collect, use, and protect your data when you
 The S.AI Toolkit Extension collects and processes limited metadata necessary to provide its functionality.  
 No personal information or message content is collected.
 
+
 ### 1.1 Data Observed Automatically
 
 **Local API Observation:**  
-The extension observes certain API responses within your browser (such as `GET /messages` and `POST /chat`) to extract metadata for visualization and debugging purposes. This includes:
+The extension observes certain API responses within your browser (such as `GET /messages`, `GET /characters`, and `POST /chat`) to extract metadata for visualization, debugging, and export features. This includes:
 
 - `conversation_id`  
+- `character_id`  
 - `message_id`  
 - `inference_model`  
-- `inference_settings`  
+- `inference_settings` (e.g., temperature, top_p, top_k, max_new_tokens)  
 - `createdAt` timestamps  
 - roles (bot/user) and related message metadata  
+- NSFW mode state (if toggled by the user)  
+- Exported chat data (when user initiates export)
 
 This observation occurs **only within your local browser environment**.  
 The extension does **not** transmit, log, or send any data externally.
+
 
 ### 1.2 Data Stored Locally
 
 The extension stores limited information locally using the browser’s `storage.local` API:
 
-- **User Preferences:** Layout, theme, and interface customization settings.  
-- **Generation Statistics:** Metadata about message generation (e.g., model type, token count, temperature, top_p, top_k, timestamps) for debugging and display purposes.  
+- **User Preferences:** Layout, theme, interface customization, and feature toggles (e.g., sidebar, classic theme, NSFW mode, etc.)
+- **Generation Statistics:** Metadata about message generation (e.g., model type, token count, temperature, top_p, top_k, timestamps) for debugging and display purposes.
+- **Exported Data:** When you use the export feature, chat data is prepared for download but is never sent externally.
+- **NSFW Mode State:** If you toggle NSFW image mode, your preference is stored locally.
 
 All stored data remains **local to your device**.
 
@@ -43,9 +51,12 @@ All stored data remains **local to your device**.
 
 Collected data is used solely for the following purposes:
 
+
 - **Display Generation Statistics:** To provide insights into message generation parameters and performance.  
 - **Customization:** To enable and manage user-selected interface features.  
 - **Debugging:** To assist users in exporting, importing, or reviewing local statistics for troubleshooting.
+- **Chat Export:** To allow users to export their chat history for backup or personal use.
+- **NSFW Mode:** To allow users to toggle and persist NSFW image mode locally.
 
 ---
 
@@ -67,6 +78,7 @@ We take reasonable measures to protect your local data:
 
 ---
 
+
 ## 5. Data Storage and Unlimited Storage Permission
 
 The **S.AI Toolkit Extension** uses the browser’s `storage.local` API to save user preferences, configuration profiles, and generation statistics locally on your device.  
@@ -76,9 +88,9 @@ To prevent data loss and ensure smooth functionality, the extension requests the
 This permission allows the extension to store more than 5 MB of data **locally only** — it **does not** enable access to additional system resources or external data, nor does it transmit any information outside your browser.
 
 Key points:
-- All information remains **fully local** on your device.  
-- No personal or identifiable data is collected.  
-- No data is shared, synced, or sent to any external servers.  
+- All information remains **fully local** on your device.
+- No personal or identifiable data is collected.
+- No data is shared, synced, or sent to any external servers.
 - You can clear all stored data at any time via the extension’s settings or by uninstalling it.
 
 This permission is requested solely to ensure the extension continues to operate reliably as your locally stored statistics and preferences grow over time.
@@ -89,8 +101,9 @@ This permission is requested solely to ensure the extension continues to operate
 
 You have full control over your data at all times:
 
-- **Clear Data:** You can remove all stored data by uninstalling the extension or by using the built-in “Clear All Data” option.  
-- **Export/Import Data:** You may export or import generation statistics for backup or debugging.  
+
+- **Clear Data:** You can remove all stored data by uninstalling the extension or by using the built-in “Clear All Data” option.
+- **Export/Import Data:** You may export or import generation statistics and chat history for backup or debugging.
 - **Local Management:** You may modify or reset preferences through your browser settings.
 
 ---
@@ -99,10 +112,11 @@ You have full control over your data at all times:
 
 The S.AI Toolkit Extension requires the following browser permissions:
 
-- **storage** – to save user preferences and local statistics.  
-- **unlimitedStorage** – to allow storage of data beyond the default 5 MB limit, all locally.  
-- **scripting** – to modify elements on supported pages and display metrics.  
-- **webRequest / webRequestBlocking (if applicable)** – to observe API responses locally within the browser for statistical display.  
+
+- **storage** – to save user preferences and local statistics.
+- **unlimitedStorage** – to allow storage of data beyond the default 5 MB limit, all locally.
+- **scripting** – to modify elements on supported pages and display metrics.
+- **webRequest / webRequestBlocking (if applicable)** – to observe API responses locally within the browser for statistical display and export features.
 
 These permissions are used **only within your browser** and **do not enable any external data collection**.
 
