@@ -45,20 +45,28 @@ The extension is optimized for minimal performance impact:
 
 ## Development
 
+extension/
+
 ### File Structure
 ```
 extension/
-├── manifest.json          # Extension manifest
-├── content.js            # Main content script (injected into pages)
-├── storage-wrapper.js    # Storage API wrapper
-├── background.js         # Background service worker
-├── popup.html            # Settings popup UI
-├── popup.js              # Settings popup logic
-├── popup.css             # Settings popup styling
-└── icons/                # Extension icons
-    ├── icon-16.png
-    ├── icon-48.png
-    └── icon-128.png
+├── manifest.json           # Extension manifest (Chrome/Edge/Firefox)
+├── manifest.chrome.json    # Chrome-specific manifest (if needed)
+├── background.js           # Background service worker
+├── content.js              # Main content script (injected into pages)
+├── storage-wrapper.js      # Storage API wrapper (cross-browser)
+├── xhr-intercept.js        # Injected script for network interception (page context)
+├── page-context.js         # Injected script for debug/utility functions (page context)
+├── popup.html              # Settings popup UI
+├── popup.css               # Settings popup styling
+├── rules.json              # Feature rules and toggles
+├── privacy.md              # Privacy policy (local only)
+├── README.md               # This documentation
+├── icons/                  # Extension icons
+│   ├── icon-16.png
+│   ├── icon-48.png
+│   └── icon-128.png
+└── ... (other support files)
 ```
 
 ### Building
