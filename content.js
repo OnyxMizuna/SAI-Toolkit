@@ -445,27 +445,41 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const CLASSIC_STYLE_KEY = 'enableClassicStyle';        // Classic colors/styling
     const CUSTOM_STYLE_KEY = 'enableCustomStyle';          // Custom colors/styling
     const CUSTOM_STYLE_VALUES_KEY = 'customStyleValues';   // Stores custom color/font values
+    const MESSAGE_CONTAINER_MAX_WIDTH_KEY = 'messageContainerMaxWidth';  // Max width for message container
     const THEME_CUSTOMIZATION_KEY = 'enableThemeCustomization';  // DEPRECATED - migrated to CLASSIC_LAYOUT_KEY + CLASSIC_STYLE_KEY
     const SMALL_PROFILE_IMAGES_KEY = 'enableSmallProfileImages';  // Smaller profile images
     const ROUNDED_PROFILE_IMAGES_KEY = 'enableRoundedProfileImages';  // Rounded profile images
     const SWAP_CHECKBOX_POSITION_KEY = 'enableSwapCheckboxPosition';  // Swap selection checkbox positions
     const SQUARE_MESSAGE_EDGES_KEY = 'enableSquareMessageEdges';  // Square message box edges
-    
+    const WYSIWYG_EDITOR_KEY = 'enableWysiwygEditor';  // Live formatting in textareas
+    const SHOW_MESSAGE_IDS_KEY = 'showMessageIds';  // Show message IDs in stats display
+    const ENABLE_GENERATION_PROFILES_KEY = 'enableGenerationProfiles';  // Override to force-enable generation profiles (debug only)
+
     // Default custom style values
     const DEFAULT_CUSTOM_STYLE = {
         aiMessageBg: 'rgba(0, 100, 255, 0.1)',
         userMessageBg: 'rgba(100, 100, 100, 0.1)',
         bodyColor: '#ffffff',
+        bodyFontWeight: 'normal',
+        bodyFontStyle: 'normal',
+        bodyTextDecoration: 'none',
         spanQuoteColor: '#ffffff',
+        spanQuoteFontWeight: 'normal',
+        spanQuoteFontStyle: 'normal',
+        spanQuoteTextDecoration: 'none',
         narrationColor: '#06B7DB',
-        highlightBgColor: '#06B7DB',
+        narrationFontWeight: 'normal',
+        narrationFontStyle: 'italic',
+        narrationTextDecoration: 'none',
+        highlightBgColor: '#ffdd6d',
         highlightTextColor: '#000000',
+        highlightFontWeight: 'normal',
+        highlightFontStyle: 'normal',
+        highlightTextDecoration: 'none',
         fontSize: '16px',
         fontFamily: '',
-        fontWeight: 'normal',
-        fontStyle: 'normal',
-        textDecoration: 'none',
-        hoverButtonColor: '#292929'
+        hoverButtonColor: '#292929',
+        backgroundImage: ''
     };
     
     // =============================================================================
@@ -597,7 +611,36 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         STICKY_HEADER: 2,              // Sticky header in Generation Settings
         NOTIFICATION: 9999,            // Notification toasts
     };
-    
+
+    // =============================================================================
+    // CHANGELOG - Update notification content for each release
+    // =============================================================================
+    // Add a new version entry here when releasing a new version
+    // Format: 'version': { title, date, features: [...] }
+    const CHANGELOG = {
+        '1.0.39': {
+            title: 'Version 1.0.39 - Stats Improvements',
+            date: 'January 2, 2026',
+            features: [
+                'Fixed user message timestamps and IDs now displaying correctly',
+                'Improved stats insertion reliability for new messages',
+                'Fixed extension compatibility with /Chat/ URLs (capital C)',
+                'Added better tracking for pending message insertions',
+                'Reduced race conditions in stats processing'
+            ]
+        },
+        '1.0.38': {
+            title: 'Version 1.0.38 - Performance Update',
+            date: 'January 1, 2026',
+            features: [
+                'Massive performance optimizations',
+                'Fixed generation stats injection issues',
+                'Improved message processing speed'
+            ]
+        }
+        // Add more versions as needed above this line
+    };
+
     // Load feature flags from storage (async operations)
     // These determine which CSS to inject before page renders
     const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
@@ -613,8 +656,11 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // sidebar layout enabled. It's designed specifically for that layout mode.
     // Without sidebar, the default SpicyChat layout is fine.
     // 
-    // Skip on lorebook pages - no chat interface there
-    if (sidebarEnabled && !window.location.pathname.startsWith('/lorebook')) {
+    // Skip on lorebook, chatbot, and group pages - different layouts there
+    const isNonChatPage = window.location.pathname.startsWith('/lorebook') ||
+                          window.location.pathname.startsWith('/chatbot/') ||
+                          window.location.pathname.startsWith('/group');
+    if (sidebarEnabled && !isNonChatPage) {
         const injectComposerCSS = () => {
             // Wait for document.head to exist (very early in page lifecycle)
             if (!document.head) {
@@ -651,8 +697,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     }
     
     // Inject Sidebar Layout CSS early if enabled
-    // Skip on lorebook pages - no modals to pin there
-    if (sidebarEnabled && !window.location.pathname.startsWith('/lorebook')) {
+    // Skip on lorebook, chatbot, and group pages - different layouts there
+    if (sidebarEnabled && !isNonChatPage) {
         const injectSidebarCSS = () => {
             if (!document.head) {
                 if (document.readyState === 'loading') {
@@ -777,6 +823,53 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         };
         
         injectCustomStyleCSS();
+    }
+    
+    // Inject Message Container Max Width CSS - inject into BODY to override HEAD stylesheets
+    const messageContainerMaxWidth = await storage.get(MESSAGE_CONTAINER_MAX_WIDTH_KEY, '');
+    if (messageContainerMaxWidth) {
+        const injectMessageContainerMaxWidthCSS = () => {
+            // For this specific CSS, we inject into body, not head
+            // This ensures it loads AFTER all external stylesheets in <head>
+            const target = document.body || document.head;
+            if (!target) {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', injectMessageContainerMaxWidthCSS, { once: true });
+                } else {
+                    setTimeout(injectMessageContainerMaxWidthCSS, TIMING.CSS_RETRY_SHORT);
+                }
+                return;
+            }
+            
+            // Remove existing style if present (to re-inject at end)
+            const existing = document.getElementById('sai-toolkit-message-container-width');
+            if (existing) {
+                existing.remove();
+            }
+            
+            const style = document.createElement('style');
+            style.id = 'sai-toolkit-message-container-width';
+            style.textContent = getMessageContainerMaxWidthCSS(messageContainerMaxWidth);
+            
+            // Append to body (or head if body not ready) - this ensures it comes AFTER all head stylesheets
+            if (document.body) {
+                document.body.appendChild(style);
+                debugLog('[Toolkit] Message Container Max Width CSS injected into BODY:', messageContainerMaxWidth);
+            } else {
+                document.head.appendChild(style);
+                debugLog('[Toolkit] Message Container Max Width CSS injected into HEAD (body not ready):', messageContainerMaxWidth);
+            }
+        };
+        
+        // Inject immediately if possible
+        injectMessageContainerMaxWidthCSS();
+        
+        // Also re-inject after page is fully loaded to ensure we override all stylesheets
+        if (document.readyState !== 'complete') {
+            window.addEventListener('load', () => {
+                setTimeout(injectMessageContainerMaxWidthCSS, 100);
+            }, { once: true });
+        }
     }
     
     // Load new layout options from storage
@@ -910,7 +1003,74 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         
         injectSquareMessageEdgesCSS();
     }
-    
+
+    // -------------------------------------------------------------------------
+    // MOBILE RESPONSIVE CSS INJECTION (Always Active)
+    // -------------------------------------------------------------------------
+    // Inject mobile-responsive CSS that applies globally regardless of layout
+    // Currently includes: contextual menu left-justification for mobile devices
+    const injectMobileResponsiveCSS = () => {
+        if (!document.head) {
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', injectMobileResponsiveCSS, { once: true });
+            } else {
+                setTimeout(injectMobileResponsiveCSS, TIMING.CSS_RETRY_SHORT);
+            }
+            return;
+        }
+
+        if (document.getElementById('sai-toolkit-mobile-responsive-early')) {
+            return;
+        }
+
+        const style = document.createElement('style');
+        style.id = 'sai-toolkit-mobile-responsive-early';
+        style.textContent = `/* SAI Toolkit - Mobile Responsive CSS */
+
+/* ===== Character info bar full-width background fix ===== */
+/* The character info bar (Iyarin name + buttons) is inside the bg-gray-2 container with background image */
+/* Make it extend full width to cover the background image on the sides */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"] {
+  position: relative;
+  background: var(--color-gray-2, #18181b) !important;
+}
+
+/* Use pseudo-element to extend background full width */
+div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"]::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100vw;
+  height: 100%;
+  background: var(--color-gray-2, #18181b);
+  z-index: -1;
+}
+
+/* Message contextual menu (Copy/Edit): reposition to left on mobile devices */
+@media (max-width: 999px) {
+  div.absolute.w-max.z-\\[100\\][style*="box-shadow"]:has(button[aria-label="Copy"]) {
+    z-index: ${Z_INDEX.CONTEXT_MENU} !important;
+    right: auto !important;
+    left: auto !important;
+    transform: translateX(-100%) !important;
+    margin-right: 0.25rem !important;
+  }
+}
+`;
+
+        if (document.head.firstChild) {
+            document.head.insertBefore(style, document.head.firstChild);
+        } else {
+            document.head.appendChild(style);
+        }
+
+        debugLog('[Toolkit] Mobile Responsive CSS injected EARLY');
+    };
+
+    injectMobileResponsiveCSS();
+
     // =============================================================================
     // CSS GENERATION FUNCTIONS - Composer Layout
     // =============================================================================
@@ -984,7 +1144,7 @@ div.flex.items-end.gap-sm[style*="margin-left"] button {
 div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
   > div.flex.justify-undefined.items-undefined.bg-transparent.w-full[style*="max-width"] {
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   margin-left: auto !important;
   margin-right: auto !important;
   box-sizing: border-box !important;
@@ -1400,13 +1560,13 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
   body:has(div.fixed.left-1\\/2.top-1\\/2)
     [class*="max-w-\\\\[800px\\\\]"] {
     width: 100% !important;
-    max-width: 800px !important;
+    max-width: var(--sai-message-max-width, 800px) !important;
     box-sizing: border-box !important;
   }
 
   body:has(div.fixed.left-1\\/2.top-1\\/2)
     [class*="max-w-\\\\[800px\\\\]"] {
-    max-width: min(800px, 100%) !important;
+    max-width: min(var(--sai-message-max-width, 800px), 100%) !important;
   }
 }
 
@@ -1421,7 +1581,7 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
 /* ===== Center message bubbles ===== */
 div.w-full.flex.mb-lg.bg-transparent.items-center.justify-between {
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   margin-left: auto !important;
   margin-right: auto !important;
   padding-left: 0 !important;
@@ -1433,7 +1593,7 @@ div.w-full.flex.mb-lg.bg-transparent.items-center.justify-between {
 div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
   > div.flex.justify-undefined.items-undefined.bg-transparent.w-full[style*="max-width"] {
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   margin-left: auto !important;
   margin-right: auto !important;
   box-sizing: border-box !important;
@@ -1616,9 +1776,9 @@ div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: co
 div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
   color: ${values.bodyColor} !important;
   font-size: ${values.fontSize} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.fontWeight} !important;
-  font-style: ${values.fontStyle} !important;
-  text-decoration: ${values.textDecoration} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.bodyFontWeight} !important;
+  font-style: ${values.bodyFontStyle} !important;
+  text-decoration: ${values.bodyTextDecoration} !important;
 }
 
 /* Body Text - Spans (color and font) */
@@ -1628,9 +1788,9 @@ div.bg-gray-2 span.leading-6,
 div.bg-gray-2 span.text-white {
   color: ${values.bodyColor} !important;
   font-size: ${values.fontSize} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.fontWeight} !important;
-  font-style: ${values.fontStyle} !important;
-  text-decoration: ${values.textDecoration} !important;
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.bodyFontWeight} !important;
+  font-style: ${values.bodyFontStyle} !important;
+  text-decoration: ${values.bodyTextDecoration} !important;
 }
 
 /* Quote Text Color (q elements inside spans) */
@@ -1641,9 +1801,14 @@ div.p-0[style*="width: 100%"] span.leading-6 q.text-white,
 div.bg-gray-2 span.text-white q.text-colorQuote,
 div.bg-gray-2 span.text-white q.text-white,
 div.bg-gray-2 span.leading-6 q.text-colorQuote,
-div.bg-gray-2 span.leading-6 q.text-white {
+div.bg-gray-2 span.leading-6 q.text-white,
+q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900,
+q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300 {
   color: ${values.spanQuoteColor} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.spanQuoteFontWeight} !important;
+  font-style: ${values.spanQuoteFontStyle} !important;
+  text-decoration: ${values.spanQuoteTextDecoration} !important;
+}
 
 /* Narration Color (em, i, .narration, .styled) */
 div.p-0[style*="width: 100%"] em,
@@ -1655,15 +1820,20 @@ div.bg-gray-2 i,
 div.bg-gray-2 .narration,
 div.bg-gray-2 .styled { 
   color: ${values.narrationColor} !important;
-  font-style: italic !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.narrationFontWeight} !important;
+  font-style: ${values.narrationFontStyle} !important;
+  text-decoration: ${values.narrationTextDecoration} !important;
+}
 
 /* Highlight Color (blockquote.bg-colorHighlight) */
 div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight,
 div.bg-gray-2 blockquote.bg-colorHighlight {
   background-color: ${values.highlightBgColor} !important;
   color: ${values.highlightTextColor} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}}
+  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.highlightFontWeight} !important;
+  font-style: ${values.highlightFontStyle} !important;
+  text-decoration: ${values.highlightTextDecoration} !important;
+}
 
 /* Message Boxes - Custom Colors */
 
@@ -1679,6 +1849,100 @@ div.bg-gray-2 blockquote.bg-colorHighlight {
 ${values.hoverButtonColor ? `button:hover {
   background-color: ${values.hoverButtonColor} !important;
 }` : ''}
+
+/* Custom Background Image */
+${values.backgroundImage ? `.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative {
+  background-image: url('${values.backgroundImage}') !important;
+  background-size: cover !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-attachment: fixed !important;
+}` : ''}
+`;
+    }
+
+    // =============================================================================
+    // CSS GENERATION FUNCTIONS - Message Container Max Width
+    // =============================================================================
+    // FUNCTION: getMessageContainerMaxWidthCSS()
+    // PURPOSE: Applies custom max-width to message container
+    // FEATURE: "Message Container Max Width" setting (independent of other styles)
+    // 
+    // WHY NEEDED:
+    // - Allows users to control the width of the message container independently
+    // - Works with or without Custom Style/Classic Layout enabled
+    // - Useful for wide screens or narrow reading preferences
+    // 
+    // PARAMETERS:
+    // - maxWidth: CSS width value (e.g., '800px', '90%', '1200px')
+    // =============================================================================
+    function getMessageContainerMaxWidthCSS(maxWidth) {
+        if (!maxWidth) return '';
+        
+        // Use extremely high specificity selectors that will override everything
+        // Including site's external CSS files that load after our injection
+        return `
+/* Message Container Max Width - Override ALL constraints */
+/* Injected into BODY to ensure it loads AFTER all HEAD stylesheets */
+
+/* Set a CSS variable for the max width */
+:root {
+  --sai-message-max-width: ${maxWidth};
+}
+
+/* ULTRA HIGH SPECIFICITY: Target message containers with multiple selector chains */
+/* The inline style="max-width: 800px" needs !important to override */
+
+/* AI messages (justify-start) - multiple specificity layers */
+html body div.flex-shrink-0.py-0.w-full div div.flex div.flex.flex-col div.w-full.flex.mb-lg.bg-transparent.items-center.justify-start[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
+
+/* User messages (justify-between) - multiple specificity layers */
+html body div.flex-shrink-0.py-0.w-full div div.flex div.flex.flex-col div.w-full.flex.mb-lg.bg-transparent.items-center.justify-between[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Generic fallback with ultra-high specificity */
+html body div.flex-shrink-0 div div div div div.w-full.flex.mb-lg.bg-transparent.items-center[style] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Target via attribute selector - catches all inline max-width styles */
+html body div[style*="max-width: 800px"].w-full.flex.mb-lg,
+html body div[style*="max-width:800px"].w-full.flex.mb-lg {
+  max-width: ${maxWidth} !important;
+}
+
+/* Override Tailwind max-w-[800px] class with high specificity */
+html body .max-w-\\[800px\\] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Override the inner message bubble max-width (often 650px or 800px) */
+html body div.flex.flex-col.gap-md.w-full[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Target message input container at bottom */
+html body div.flex.flex-col.items-center.p-md.w-full div[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Override max-w-[620px] content containers */
+html body .max-w-\\[620px\\] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Sidebar layout context - even higher specificity */
+html body div.bg-gray-2 div.w-full.flex.mb-lg.bg-transparent.items-center[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
+
+/* Classic layout context */
+html body div.p-0 div.w-full.flex.mb-lg.bg-transparent.items-center[style*="max-width"] {
+  max-width: ${maxWidth} !important;
+}
 `;
     }
 
@@ -1729,7 +1993,7 @@ ${values.hoverButtonColor ? `button:hover {
   margin-left: auto !important;
   margin-right: auto !important;
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   box-sizing: border-box !important;
   border-radius: 20px !important;
 }
@@ -1738,7 +2002,7 @@ ${values.hoverButtonColor ? `button:hover {
   margin-left: auto !important;
   margin-right: auto !important;
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   box-sizing: border-box !important;
   border-radius: 20px !important;
 }
@@ -1827,7 +2091,7 @@ div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full {
 div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
   > div.flex.justify-undefined.items-undefined.bg-transparent.w-full[style*="max-width"] {
   width: 100% !important;
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   margin-left: auto !important;
   margin-right: auto !important;
   box-sizing: border-box !important;
@@ -1835,7 +2099,7 @@ div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
 
 /* Also ensure the inner wrapper stays centered */
 div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
-  max-width: 800px !important;
+  max-width: var(--sai-message-max-width, 800px) !important;
   margin-left: auto !important;
   margin-right: auto !important;
   box-sizing: border-box !important;
@@ -1957,6 +2221,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 
                 // Listen for Kinde token refresh responses
+                // Use { once: true } to prevent listener accumulation (memory leak fix)
                 if (this._url && this._url.includes('gamma.kinde.com/oauth2/token')) {
                     this.addEventListener('load', function() {
                         if (this.status === 200) {
@@ -1971,7 +2236,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                 console.warn('[S.AI] Could not parse Kinde token response:', e);
                             }
                         }
-                    });
+                    }, { once: true });
                 }
                 
                 return originalXHRSend.apply(this, args);
@@ -2047,6 +2312,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Structure: { messageId: createdAt (unix ms) }
     let messageTimestamps = {};
 
+    // Track which message IDs have already had stats inserted to prevent duplicates
+    // Note: We clear these sets when navigating conversations to allow re-insertion
+    const statsInsertedForMessageIds = new Set();      // Successfully inserted
+    const statsInsertionInProgress = new Set();        // Currently being processed (prevents parallel runs)
+
+    // Track how many new messages are pending insertion (used to skip newest messages in processMessagesForStats)
+    // This prevents race conditions where processMessagesForStats runs before insertStatsForRegeneratedMessage
+    let pendingNewMessageCount = 0;
+
+    // Helper function to detect if we're in Story Mode
+    function isStoryMode() {
+        return /\/story\//i.test(window.location.pathname);
+    }
+    
     // Helper function to safely set HTML content (sanitizes input)
     function safeSetHTML(element, content) {
         // For simple text content, use textContent
@@ -2187,32 +2466,55 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Get current character ID from URL
     function getCurrentCharacterId() {
-        // URL structure: /chat/{character_id} or /chat/{character_id}/{conversation_id}
-        const match = window.location.pathname.match(/\/chat\/([a-f0-9-]+)/);
-        if (match) {
-            debugLog('[Stats] getCurrentCharacterId - from URL:', match[1]);
-            return match[1];
+        // URL structure: 
+        // - Chat mode: /chat/{character_id} or /chat/{character_id}/{conversation_id}
+        // - Story mode: /story/{character_id}/{conversation_id}
+        // Note: URL may have mixed case so use case-insensitive match
+        
+        // Try /chat/ pattern first
+        const chatMatch = window.location.pathname.match(/\/chat\/([a-f0-9-]+)/i);
+        if (chatMatch) {
+            debugLog('[Stats] getCurrentCharacterId - from /chat/ URL:', chatMatch[1]);
+            return chatMatch[1];
         }
         
+        // Try /story/ pattern (Story Mode)
+        const storyMatch = window.location.pathname.match(/\/story\/([a-f0-9-]+)/i);
+        if (storyMatch) {
+            debugLog('[Stats] getCurrentCharacterId - from /story/ URL:', storyMatch[1]);
+            return storyMatch[1];
+        }
+
         // Fallback: Try /chatbot/ pattern if on character profile page
-        const chatbotMatch = window.location.pathname.match(/\/chatbot\/([a-f0-9-]+)/);
+        const chatbotMatch = window.location.pathname.match(/\/chatbot\/([a-f0-9-]+)/i);
         if (chatbotMatch) {
             debugLog('[Stats] getCurrentCharacterId - from /chatbot/ URL:', chatbotMatch[1]);
             return chatbotMatch[1];
         }
-        
+
         debugLog('[Stats] getCurrentCharacterId - not found, URL:', window.location.pathname);
         return null;
     }
-    
+
     // Get current conversation ID from URL
     function getCurrentConversationId() {
-        // URL structure: /chat/{character_id}/{conversation_id}
+        // URL structure: /chat/{character_id}/{conversation_id} or /story/{character_id}/{conversation_id}
         // If only /chat/{character_id}, conversation_id will be null (defaults to most recent)
-        const match = window.location.pathname.match(/\/chat\/[a-f0-9-]+\/([a-f0-9-]+)/);
-        const convId = match ? match[1] : null;
-        debugLog('[Stats] getCurrentConversationId - URL:', window.location.pathname, 'extracted:', convId);
-        return convId;
+        // Note: URL may have /Chat/ or /Story/ (capital letters) so use case-insensitive match
+        const chatMatch = window.location.pathname.match(/\/chat\/[a-f0-9-]+\/([a-f0-9-]+)/i);
+        if (chatMatch) {
+            debugLog('[Stats] getCurrentConversationId - from /chat/ URL:', chatMatch[1]);
+            return chatMatch[1];
+        }
+        
+        const storyMatch = window.location.pathname.match(/\/story\/[a-f0-9-]+\/([a-f0-9-]+)/i);
+        if (storyMatch) {
+            debugLog('[Stats] getCurrentConversationId - from /story/ URL:', storyMatch[1]);
+            return storyMatch[1];
+        }
+        
+        debugLog('[Stats] getCurrentConversationId - URL:', window.location.pathname, 'extracted: null');
+        return null;
     }
     
     // Migrate old format to new format
@@ -2361,8 +2663,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }
     
     async function formatDate(date) {
-        // Get user preference for timestamp format (true = date@time, false = time@date)
-        const dateFirst = await storage.get('timestampDateFirst', true);
+        // Get user preferences for timestamp format
+        const dateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
+        const use24Hour = await storage.get('timestamp24Hour', false); // false = 12-hour (default), true = 24-hour
         
         // Use locale-aware formatting for date and time
         // This respects the browser's language/region settings
@@ -2374,7 +2677,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const timeStr = date.toLocaleTimeString(undefined, {
             hour: '2-digit',
             minute: '2-digit',
-            second: '2-digit'
+            second: '2-digit',
+            hour12: !use24Hour  // false for 24-hour, true for 12-hour
         });
         
         debugLog('[Stats] formatDate - dateFirst:', dateFirst, 'dateStr:', dateStr, 'timeStr:', timeStr);
@@ -2923,14 +3227,52 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 
                 debugLog('[Stats] Stored stats for new message:', messageId);
-                
+
+                // If this is a bot message and we have prevId, store the user message too
+                // The prevId is the user message ID, and we have its timestamp from SAI_USER_MESSAGE_SENT
+                if ((role === 'bot' || !role) && prevId && lastUserMessageTimestamp) {
+                    debugLog('[Stats] Bot message has prevId - storing user message:', prevId.substring(0, 8));
+
+                    // Store the user message timestamp in messageTimestamps
+                    messageTimestamps[prevId] = lastUserMessageTimestamp;
+                    debugLog('[Stats] Added user message to messageTimestamps:', prevId.substring(0, 8), '→', lastUserMessageTimestamp);
+
+                    // Store stats for the user message
+                    const userStats = {
+                        role: 'user'
+                        // Timestamp comes from messageTimestamps map
+                    };
+                    await storeStatsForMessage(prevId, userStats, conversationId);
+                    debugLog('[Stats] Stored stats for user message:', prevId.substring(0, 8));
+
+                    // Add to index map (user message comes before bot message)
+                    if (!isRegenerationDetected) {
+                        const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
+                        const userIndex = currentMaxIndex + 1; // Next available index
+                        messageIdToIndexMap[userIndex] = prevId;
+                        debugLog('[Stats SAVE] Added user message to index map at index:', userIndex, 'messageId:', prevId.substring(0, 8));
+                    }
+
+                    // Trigger stats insertion for the user message
+                    // Use processMessagesForStats to insert the timestamp
+                    setTimeout(() => processMessagesForStats(true), 200);
+                    setTimeout(() => processMessagesForStats(true), 600);
+
+                    // Clear the last user message timestamp so we don't reuse it
+                    lastUserMessageTimestamp = null;
+                }
+
                 // For bot messages, use insertStatsForRegeneratedMessage which handles the version counter UI
                 // This is more reliable than index-based matching in processMessagesForStats
                 // processMessagesForStats will skip messages with version counters
                 if (role === 'bot' || !role) {
                     debugLog('[Stats] Bot message - will insert stats directly via insertStatsForRegeneratedMessage');
+                    // Increment pending count - this tells processMessagesForStats to skip the newest messages
+                    pendingNewMessageCount++;
+                    debugLog('[Stats] Incremented pendingNewMessageCount to:', pendingNewMessageCount);
                     // Insert stats with retries - use a single call with built-in retry logic
                     // This prevents race conditions when browser throttles background tab timers
+                    // NOTE: insertStatsForRegeneratedMessage will add messageId to statsInsertionInProgress
                     insertStatsWithRetry(messageId, model, settings, createdAt);
                     
                     // Also add to index map for historical message display on page refresh
@@ -3414,6 +3756,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Profile Controls] No Generation Settings modal found');
             return;
         }
+        
+        // Check if user has profiles stored OR has explicitly enabled via debug setting
+        const storedProfiles = await loadProfiles();
+        const hasProfiles = Object.keys(storedProfiles).length > 0;
+        const forceEnabled = await storage.get(ENABLE_GENERATION_PROFILES_KEY, false);
+        
+        debugLog('[Profile Controls] hasProfiles:', hasProfiles, 'forceEnabled:', forceEnabled);
+        
+        // Only show profile controls if user has profiles OR force-enabled via debug setting
+        if (!hasProfiles && !forceEnabled) {
+            debugLog('[Profile Controls] No profiles stored and not force-enabled, skipping UI creation');
+            return;
+        }
 
         // Check if controls already exist OR if a placeholder exists (being created)
         const existingControls = modal.querySelector('#profile-controls');
@@ -3471,7 +3826,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         select.className = 'flex-1 h-[28px] px-2 rounded-md bg-gray-100 dark:bg-gray-800 text-[12px] border border-gray-300 dark:border-gray-700 cursor-pointer';
         
         // Populate dropdown
-        const profiles = await loadProfiles();
+        const profilesList = await loadProfiles();
         const lastProfile = await storage.get(LAST_PROFILE_KEY, '');
         
         const defaultOption = document.createElement('option');
@@ -3479,10 +3834,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         defaultOption.textContent = '-- Select Profile --';
         select.appendChild(defaultOption);
 
-        Object.keys(profiles).sort().forEach(async name => {
+        Object.keys(profilesList).sort().forEach(async name => {
             const option = document.createElement('option');
             option.value = name;
-            const profile = profiles[name];
+            const profile = profilesList[name];
             option.textContent = `${name} ${profile.model ? `(${profile.model})` : ''}`;
             if (name === lastProfile) {
                 option.selected = true;
@@ -3493,9 +3848,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         select.addEventListener('change', async function() {
             const profileName = this.value;
             if (profileName) {
-                const profiles = await loadProfiles();
-                if (profiles[profileName]) {
-                    const profileSettings = profiles[profileName];
+                const profilesData = await loadProfiles();
+                if (profilesData[profileName]) {
+                    const profileSettings = profilesData[profileName];
                     const autoChange = true; // Always auto-change model
                     applySettings(profileSettings, autoChange);
                     await storage.set(LAST_PROFILE_KEY, profileName);
@@ -3747,10 +4102,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let sidebarAutoDisabled = false; // True when user has sidebar enabled but page is too narrow
     let sidebarUserEnabled = false; // Tracks user's actual preference (persisted to storage)
     
+    // Check if current page should have sidebar layout disabled
+    function isNonChatPageForSidebar() {
+        return window.location.pathname.startsWith('/lorebook') ||
+               window.location.pathname.startsWith('/chatbot/') ||
+               window.location.pathname.startsWith('/group');
+    }
+    
     // Apply or remove sidebar layout CSS
     // saveToStorage: if false, only updates the CSS state without saving (used for responsive auto-disable)
     async function toggleSidebarLayout(enable, saveToStorage = true) {
-        if (enable) {
+        // Don't enable sidebar on non-chat pages (lorebook, chatbot, group)
+        const shouldBlock = enable && isNonChatPageForSidebar();
+        
+        if (enable && !shouldBlock) {
             if (!sidebarStyleElement) {
                 // Check if early-injected element exists
                 sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') || 
@@ -4342,6 +4707,1230 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         await storage.set(PAGE_JUMP_KEY, enable);
     }
     
+    // =============================================================================
+    // WYSIWYG EDITOR - Live formatting preview in textareas
+    // =============================================================================
+    
+    let wysiwygObserver = null;
+    let wysiwygActive = false;
+    const WYSIWYG_EDITOR_CLASS = 'sai-wysiwyg-editor';
+    
+    // CSS for the WYSIWYG contenteditable editor
+    // Uses a contenteditable div that syncs back to the hidden textarea
+    // This ensures cursor alignment because the formatted text IS the editable content
+    // IMPORTANT: We insert the editor as a sibling, NOT wrapping the textarea,
+    // to avoid breaking React's DOM reconciliation
+    const WYSIWYG_CSS = `
+        /* Ensure the Suggest/autogenerate button wrapper stays at the LEFT of the flex container */
+        /* This button has data-tooltip-id and contains the autogenerate/lightbulb button */
+        /* It must remain before the editor in visual order, never getting pushed right */
+        .sai-wysiwyg-editor ~ textarea.sai-wysiwyg-hidden {
+            /* Already handled below */
+        }
+        
+        /* When WYSIWYG is active, ensure the Suggest button wrapper stays left */
+        /* The wrapper is the div with data-tooltip-id that contains aria-label="autogenerate" */
+        /* During generation, React replaces the wrapper with a direct button element */
+        .flex:has(.sai-wysiwyg-editor) > .inline-flex:has(button[aria-label="autogenerate"]),
+        .flex:has(.sai-wysiwyg-editor) > div[data-tooltip-id]:has(button[aria-label="autogenerate"]),
+        .flex:has(.sai-wysiwyg-editor) > button[aria-label="autogenerate"] {
+            flex: 0 0 auto !important;
+            order: -1 !important;
+        }
+        
+        /* The contenteditable editor - visible, receives input */
+        /* Inserted as sibling BEFORE the textarea, not wrapping it */
+        .sai-wysiwyg-editor {
+            white-space: pre-wrap !important;
+            word-wrap: break-word !important;
+            overflow-wrap: break-word !important;
+            overflow: auto !important;
+            box-sizing: border-box !important;
+            background: transparent !important;
+            color: var(--wysiwyg-body-color, #ffffff) !important;
+            font-weight: var(--wysiwyg-body-font-weight, normal) !important;
+            font-style: var(--wysiwyg-body-font-style, normal) !important;
+            text-decoration: var(--wysiwyg-body-text-decoration, none) !important;
+            outline: none !important;
+            cursor: text !important;
+            flex: 1 1 0% !important;
+            min-width: 0 !important;
+            min-height: 24px !important;
+            width: 100% !important;
+            align-self: center !important;
+            /* DO NOT use display: flex on contenteditable - it causes column layout! */
+            display: block !important;
+            /* Editor appears after the Suggest button (which has order: -1) */
+            order: 0 !important;
+            
+            /* Default CSS variables for colors */
+            --wysiwyg-body-color: #ffffff;
+            --wysiwyg-body-font-weight: normal;
+            --wysiwyg-body-font-style: normal;
+            --wysiwyg-body-text-decoration: none;
+            --wysiwyg-dialogue-color: #ffffff;
+            --wysiwyg-dialogue-font-weight: normal;
+            --wysiwyg-dialogue-font-style: normal;
+            --wysiwyg-dialogue-text-decoration: none;
+            --wysiwyg-narration-color: #7dd3fc;
+            --wysiwyg-narration-font-weight: normal;
+            --wysiwyg-narration-font-style: italic;
+            --wysiwyg-narration-text-decoration: none;
+            --wysiwyg-highlight-bg: #ffdd6d;
+            --wysiwyg-highlight-text: #000000;
+            --wysiwyg-highlight-font-weight: normal;
+            --wysiwyg-highlight-font-style: normal;
+            --wysiwyg-highlight-text-decoration: none;
+        }
+        
+        /* Narration: uses custom style settings */
+        .sai-wysiwyg-editor .wysiwyg-narration {
+            color: var(--wysiwyg-narration-color);
+            font-weight: var(--wysiwyg-narration-font-weight);
+            font-style: var(--wysiwyg-narration-font-style);
+            text-decoration: var(--wysiwyg-narration-text-decoration);
+        }
+        
+        /* Dialogue: uses custom style settings */
+        .sai-wysiwyg-editor .wysiwyg-dialogue {
+            color: var(--wysiwyg-dialogue-color);
+            font-weight: var(--wysiwyg-dialogue-font-weight);
+            font-style: var(--wysiwyg-dialogue-font-style);
+            text-decoration: var(--wysiwyg-dialogue-text-decoration);
+        }
+        
+        /* Reset narration styles for nested elements */
+        .sai-wysiwyg-editor .wysiwyg-narration .wysiwyg-dialogue {
+            font-style: var(--wysiwyg-dialogue-font-style);
+            font-weight: var(--wysiwyg-dialogue-font-weight);
+            text-decoration: var(--wysiwyg-dialogue-text-decoration);
+        }
+        .sai-wysiwyg-editor .wysiwyg-narration .wysiwyg-highlight {
+            font-style: var(--wysiwyg-highlight-font-style);
+            font-weight: var(--wysiwyg-highlight-font-weight);
+            text-decoration: var(--wysiwyg-highlight-text-decoration);
+        }
+        
+        /* Bold: body color but bold */
+        .sai-wysiwyg-editor .wysiwyg-bold {
+            color: var(--wysiwyg-body-color);
+            font-weight: bold;
+        }
+        
+        /* Bold narration: narration color but bold */
+        .sai-wysiwyg-editor .wysiwyg-bold-narration {
+            color: var(--wysiwyg-narration-color);
+            font-weight: bold;
+            font-style: var(--wysiwyg-narration-font-style);
+        }
+        
+        /* Highlight: uses custom style settings */
+        .sai-wysiwyg-editor .wysiwyg-highlight {
+            background-color: var(--wysiwyg-highlight-bg);
+            color: var(--wysiwyg-highlight-text);
+            font-weight: var(--wysiwyg-highlight-font-weight);
+            font-style: var(--wysiwyg-highlight-font-style);
+            text-decoration: var(--wysiwyg-highlight-text-decoration);
+            border-radius: 2px;
+        }
+        
+        /* Hide the original textarea when WYSIWYG is active */
+        /* Use position:absolute and zero dimensions to take it out of flex flow completely */
+        textarea.sai-wysiwyg-hidden {
+            position: absolute !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            width: 0 !important;
+            height: 0 !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            max-width: 0 !important;
+            max-height: 0 !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            border: none !important;
+            overflow: hidden !important;
+            flex: 0 0 0 !important;
+            z-index: -1 !important;
+        }
+        
+        /* Ensure parent container of WYSIWYG has position:relative for absolute positioning */
+        /* This is needed on /group/, /lorebook/, and /chatbot/ pages */
+        .flex.flex-col.gap-1\\.5:has(.sai-wysiwyg-editor) {
+            position: relative !important;
+        }
+        
+        /* On non-chat pages, make WYSIWYG overlay the textarea instead of sitting above it */
+        /* These pages have different flex layouts that don't hide the textarea properly */
+        .flex.flex-col.gap-1\\.5:has(.sai-wysiwyg-editor) > .sai-wysiwyg-editor {
+            position: relative !important;
+            z-index: 1 !important;
+        }
+        
+        /* Placeholder styling for empty editor */
+        .sai-wysiwyg-editor:empty::before {
+            content: attr(data-placeholder);
+            color: rgb(156, 163, 175);
+            pointer-events: none;
+        }
+    `;
+    
+    let wysiwygStyleElement = null;
+    
+    function injectWysiwygCSS() {
+        if (!wysiwygStyleElement) {
+            wysiwygStyleElement = document.createElement('style');
+            wysiwygStyleElement.id = 'sai-toolkit-wysiwyg-css';
+            wysiwygStyleElement.textContent = WYSIWYG_CSS;
+            document.head.appendChild(wysiwygStyleElement);
+            debugLog('[WYSIWYG] Injected WYSIWYG CSS');
+        }
+    }
+    
+    function removeWysiwygCSS() {
+        if (wysiwygStyleElement) {
+            wysiwygStyleElement.remove();
+            wysiwygStyleElement = null;
+            debugLog('[WYSIWYG] Removed WYSIWYG CSS');
+        }
+    }
+    
+    /**
+     * Parse text and convert formatting markers to HTML
+     * Formatting rules (matching SpicyChat's renderer):
+     * - ***text*** → bold narration (italic cyan + bold)
+     * - **text** → bold body text (white + bold)
+     * - *text* → narration (italic, cyan) - can contain dialogue
+     * - "text" → dialogue (white) - supports various quote styles
+     * - `text` → highlight (cyan background)
+     * - Plain text → body text (white)
+     */
+    function parseFormattedText(text) {
+        if (!text) return '';
+        
+        // All opening quote characters
+        const OPENING_QUOTES = ['"', '"', '„', '‟'];
+        // All closing quote characters  
+        const CLOSING_QUOTES = ['"', '"', '"'];
+        // Check if char is any opening quote
+        const isOpeningQuote = (char) => OPENING_QUOTES.includes(char);
+        // Check if char is any closing quote
+        const isClosingQuote = (char) => CLOSING_QUOTES.includes(char);
+        // Find next closing quote position
+        const findClosingQuote = (str, startIdx) => {
+            for (let j = startIdx; j < str.length; j++) {
+                if (isClosingQuote(str[j])) return j;
+            }
+            return -1;
+        };
+        
+        // Helper to escape HTML in plain text
+        function escapeHtml(str) {
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+        
+        // Helper to parse dialogue and highlights within text (for inside narration)
+        function parseInnerContent(str) {
+            let result = '';
+            let i = 0;
+            while (i < str.length) {
+                const char = str[i];
+                
+                // Check for highlight: `text`
+                if (char === '`') {
+                    const endIdx = str.indexOf('`', i + 1);
+                    if (endIdx !== -1) {
+                        const content = str.substring(i + 1, endIdx);
+                        result += '<span class="wysiwyg-highlight">`' + escapeHtml(content) + '`</span>';
+                        i = endIdx + 1;
+                        continue;
+                    }
+                }
+                
+                // Check for dialogue: any opening quote character
+                if (isOpeningQuote(char)) {
+                    const endIdx = findClosingQuote(str, i + 1);
+                    
+                    if (endIdx !== -1) {
+                        // Found closing quote
+                        const content = str.substring(i + 1, endIdx);
+                        const actualCloseQuote = str[endIdx];
+                        result += '<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + actualCloseQuote + '</span>';
+                        i = endIdx + 1;
+                        continue;
+                    } else {
+                        // No closing quote found - style rest as dialogue (unclosed)
+                        const content = str.substring(i + 1);
+                        result += '<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + '</span>';
+                        return result; // We've consumed the rest
+                    }
+                }
+                
+                // Plain character
+                if (char === '&') {
+                    result += '&amp;';
+                } else if (char === '<') {
+                    result += '&lt;';
+                } else if (char === '>') {
+                    result += '&gt;';
+                } else {
+                    result += char;
+                }
+                i++;
+            }
+            return result;
+        }
+        
+        const result = [];
+        let i = 0;
+        const len = text.length;
+        
+        while (i < len) {
+            const char = text[i];
+            
+            // Check for highlight: `text`
+            if (char === '`') {
+                const endIdx = text.indexOf('`', i + 1);
+                if (endIdx !== -1) {
+                    const content = text.substring(i + 1, endIdx);
+                    result.push('<span class="wysiwyg-highlight">`' + escapeHtml(content) + '`</span>');
+                    i = endIdx + 1;
+                    continue;
+                }
+            }
+            
+            // Check for bold narration: ***text***
+            if (char === '*' && text[i + 1] === '*' && text[i + 2] === '*') {
+                const endIdx = text.indexOf('***', i + 3);
+                if (endIdx !== -1) {
+                    const content = text.substring(i + 3, endIdx);
+                    result.push('<span class="wysiwyg-bold-narration">***' + escapeHtml(content) + '***</span>');
+                    i = endIdx + 3;
+                    continue;
+                }
+            }
+            
+            // Check for bold: **text**
+            if (char === '*' && text[i + 1] === '*' && text[i + 2] !== '*') {
+                const endIdx = text.indexOf('**', i + 2);
+                if (endIdx !== -1 && text[endIdx + 2] !== '*') {
+                    const content = text.substring(i + 2, endIdx);
+                    result.push('<span class="wysiwyg-bold">**' + escapeHtml(content) + '**</span>');
+                    i = endIdx + 2;
+                    continue;
+                }
+            }
+            
+            // Check for narration: *text*
+            // Single * starts narration - find matching closing *
+            if (char === '*' && text[i + 1] !== '*') {
+                // Find the next single * (not part of ** or ***)
+                let endIdx = -1;
+                for (let j = i + 1; j < len; j++) {
+                    if (text[j] === '*') {
+                        // Check it's a single * (not ** or ***)
+                        const prevIsStar = j > 0 && text[j - 1] === '*';
+                        const nextIsStar = text[j + 1] === '*';
+                        if (!prevIsStar && !nextIsStar) {
+                            endIdx = j;
+                            break;
+                        }
+                        // Skip if it's part of ** or ***
+                        if (nextIsStar) {
+                            j++; // Skip the next *
+                            if (text[j + 1] === '*') j++; // Skip another if ***
+                        }
+                    }
+                    // Stop at double newline (paragraph break)
+                    if (text[j] === '\n' && text[j + 1] === '\n') {
+                        break;
+                    }
+                }
+                
+                if (endIdx !== -1) {
+                    const content = text.substring(i + 1, endIdx);
+                    // Parse inner content for dialogue/highlights
+                    const parsedContent = parseInnerContent(content);
+                    result.push('<span class="wysiwyg-narration">*' + parsedContent + '*</span>');
+                    i = endIdx + 1;
+                    continue;
+                }
+            }
+            
+            // Check for dialogue: any opening quote character (outside of narration)
+            if (isOpeningQuote(char)) {
+                const endIdx = findClosingQuote(text, i + 1);
+                
+                if (endIdx !== -1) {
+                    // Found closing quote
+                    const content = text.substring(i + 1, endIdx);
+                    const actualCloseQuote = text[endIdx];
+                    result.push('<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + actualCloseQuote + '</span>');
+                    i = endIdx + 1;
+                    continue;
+                } else {
+                    // No closing quote found - style rest of text as dialogue (unclosed)
+                    const content = text.substring(i + 1);
+                    result.push('<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + '</span>');
+                    break; // We've consumed the rest of the text
+                }
+            }
+            
+            // Plain character - escape if needed
+            if (char === '&') {
+                result.push('&amp;');
+            } else if (char === '<') {
+                result.push('&lt;');
+            } else if (char === '>') {
+                result.push('&gt;');
+            } else {
+                result.push(char);
+            }
+            i++;
+        }
+        
+        return result.join('');
+    }
+    
+    /**
+     * Create a WYSIWYG contenteditable editor for a textarea
+     * The editor displays formatted text and syncs plain text back to the hidden textarea
+     * IMPORTANT: We insert the editor as a sibling BEFORE the textarea, NOT wrapping it,
+     * to avoid breaking React's DOM reconciliation which causes crashes on hover/tooltips
+     */
+    function setupWysiwygOverlay(textarea) {
+        // Skip if already set up
+        if (textarea.dataset.wysiwygSetup === 'true') return;
+        
+        // EXCLUDE textareas inside modals/dialogs - these should not get WYSIWYG
+        // Modals typically have role="dialog" or are inside elements with certain classes
+        const isInModal = textarea.closest('[role="dialog"]') !== null ||
+                          textarea.closest('[role="alertdialog"]') !== null ||
+                          textarea.closest('.modal') !== null ||
+                          textarea.closest('[data-slot="base"]') !== null ||  // NextUI modal
+                          textarea.closest('[aria-modal="true"]') !== null;
+        
+        if (isInModal) {
+            debugLog('[WYSIWYG] Skipping textarea inside modal:', textarea);
+            return;
+        }
+        
+        // Check if this is a message editor (editing existing messages)
+        // These have .flex.flex-col.gap-1\.5 parent but are NOT in the main chat input container
+        const messageEditorContainer = textarea.closest('.flex.flex-col.gap-1\\.5');
+        const chatInputContainer = textarea.closest('.border-1.border-solid.rounded-\\[13px\\]');
+        const isMessageEditor = messageEditorContainer !== null && chatInputContainer === null;
+        
+        // Check if this is a group chat message editor (has placeholder "Enter something")
+        // Also matches regular message edits which use the same placeholder
+        const isGroupChatEdit = textarea.placeholder === 'Enter something' && 
+                                textarea.closest('.flex.flex-col.gap-1\\.5') !== null;
+        
+        // Chat input: main message input at bottom of chat
+        const isChatInput = textarea.classList.contains('flex-grow') && 
+                           chatInputContainer !== null;
+        
+        // Alternative selectors for chat input - must also be in the chat input container
+        const isChatInputAlt = textarea.placeholder === 'Message...' &&
+                              textarea.closest('.bg-gray-3') !== null;
+        
+        // Only apply WYSIWYG to: main chat input, message editors, or group chat editors
+        if (!isChatInput && !isChatInputAlt && !isMessageEditor && !isGroupChatEdit) {
+            return;
+        }
+        
+        debugLog('[WYSIWYG] Setting up contenteditable editor for textarea:', textarea,
+                 { isChatInput, isChatInputAlt, isMessageEditor, isGroupChatEdit });
+        
+        // Track active message editors globally so we can block arrow keys
+        // even when the editor is not focused (user clicked away to read something)
+        if (!window._activeMessageEditors) {
+            window._activeMessageEditors = new Set();
+        }
+        
+        // Install global arrow key blocker ONCE - blocks when ANY message editor is active
+        if (!window._wysiwygGlobalArrowBlockerInstalled) {
+            window._wysiwygGlobalArrowBlockerInstalled = true;
+            
+            // Window capture phase - this fires FIRST before any element handlers
+            window.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
+                    e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                    
+                    // Check if any message editor is currently active (visible on page)
+                    const hasActiveMessageEditor = window._activeMessageEditors && 
+                                                   window._activeMessageEditors.size > 0;
+                    
+                    // Check if the WYSIWYG editor itself is focused
+                    // If so, let arrow keys through for cursor movement
+                    const activeEl = document.activeElement;
+                    const isEditorFocused = activeEl && activeEl.classList.contains('sai-wysiwyg-editor');
+                    
+                    // Block arrow keys when a message editor is active BUT NOT focused
+                    // This prevents accidentally switching regenerations while editing
+                    // but allows cursor movement when typing in the editor
+                    if (hasActiveMessageEditor && !isEditorFocused) {
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        e.preventDefault();
+                        return false;
+                    }
+                }
+            }, true); // Capture phase - fires first!
+        }
+        
+        textarea.dataset.wysiwygSetup = 'true';
+        
+        // Create contenteditable div that will be the visible editor
+        // This is inserted as a SIBLING before the textarea, not wrapping it
+        const editor = document.createElement('div');
+        editor.className = 'sai-wysiwyg-editor';
+        editor.contentEditable = 'true';
+        editor.setAttribute('data-placeholder', textarea.placeholder || 'Enter something');
+        
+        // Apply custom style colors if enabled (async, applied to editor directly)
+        (async () => {
+            const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
+            if (customStyleEnabled) {
+                const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+                let customStyleValues;
+                try {
+                    customStyleValues = typeof customStyleValuesStr === 'string' 
+                        ? JSON.parse(customStyleValuesStr) 
+                        : customStyleValuesStr;
+                } catch (e) {
+                    customStyleValues = DEFAULT_CUSTOM_STYLE;
+                }
+                
+                // Apply custom colors via CSS variables directly on editor
+                if (customStyleValues.bodyColor) {
+                    editor.style.setProperty('--wysiwyg-body-color', customStyleValues.bodyColor);
+                    editor.style.setProperty('--wysiwyg-dialogue-color', customStyleValues.bodyColor);
+                }
+                if (customStyleValues.bodyFontWeight) {
+                    editor.style.setProperty('--wysiwyg-body-font-weight', customStyleValues.bodyFontWeight);
+                }
+                if (customStyleValues.bodyFontStyle) {
+                    editor.style.setProperty('--wysiwyg-body-font-style', customStyleValues.bodyFontStyle);
+                }
+                if (customStyleValues.bodyTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-body-text-decoration', customStyleValues.bodyTextDecoration);
+                }
+                
+                // Dialogue / Quote settings
+                if (customStyleValues.spanQuoteColor) {
+                    editor.style.setProperty('--wysiwyg-dialogue-color', customStyleValues.spanQuoteColor);
+                }
+                if (customStyleValues.spanQuoteFontWeight) {
+                    editor.style.setProperty('--wysiwyg-dialogue-font-weight', customStyleValues.spanQuoteFontWeight);
+                }
+                if (customStyleValues.spanQuoteFontStyle) {
+                    editor.style.setProperty('--wysiwyg-dialogue-font-style', customStyleValues.spanQuoteFontStyle);
+                }
+                if (customStyleValues.spanQuoteTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-dialogue-text-decoration', customStyleValues.spanQuoteTextDecoration);
+                }
+                
+                // Narration settings
+                if (customStyleValues.narrationColor) {
+                    editor.style.setProperty('--wysiwyg-narration-color', customStyleValues.narrationColor);
+                }
+                if (customStyleValues.narrationFontWeight) {
+                    editor.style.setProperty('--wysiwyg-narration-font-weight', customStyleValues.narrationFontWeight);
+                }
+                if (customStyleValues.narrationFontStyle) {
+                    editor.style.setProperty('--wysiwyg-narration-font-style', customStyleValues.narrationFontStyle);
+                }
+                if (customStyleValues.narrationTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-narration-text-decoration', customStyleValues.narrationTextDecoration);
+                }
+                
+                // Highlight settings
+                if (customStyleValues.highlightBgColor) {
+                    editor.style.setProperty('--wysiwyg-highlight-bg', customStyleValues.highlightBgColor);
+                }
+                if (customStyleValues.highlightTextColor) {
+                    editor.style.setProperty('--wysiwyg-highlight-text', customStyleValues.highlightTextColor);
+                }
+                if (customStyleValues.highlightFontWeight) {
+                    editor.style.setProperty('--wysiwyg-highlight-font-weight', customStyleValues.highlightFontWeight);
+                }
+                if (customStyleValues.highlightFontStyle) {
+                    editor.style.setProperty('--wysiwyg-highlight-font-style', customStyleValues.highlightFontStyle);
+                }
+                if (customStyleValues.highlightTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-highlight-text-decoration', customStyleValues.highlightTextDecoration);
+                }
+                
+                debugLog('[WYSIWYG] Applied custom style settings:', customStyleValues);
+            }
+        })();
+        
+        // Get computed styles from textarea
+        const computedStyle = window.getComputedStyle(textarea);
+        
+        // Copy ALL relevant styles from textarea to editor
+        editor.style.fontFamily = computedStyle.fontFamily;
+        editor.style.fontSize = computedStyle.fontSize;
+        editor.style.fontWeight = computedStyle.fontWeight;
+        editor.style.lineHeight = computedStyle.lineHeight;
+        editor.style.letterSpacing = computedStyle.letterSpacing;
+        editor.style.wordSpacing = computedStyle.wordSpacing;
+        editor.style.textAlign = computedStyle.textAlign;
+        editor.style.textIndent = computedStyle.textIndent;
+        editor.style.textTransform = computedStyle.textTransform;
+        editor.style.padding = computedStyle.padding;
+        editor.style.border = computedStyle.border;
+        editor.style.borderRadius = computedStyle.borderRadius;
+        editor.style.background = computedStyle.background;
+        editor.style.backgroundColor = computedStyle.backgroundColor;
+        editor.style.minHeight = computedStyle.height;
+        editor.style.maxHeight = computedStyle.maxHeight || '188px'; // Match textarea's max-h-[188px]
+        editor.style.boxSizing = 'border-box';
+        
+        // Copy ring/outline styles
+        editor.style.boxShadow = computedStyle.boxShadow;
+        
+        // Set caret color
+        editor.style.caretColor = 'white';
+        
+        // IMPORTANT: Insert editor as a sibling BEFORE the textarea
+        // Do NOT wrap/move the textarea - this would break React's DOM reconciliation
+        // and cause crashes when React tries to show tooltips or update the UI
+        textarea.parentNode.insertBefore(editor, textarea);
+        
+        // Ensure parent container has position:relative for absolute positioning of hidden textarea
+        const parentContainer = textarea.parentNode;
+        if (parentContainer) {
+            parentContainer.style.setProperty('position', 'relative', 'important');
+        }
+        
+        // Hide the original textarea visually but keep it in its original DOM position
+        // Apply inline styles directly to ensure it's hidden on all pages
+        textarea.classList.add('sai-wysiwyg-hidden');
+        textarea.style.setProperty('position', 'absolute', 'important');
+        textarea.style.setProperty('opacity', '0', 'important');
+        textarea.style.setProperty('pointer-events', 'none', 'important');
+        textarea.style.setProperty('width', '0', 'important');
+        textarea.style.setProperty('height', '0', 'important');
+        textarea.style.setProperty('min-width', '0', 'important');
+        textarea.style.setProperty('min-height', '0', 'important');
+        textarea.style.setProperty('max-width', '0', 'important');
+        textarea.style.setProperty('max-height', '0', 'important');
+        textarea.style.setProperty('padding', '0', 'important');
+        textarea.style.setProperty('margin', '0', 'important');
+        textarea.style.setProperty('border', 'none', 'important');
+        textarea.style.setProperty('overflow', 'hidden', 'important');
+        textarea.style.setProperty('z-index', '-1', 'important');
+        
+        // For message editors: Register as active so global arrow key blocker knows
+        // This allows blocking arrow keys even when editor is not focused
+        if (isMessageEditor || isGroupChatEdit) {
+            // Generate unique ID for this editor
+            const editorId = 'wysiwyg-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+            editor._wysiwygEditorId = editorId;
+            textarea._wysiwygEditorId = editorId;
+            
+            // Register as active
+            window._activeMessageEditors.add(editorId);
+            
+            // Watch for editor removal (when user cancels edit or saves)
+            const removalObserver = new MutationObserver((mutations) => {
+                // Check if editor was removed from DOM
+                if (!document.body.contains(editor)) {
+                    window._activeMessageEditors.delete(editorId);
+                    removalObserver.disconnect();
+                }
+            });
+            // Observe parent's parent for child removal
+            const observeTarget = editor.parentNode?.parentNode || editor.parentNode || document.body;
+            removalObserver.observe(observeTarget, { childList: true, subtree: true });
+            textarea._wysiwygRemovalObserver = removalObserver;
+        }
+        
+        // For message editors: Add capture-phase arrow key blocker on parent container
+        // This intercepts arrow key events before they bubble up to React's handlers
+        // that switch between message regenerations (legacy - kept as backup)
+        if (isMessageEditor || isGroupChatEdit) {
+            const messageContainer = textarea.closest('.flex.flex-col.gap-1\\.5');
+            if (messageContainer && !messageContainer._arrowKeyBlockerInstalled) {
+                messageContainer._arrowKeyBlockerInstalled = true;
+                messageContainer.addEventListener('keydown', (e) => {
+                    const isArrowKey = e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
+                                       e.key === 'ArrowUp' || e.key === 'ArrowDown';
+                    const editorFocused = document.activeElement === editor;
+                    
+                    // Block arrow keys when the WYSIWYG editor is focused
+                    if (isArrowKey && editorFocused) {
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        // Don't preventDefault - let cursor move in editor
+                    }
+                }, true); // Capture phase
+            }
+        }
+        
+        // Watch for autogenerate/suggest button clicks to clear and lock editor during generation
+        const suggestButton = textarea.parentNode?.querySelector('button[aria-label="autogenerate"]');
+        if (suggestButton) {
+            suggestButton.addEventListener('click', () => {
+                // Clear editor and show loading state using safe DOM methods
+                while (editor.firstChild) {
+                    editor.removeChild(editor.firstChild);
+                }
+                const loadingSpan = document.createElement('span');
+                loadingSpan.style.cssText = 'color: #888; font-style: italic;';
+                loadingSpan.textContent = 'Generating suggestion...';
+                editor.appendChild(loadingSpan);
+                
+                editor.contentEditable = 'false';
+                editor.style.pointerEvents = 'none';
+                editor.style.opacity = '0.6';
+            });
+        }
+        
+        // Track if we're programmatically updating to avoid loops
+        let isUpdating = false;
+        
+        // Get plain text from contenteditable (preserving line breaks)
+        function getPlainText() {
+            // Clone to avoid modifying the actual DOM
+            const clone = editor.cloneNode(true);
+            
+            // Replace <br> with newlines
+            clone.querySelectorAll('br').forEach(br => {
+                br.replaceWith('\n');
+            });
+            
+            // Replace block elements with newlines
+            clone.querySelectorAll('div, p').forEach(block => {
+                if (block.previousSibling) {
+                    block.insertBefore(document.createTextNode('\n'), block.firstChild);
+                }
+            });
+            
+            return clone.textContent || '';
+        }
+        
+        // Save cursor position
+        function saveCursorPosition() {
+            const selection = window.getSelection();
+            if (!selection.rangeCount) return null;
+            
+            const range = selection.getRangeAt(0);
+            
+            // Get text offset from start
+            const preCaretRange = range.cloneRange();
+            preCaretRange.selectNodeContents(editor);
+            preCaretRange.setEnd(range.startContainer, range.startOffset);
+            const startOffset = preCaretRange.toString().length;
+            
+            preCaretRange.setEnd(range.endContainer, range.endOffset);
+            const endOffset = preCaretRange.toString().length;
+            
+            return { start: startOffset, end: endOffset };
+        }
+        
+        // Restore cursor position
+        function restoreCursorPosition(savedPos) {
+            if (!savedPos) return;
+            
+            const selection = window.getSelection();
+            const range = document.createRange();
+            
+            let charCount = 0;
+            let startNode = null, startOffset = 0;
+            let endNode = null, endOffset = 0;
+            
+            function traverseNodes(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    const nextCount = charCount + node.textContent.length;
+                    
+                    if (!startNode && savedPos.start <= nextCount) {
+                        startNode = node;
+                        startOffset = savedPos.start - charCount;
+                    }
+                    if (!endNode && savedPos.end <= nextCount) {
+                        endNode = node;
+                        endOffset = savedPos.end - charCount;
+                    }
+                    
+                    charCount = nextCount;
+                } else {
+                    for (const child of node.childNodes) {
+                        traverseNodes(child);
+                        if (startNode && endNode) return;
+                    }
+                }
+            }
+            
+            traverseNodes(editor);
+            
+            // Fallback: place cursor at end
+            if (!startNode) {
+                range.selectNodeContents(editor);
+                range.collapse(false);
+            } else {
+                range.setStart(startNode, startOffset);
+                range.setEnd(endNode || startNode, endOffset || startOffset);
+            }
+            
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+        
+        // Safely set HTML content using DOMParser (avoids innerHTML security warnings)
+        // The HTML is generated by parseFormattedText which already escapes user content
+        // DOMParser creates an isolated document that doesn't execute scripts
+        function safeSetHTML(element, html) {
+            // Clear existing content
+            while (element.firstChild) {
+                element.removeChild(element.firstChild);
+            }
+            
+            if (!html) return;
+            
+            // Use DOMParser to safely parse HTML - this creates nodes without executing scripts
+            // Wrap in a div to handle multiple top-level nodes and text nodes
+            const parser = new DOMParser();
+            const doc = parser.parseFromString('<div>' + html + '</div>', 'text/html');
+            const wrapper = doc.body.firstChild;
+            
+            // Move all children from the parsed wrapper to our element
+            while (wrapper.firstChild) {
+                element.appendChild(document.adoptNode(wrapper.firstChild));
+            }
+        }
+        
+        // Update editor display with formatted HTML
+        function updateEditorDisplay() {
+            if (isUpdating) return;
+            isUpdating = true;
+            
+            const savedPos = saveCursorPosition();
+            const plainText = getPlainText();
+            const formattedHtml = parseFormattedText(plainText);
+            
+            safeSetHTML(editor, formattedHtml);
+            
+            restoreCursorPosition(savedPos);
+            
+            isUpdating = false;
+        }
+        
+        // Sync editor content to textarea
+        function syncToTextarea() {
+            if (isUpdating) return;
+            
+            const plainText = getPlainText();
+            if (textarea.value !== plainText) {
+                textarea.value = plainText;
+                
+                // Trigger input event so the site knows the value changed
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                textarea.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+        
+        // Initialize editor with textarea content
+        function initializeEditor() {
+            const formattedHtml = parseFormattedText(textarea.value);
+            safeSetHTML(editor, formattedHtml);
+
+            // Restore editor to editable state (in case it was locked during generation)
+            editor.contentEditable = 'true';
+            editor.style.pointerEvents = '';
+            editor.style.opacity = '';
+
+            // Auto-focus the editor when it becomes visible and enabled
+            // Check if the editor is visible (not hidden by React)
+            const isVisible = editor.offsetParent !== null &&
+                             editor.offsetWidth > 0 &&
+                             editor.offsetHeight > 0;
+
+            // Focus the editor if it's visible, editable, and not currently focused
+            if (isVisible && editor.contentEditable === 'true' && document.activeElement !== editor) {
+                // Use requestAnimationFrame to ensure DOM is fully updated
+                requestAnimationFrame(() => {
+                    editor.focus();
+                    // Place cursor at the end of content
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(editor);
+                    range.collapse(false); // false = collapse to end
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                });
+            }
+        }
+        
+        // Initialize
+        initializeEditor();
+        
+        // Track last known textarea value for change detection
+        let lastKnownValue = textarea.value;
+        
+        // Handle input - update formatting and sync to textarea
+        let inputDebounceTimer = null;
+        editor.addEventListener('input', () => {
+            // Sync to textarea immediately
+            syncToTextarea();
+            lastKnownValue = textarea.value;
+            
+            // Debounce the visual update to avoid cursor jumping while typing
+            clearTimeout(inputDebounceTimer);
+            inputDebounceTimer = setTimeout(() => {
+                updateEditorDisplay();
+            }, 300);
+        });
+        
+        // Handle paste - strip formatting and paste as plain text
+        editor.addEventListener('paste', (e) => {
+            e.preventDefault();
+            const text = e.clipboardData.getData('text/plain');
+            document.execCommand('insertText', false, text);
+        });
+        
+        // Handle keydown for special keys
+        editor.addEventListener('keydown', (e) => {
+            // ARROW KEY FIX: Stop propagation for arrow keys to prevent
+            // switching between regenerations when editing messages
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
+                e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                // Don't preventDefault - let the cursor move normally within the editor
+            }
+            
+            // Handle Enter key
+            if (e.key === 'Enter') {
+                if (e.shiftKey) {
+                    // Shift+Enter always adds a newline
+                    e.preventDefault();
+                    document.execCommand('insertLineBreak');
+                } else if (isMessageEditor || isGroupChatEdit) {
+                    // For message editor / group chat edit: Enter adds newline (like native textarea)
+                    e.preventDefault();
+                    document.execCommand('insertLineBreak');
+                } else {
+                    // For chat input: Enter sends the message
+                    e.preventDefault();
+                    
+                    // Sync to textarea first
+                    syncToTextarea();
+                    
+                    // Find and click the send button - try multiple selectors for different layouts
+                    // Old layout: button[aria-label="send-message"] in .flex.justify-between
+                    // New layout: may have different button structure
+                    let sendButton = null;
+                    
+                    // Try 1: Old layout - send-message button near editor
+                    sendButton = editor.closest('.flex.justify-between')?.querySelector('button[aria-label="send-message"]');
+                    
+                    // Try 2: Search up the DOM tree for any button with send-message
+                    if (!sendButton) {
+                        sendButton = document.querySelector('button[aria-label="send-message"]');
+                    }
+                    
+                    // Try 3: New layout - look for buttons in composer area siblings
+                    // Check parent containers for buttons (may be in flex container next to textarea)
+                    if (!sendButton) {
+                        const parent = editor.parentElement;
+                        const grandparent = parent?.parentElement;
+                        const greatGrandparent = grandparent?.parentElement;
+                        
+                        // Look for any button in the immediate composer area
+                        if (greatGrandparent) {
+                            const siblings = greatGrandparent.querySelectorAll('button');
+                            // Find an enabled button that's not aria-label="record-voice" or other non-send buttons
+                            for (const btn of siblings) {
+                                const ariaLabel = btn.getAttribute('aria-label') || '';
+                                const isDisabled = btn.disabled;
+                                const isHidden = btn.style.display === 'none' || btn.classList.contains('hidden');
+                                
+                                // Skip voice record button and other known non-send buttons
+                                if (!isDisabled && !isHidden && ariaLabel !== 'record-voice' && 
+                                    ariaLabel !== 'autogenerate' && ariaLabel !== 'generate-image') {
+                                    // Check if it looks like a send button (primary action button, not disabled)
+                                    if (btn.className && !btn.className.includes('opacity-60') && 
+                                        !btn.className.includes('cursor-not-allowed')) {
+                                        sendButton = btn;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If still not found, try to find ANY enabled button near the textarea that's not disabled
+                    if (!sendButton) {
+                        const parentContainer = editor.closest('.flex.flex-col') || editor.parentElement;
+                        if (parentContainer) {
+                            const allButtons = parentContainer.querySelectorAll('button:not([disabled])');
+                            // Take the last enabled button (likely the send button if only one is enabled)
+                            if (allButtons.length > 0) {
+                                sendButton = allButtons[allButtons.length - 1];
+                            }
+                        }
+                    }
+                    
+                    if (sendButton && !sendButton.disabled) {
+                        debugLog('[WYSIWYG] Found send button, clicking it:', {
+                            ariaLabel: sendButton.getAttribute('aria-label'),
+                            className: sendButton.className
+                        });
+                        sendButton.click();
+                        
+                        // Clear the editor after a short delay (after message is sent)
+                        setTimeout(() => {
+                            if (textarea.value === '' || textarea.value !== getPlainText()) {
+                                editor.innerHTML = '';
+                                lastKnownValue = '';
+                            }
+                        }, 50);
+                    } else {
+                        debugLog('[WYSIWYG] Could not find send button', {
+                            sendButton: !!sendButton,
+                            disabled: sendButton?.disabled
+                        });
+                    }
+                }
+            }
+            
+            // Handle Tab
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                document.execCommand('insertText', false, '\t');
+            }
+        });
+        
+        // Focus handling - when editor is focused, ensure it's ready
+        editor.addEventListener('focus', () => {
+            // Trigger immediate update if content changed externally
+            if (textarea.value !== getPlainText()) {
+                initializeEditor();
+            }
+        });
+        
+        // Watch for external changes to textarea (e.g., from undo/redo or message send clearing)
+        const textareaObserver = new MutationObserver(() => {
+            if (!isUpdating) {
+                lastKnownValue = textarea.value;
+                initializeEditor();
+            }
+        });
+        textareaObserver.observe(textarea, { attributes: true, attributeFilter: ['value'] });
+        
+        // Watch for value property changes (polling as backup)
+        const valueCheckInterval = setInterval(() => {
+            if (!document.body.contains(textarea)) {
+                clearInterval(valueCheckInterval);
+                return;
+            }
+            // Always check, even when editor is focused - important for message send clearing
+            if (textarea.value !== lastKnownValue) {
+                lastKnownValue = textarea.value;
+                // Only update display if textarea was cleared or changed externally
+                if (!isUpdating) {
+                    initializeEditor();
+                }
+            }
+        }, 100); // Check more frequently for responsive clearing
+        
+        // Handle resize - observe the editor since we don't have a container anymore
+        // Debounced to avoid expensive getComputedStyle calls on every resize event
+        let resizeDebounceTimer = null;
+        const resizeObserver = new ResizeObserver(() => {
+            clearTimeout(resizeDebounceTimer);
+            resizeDebounceTimer = setTimeout(() => {
+                const style = window.getComputedStyle(textarea);
+                editor.style.minHeight = style.height;
+            }, 16); // ~60fps max
+        });
+        // Observe the textarea's parent for layout changes
+        if (textarea.parentNode) {
+            resizeObserver.observe(textarea.parentNode);
+        }
+        
+        // Store references for cleanup
+        textarea._wysiwygEditor = editor;
+        textarea._wysiwygResizeObserver = resizeObserver;
+        textarea._wysiwygMutationObserver = textareaObserver;
+        textarea._wysiwygValueCheckInterval = valueCheckInterval;
+        textarea._wysiwygInputDebounceTimer = inputDebounceTimer;
+    }
+    
+    /**
+     * Remove WYSIWYG editor from a textarea
+     */
+    function removeWysiwygOverlay(textarea) {
+        if (textarea.dataset.wysiwygSetup !== 'true') return;
+        
+        textarea.dataset.wysiwygSetup = '';
+        textarea.classList.remove('sai-wysiwyg-hidden');
+        
+        // Unregister from active message editors (for global arrow key blocking)
+        if (textarea._wysiwygEditorId && window._activeMessageEditors) {
+            window._activeMessageEditors.delete(textarea._wysiwygEditorId);
+        }
+        
+        // Clean up removal observer
+        if (textarea._wysiwygRemovalObserver) {
+            textarea._wysiwygRemovalObserver.disconnect();
+        }
+        
+        // Clean up editor
+        if (textarea._wysiwygEditor) {
+            textarea._wysiwygEditor.remove();
+        }
+        
+        // Clean up resize observer
+        if (textarea._wysiwygResizeObserver) {
+            textarea._wysiwygResizeObserver.disconnect();
+        }
+        
+        // Clean up mutation observer
+        if (textarea._wysiwygMutationObserver) {
+            textarea._wysiwygMutationObserver.disconnect();
+        }
+        
+        // Clean up value check interval
+        if (textarea._wysiwygValueCheckInterval) {
+            clearInterval(textarea._wysiwygValueCheckInterval);
+        }
+        
+        // Clean up debounce timer
+        if (textarea._wysiwygInputDebounceTimer) {
+            clearTimeout(textarea._wysiwygInputDebounceTimer);
+        }
+        
+        // No need to unwrap from container since we don't use one anymore
+        // The textarea stays in its original position in the DOM
+        
+        // Clear inline styles that were added to hide the textarea
+        textarea.style.removeProperty('position');
+        textarea.style.removeProperty('opacity');
+        textarea.style.removeProperty('pointer-events');
+        textarea.style.removeProperty('width');
+        textarea.style.removeProperty('height');
+        textarea.style.removeProperty('min-width');
+        textarea.style.removeProperty('min-height');
+        textarea.style.removeProperty('max-width');
+        textarea.style.removeProperty('max-height');
+        textarea.style.removeProperty('padding');
+        textarea.style.removeProperty('margin');
+        textarea.style.removeProperty('border');
+        textarea.style.removeProperty('overflow');
+        textarea.style.removeProperty('z-index');
+        
+        // Clear references
+        delete textarea._wysiwygEditor;
+        delete textarea._wysiwygEditorId;
+        delete textarea._wysiwygResizeObserver;
+        delete textarea._wysiwygMutationObserver;
+        delete textarea._wysiwygValueCheckInterval;
+        delete textarea._wysiwygInputDebounceTimer;
+    }
+    
+    /**
+     * Find and setup all relevant textareas
+     */
+    function findAndSetupWysiwygTextareas() {
+        // STORY MODE: Skip WYSIWYG setup as Story Mode has native WYSIWYG
+        if (isStoryMode()) {
+            debugLog('[WYSIWYG] Skipping setup - Story Mode has native WYSIWYG');
+            return;
+        }
+        
+        // Find message editor textareas (in edit mode)
+        const messageEditorTextareas = document.querySelectorAll('.flex.flex-col.gap-1\\.5 textarea');
+        messageEditorTextareas.forEach(setupWysiwygOverlay);
+        
+        // Find chat input textareas
+        const chatInputTextareas = document.querySelectorAll('.border-1.border-solid.rounded-\\[13px\\] textarea');
+        chatInputTextareas.forEach(setupWysiwygOverlay);
+        
+        // Alternative: find by placeholder
+        const messageTextareas = document.querySelectorAll('textarea[placeholder="Message..."], textarea[placeholder="Enter something"]');
+        messageTextareas.forEach(setupWysiwygOverlay);
+    }
+    
+    /**
+     * Remove all WYSIWYG overlays
+     */
+    function removeAllWysiwygOverlays() {
+        const activeTextareas = document.querySelectorAll('textarea.sai-wysiwyg-active');
+        activeTextareas.forEach(removeWysiwygOverlay);
+    }
+    
+    /**
+     * Toggle WYSIWYG editor feature
+     */
+    async function toggleWysiwygEditor(enable) {
+        // STORY MODE: Skip WYSIWYG toggle as Story Mode has native WYSIWYG
+        if (isStoryMode()) {
+            debugLog('[WYSIWYG] Skipping toggle - Story Mode has native WYSIWYG');
+            return;
+        }
+        
+        if (enable) {
+            debugLog('[WYSIWYG] Enabling WYSIWYG editor');
+            wysiwygActive = true;
+            injectWysiwygCSS();
+            
+            // Initial setup
+            setTimeout(findAndSetupWysiwygTextareas, 500);
+            
+            // Watch for new textareas
+            if (!wysiwygObserver) {
+                wysiwygObserver = new MutationObserver((mutations) => {
+                    let needsSetup = false;
+                    for (const mutation of mutations) {
+                        if (mutation.addedNodes.length > 0) {
+                            for (const node of mutation.addedNodes) {
+                                if (node.nodeType === 1) {
+                                    // Check if node is a textarea
+                                    if (node.tagName === 'TEXTAREA') {
+                                        needsSetup = true;
+                                        break;
+                                    }
+                                    // Check if node contains a textarea
+                                    if (node.querySelector && node.querySelector('textarea')) {
+                                        needsSetup = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (needsSetup) break;
+                    }
+                    if (needsSetup) {
+                        setTimeout(findAndSetupWysiwygTextareas, 100);
+                    }
+                });
+                wysiwygObserver.observe(document.body, { childList: true, subtree: true });
+            }
+        } else {
+            debugLog('[WYSIWYG] Disabling WYSIWYG editor');
+            wysiwygActive = false;
+            
+            // Clean up observer
+            if (wysiwygObserver) {
+                wysiwygObserver.disconnect();
+                wysiwygObserver = null;
+            }
+            
+            // Remove all overlays
+            removeAllWysiwygOverlays();
+            removeWysiwygCSS();
+        }
+        
+        await storage.set(WYSIWYG_EDITOR_KEY, enable);
+    }
+    
     // Initialize features on page load
     async function initializeStyles() {
         const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
@@ -4350,6 +5939,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
         const pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
         const compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
+        const wysiwygEnabled = await storage.get(WYSIWYG_EDITOR_KEY, false);
         
         // Load sidebar minimum width setting
         sidebarMinWidth = await storage.get(SIDEBAR_MIN_WIDTH_KEY, DEFAULT_SIDEBAR_MIN_WIDTH);
@@ -4361,7 +5951,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             classicStyle: classicStyleEnabled,
             hideForYou: hideForYouEnabled,
             pageJump: pageJumpEnabled,
-            compactGeneration: compactGenerationEnabled
+            compactGeneration: compactGenerationEnabled,
+            wysiwygEditor: wysiwygEnabled
         });
         
         // Initialize sidebarUserEnabled for responsive sidebar tracking
@@ -4438,6 +6029,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         if (pageJumpEnabled) {
             await togglePageJump(true);
+        }
+        if (wysiwygEnabled) {
+            await toggleWysiwygEditor(true);
         }
     }
 
@@ -4693,8 +6287,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Function to inject chat export button in mobile header (to the left of toolkit settings button)
     function injectChatExportButton() {
-        // Only show on chat pages
-        if (!window.location.pathname.startsWith('/chat/')) {
+        // Only show on chat pages (case-insensitive check for /chat/ or /Chat/)
+        if (!window.location.pathname.toLowerCase().startsWith('/chat/')) {
             return;
         }
         
@@ -4756,8 +6350,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Function to inject NSFW mode toggle button in toolbar
     async function injectNSFWToggleButton() {
-        // Only show on chat pages
-        if (!window.location.pathname.startsWith('/chat/')) {
+        // Only show on chat pages (case-insensitive check for /chat/ or /Chat/)
+        if (!window.location.pathname.toLowerCase().startsWith('/chat/')) {
             return;
         }
         
@@ -5190,13 +6784,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Fetch all messages from the API (without limit)
     async function fetchAllChatMessages() {
-        // URL format: /chat/{characterId}/{conversationId}
+        // URL format: /chat/{characterId}/{conversationId} (may be /Chat/ with capital C)
         const pathParts = window.location.pathname.split('/').filter(p => p);
-        // pathParts should be: ['chat', characterId, conversationId]
-        
+        // pathParts should be: ['chat', characterId, conversationId] or ['Chat', ...]
+
         debugLog('[Export] Path parts:', pathParts);
-        
-        if (pathParts.length < 2 || pathParts[0] !== 'chat') {
+
+        if (pathParts.length < 2 || pathParts[0].toLowerCase() !== 'chat') {
             throw new Error('Not on a chat page. URL should be /chat/{characterId}/{conversationId}');
         }
         
@@ -5266,10 +6860,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (country) headers['X-Country'] = country;
                         
                         console.log('[Export] Fetching from API with character ID: ${characterId}, conversation ID: ${conversationId}');
-                        
+
                         // Fetch messages for specific conversation
-                        // The API endpoint requires both character ID and conversation ID
-                        const apiUrl = '${conversationId}' 
+                        // If conversation ID is not provided, use the character-level endpoint
+                        const apiUrl = '${conversationId}' && '${conversationId}' !== 'null'
                             ? 'https://prod.nd-api.com/characters/${characterId}/messages/${conversationId}'
                             : 'https://prod.nd-api.com/characters/${characterId}/messages';
                         
@@ -5363,7 +6957,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 messages: messages.messages || []
             };
             
-            const filename = `chat-${character?.name || 'export'}-${new Date().toISOString().slice(0, 10)}.json`;
+            // Build filename with chat label if available
+            const chatLabel = window.__saiChatLabel;
+            const characterName = character?.name || 'export';
+            const safeCharName = characterName.replace(/[^a-zA-Z0-9-_ ]/g, '').trim();
+            const dateStr = new Date().toISOString().slice(0, 10);
+            const filename = chatLabel 
+                ? `chat-${safeCharName}-${chatLabel.replace(/[^a-zA-Z0-9-_ ]/g, '').trim()}-${dateStr}.json`
+                : `chat-${safeCharName}-${dateStr}.json`;
             downloadFile(JSON.stringify(exportData, null, 2), filename, 'application/json');
             
             debugLog('[Export] JSON export complete:', filename, 'with', exportData.messageCount, 'messages');
@@ -5377,6 +6978,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function exportChatAsHTML() {
         try {
             debugLog('[Export] Starting HTML export...');
+            
+            // Fetch custom style settings for highlight colors
+            const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
+            const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+            const customStyleValues = JSON.parse(customStyleValuesStr);
             
             const { messages, character } = await fetchAllChatMessages();
             
@@ -5478,10 +7084,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 // Group chat support
                 isGroupChat,
                 subCharacterMap,
-                subCharacterImageMap
+                subCharacterImageMap,
+                // Custom style colors for backtick formatting
+                highlightBgColor: customStyleEnabled && customStyleValues.highlightBgColor ? customStyleValues.highlightBgColor : '#ffdd6d',
+                highlightTextColor: customStyleEnabled && customStyleValues.highlightTextColor ? customStyleValues.highlightTextColor : '#000000'
             });
             
-            const filename = `chat-${safeBotName}-${new Date().toISOString().slice(0, 10)}.html`;
+            // Build filename with chat label if available
+            const chatLabel = window.__saiChatLabel;
+            const dateStr = new Date().toISOString().slice(0, 10);
+            const filename = chatLabel 
+                ? `chat-${safeBotName}-${chatLabel.replace(/[^a-zA-Z0-9-_ ]/g, '').trim()}-${dateStr}.html`
+                : `chat-${safeBotName}-${dateStr}.html`;
             downloadFile(html, filename, 'text/html');
             
             debugLog('[Export] HTML export complete:', filename);
@@ -5552,7 +7166,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             botName, botImageUrl, userName, userImageUrl, characterTitle, 
             conversationId, messages, exportedAt,
             // Group chat support
-            isGroupChat = false, subCharacterMap = {}, subCharacterImageMap = {}
+            isGroupChat = false, subCharacterMap = {}, subCharacterImageMap = {},
+            // Custom style colors
+            highlightBgColor = '#ffdd6d', highlightTextColor = '#000000'
         } = data;
         
         // Format timestamp
@@ -5577,6 +7193,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const formatContent = (text) => {
             if (!text) return '';
             let formatted = escapeHTML(text);
+            // Process backticks for highlighted code/text BEFORE asterisks to avoid conflicts
+            formatted = formatted.replace(/`([^`]+)`/g, `<span class="highlight-text" style="background-color: ${highlightBgColor}; color: ${highlightTextColor}; padding: 0 4px; border-radius: 4px; display: inline-block; max-width: max-content;">$1</span>`);
+            // Process double asterisks for bold BEFORE single asterisks to avoid conflicts
+            formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
             formatted = formatted.replace(/\*([^*]+)\*/g, '<em class="action">$1</em>');
             formatted = formatted.replace(/\n/g, '<br>');
             return formatted;
@@ -5653,12 +7273,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             --text-color: #e5e5e5;
             --header-bg: #1a1a1a;
             --message-bg: #1a1a1a;
-            --user-message-bg: #1e3a5f;
-            --bot-message-bg: #2d2d2d;
+            --user-message-bg: rgba(0, 100, 255, 0.1);
+            --bot-message-bg: rgba(100, 100, 100, 0.1);
             --border-color: #333;
-            --action-color: #a78bfa;
+            --action-color: #06B7DB;
             --timestamp-color: #6b7280;
-            --accent-color: #8b5cf6;
+            --accent-color: #ffdd6d;
         }
         
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -6450,8 +8070,58 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     font-size: 12px;
                     font-weight: 500;
                 }
+                .style-label-sub {
+                    min-width: 100px;
+                    flex-shrink: 0;
+                    color: #9ca3af;
+                    font-size: 11px;
+                    font-weight: 400;
+                    padding-left: 1rem;
+                }
                 @media (max-width: 380px) {
                     .style-label { min-width: 80px; font-size: 11px; }
+                    .style-label-sub { min-width: 70px; font-size: 10px; }
+                }
+                
+                /* Text Type Sections (Collapsible) */
+                .text-type-section {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.25rem;
+                    padding: 0.5rem;
+                    background: rgba(0,0,0,0.2);
+                    border-radius: 6px;
+                    border: 1px solid rgba(255,255,255,0.05);
+                }
+                .text-type-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    cursor: pointer;
+                    user-select: none;
+                }
+                .text-type-header:hover {
+                    opacity: 0.8;
+                }
+                .text-type-caret {
+                    font-size: 10px;
+                    color: #9ca3af;
+                    transition: transform 0.2s;
+                    flex-shrink: 0;
+                    width: 12px;
+                }
+                .text-type-caret.expanded {
+                    transform: rotate(90deg);
+                }
+                .text-type-options {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.5rem;
+                    padding-left: 1.5rem;
+                    padding-top: 0.5rem;
+                }
+                .text-type-options.hidden {
+                    display: none;
                 }
                 .style-input {
                     flex: 1;
@@ -6473,6 +8143,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     color: #fff;
                     border-radius: 6px;
                     font-size: 12px;
+                }
+                .clear-btn {
+                    padding: 0.4rem 0.75rem;
+                    background: #ef4444;
+                    border: none;
+                    color: #fff;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    transition: background-color 0.2s;
+                    flex-shrink: 0;
+                }
+                .clear-btn:hover {
+                    background: #dc2626;
                 }
                 .color-preview {
                     width: 24px;
@@ -6541,14 +8227,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let showModelDetailsEnabled = await storage.get('showModelDetails', true); // true = show "model → engine", false = show only "model"
         let showTimestampEnabled = await storage.get('showTimestamp', false);
         let timestampDateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
+        let timestamp24Hour = await storage.get('timestamp24Hour', false);
+        let showMessageIdsEnabled = await storage.get(SHOW_MESSAGE_IDS_KEY, false); // false = 12-hour (default), true = 24-hour
         let showChatNameInTitleEnabled = await storage.get('showChatNameInTitle', false);
         let nsfwToggleEnabled = await storage.get('nsfwToggleEnabled', false);
+        let wysiwygEnabled = await storage.get(WYSIWYG_EDITOR_KEY, false);
+        let enableGenerationProfilesEnabled = await storage.get(ENABLE_GENERATION_PROFILES_KEY, false);
         let smallProfileImagesEnabled = await storage.get(SMALL_PROFILE_IMAGES_KEY, false);
         let roundedProfileImagesEnabled = await storage.get(ROUNDED_PROFILE_IMAGES_KEY, false);
         let swapCheckboxPositionEnabled = await storage.get(SWAP_CHECKBOX_POSITION_KEY, false);
         let squareMessageEdgesEnabled = await storage.get(SQUARE_MESSAGE_EDGES_KEY, false);
+        let messageContainerMaxWidth = await storage.get(MESSAGE_CONTAINER_MAX_WIDTH_KEY, '');
         
-        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
+        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth);
         
         // Create backdrop
         debugLog('[Toolkit] Creating backdrop and modal elements');
@@ -6685,31 +8376,196 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <input type="text" id="custom-user-bg" class="style-input" placeholder="rgba(0, 100, 255, 0.1)">
                             <div class="color-preview"><div class="color-preview-inner" id="preview-user-bg"></div></div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Body Text:</label>
-                            <input type="text" id="custom-body-color" class="style-input" placeholder="#ffffff">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-body-color"></div></div>
+                        
+                        <!-- Body Text Section -->
+                        <div class="text-type-section">
+                            <div class="text-type-header" data-target="body-text-options">
+                                <span class="text-type-caret">▶</span>
+                                <label class="style-label">Body Text:</label>
+                                <input type="text" id="custom-body-color" class="style-input" placeholder="#ffffff">
+                                <div class="color-preview"><div class="color-preview-inner" id="preview-body-color"></div></div>
+                            </div>
+                            <div class="text-type-options hidden" id="body-text-options">
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Weight:</label>
+                                    <select id="custom-body-font-weight" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="bold">Bold</option>
+                                        <option value="lighter">Lighter</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                        <option value="600">600</option>
+                                        <option value="700">700</option>
+                                        <option value="800">800</option>
+                                        <option value="900">900</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Style:</label>
+                                    <select id="custom-body-font-style" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="italic">Italic</option>
+                                        <option value="oblique">Oblique</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Text Decoration:</label>
+                                    <select id="custom-body-text-decoration" class="style-select">
+                                        <option value="none">None</option>
+                                        <option value="underline">Underline</option>
+                                        <option value="overline">Overline</option>
+                                        <option value="line-through">Line Through</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Dialogue:</label>
-                            <input type="text" id="custom-span-quote-color" class="style-input" placeholder="#ffffff">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-quote-color"></div></div>
+                        
+                        <!-- Dialogue Section -->
+                        <div class="text-type-section">
+                            <div class="text-type-header" data-target="dialogue-options">
+                                <span class="text-type-caret">▶</span>
+                                <label class="style-label">Dialogue:</label>
+                                <input type="text" id="custom-span-quote-color" class="style-input" placeholder="#ffffff">
+                                <div class="color-preview"><div class="color-preview-inner" id="preview-quote-color"></div></div>
+                            </div>
+                            <div class="text-type-options hidden" id="dialogue-options">
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Weight:</label>
+                                    <select id="custom-quote-font-weight" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="bold">Bold</option>
+                                        <option value="lighter">Lighter</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                        <option value="600">600</option>
+                                        <option value="700">700</option>
+                                        <option value="800">800</option>
+                                        <option value="900">900</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Style:</label>
+                                    <select id="custom-quote-font-style" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="italic">Italic</option>
+                                        <option value="oblique">Oblique</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Text Decoration:</label>
+                                    <select id="custom-quote-text-decoration" class="style-select">
+                                        <option value="none">None</option>
+                                        <option value="underline">Underline</option>
+                                        <option value="overline">Overline</option>
+                                        <option value="line-through">Line Through</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Narration:</label>
-                            <input type="text" id="custom-narration-color" class="style-input" placeholder="#06B7DB">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-narration-color"></div></div>
+                        
+                        <!-- Narration Section -->
+                        <div class="text-type-section">
+                            <div class="text-type-header" data-target="narration-options">
+                                <span class="text-type-caret">▶</span>
+                                <label class="style-label">Narration:</label>
+                                <input type="text" id="custom-narration-color" class="style-input" placeholder="#06B7DB">
+                                <div class="color-preview"><div class="color-preview-inner" id="preview-narration-color"></div></div>
+                            </div>
+                            <div class="text-type-options hidden" id="narration-options">
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Weight:</label>
+                                    <select id="custom-narration-font-weight" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="bold">Bold</option>
+                                        <option value="lighter">Lighter</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                        <option value="600">600</option>
+                                        <option value="700">700</option>
+                                        <option value="800">800</option>
+                                        <option value="900">900</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Style:</label>
+                                    <select id="custom-narration-font-style" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="italic">Italic</option>
+                                        <option value="oblique">Oblique</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Text Decoration:</label>
+                                    <select id="custom-narration-text-decoration" class="style-select">
+                                        <option value="none">None</option>
+                                        <option value="underline">Underline</option>
+                                        <option value="overline">Overline</option>
+                                        <option value="line-through">Line Through</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Highlight BG:</label>
-                            <input type="text" id="custom-highlight-bg-color" class="style-input" placeholder="#ffdd6d">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-bg"></div></div>
+                        
+                        <!-- Highlight Section -->
+                        <div class="text-type-section">
+                            <div class="text-type-header" data-target="highlight-options">
+                                <span class="text-type-caret">▶</span>
+                                <label class="style-label">Highlight BG:</label>
+                                <input type="text" id="custom-highlight-bg-color" class="style-input" placeholder="#ffdd6d">
+                                <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-bg"></div></div>
+                            </div>
+                            <div class="text-type-options hidden" id="highlight-options">
+                                <div class="style-input-row">
+                                    <label class="style-label">Highlight Text:</label>
+                                    <input type="text" id="custom-highlight-text-color" class="style-input" placeholder="#000000">
+                                    <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-text"></div></div>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Weight:</label>
+                                    <select id="custom-highlight-font-weight" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="bold">Bold</option>
+                                        <option value="lighter">Lighter</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                        <option value="600">600</option>
+                                        <option value="700">700</option>
+                                        <option value="800">800</option>
+                                        <option value="900">900</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Font Style:</label>
+                                    <select id="custom-highlight-font-style" class="style-select">
+                                        <option value="normal">Normal</option>
+                                        <option value="italic">Italic</option>
+                                        <option value="oblique">Oblique</option>
+                                    </select>
+                                </div>
+                                <div class="style-input-row">
+                                    <label class="style-label-sub">Text Decoration:</label>
+                                    <select id="custom-highlight-text-decoration" class="style-select">
+                                        <option value="none">None</option>
+                                        <option value="underline">Underline</option>
+                                        <option value="overline">Overline</option>
+                                        <option value="line-through">Line Through</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Highlight Text:</label>
-                            <input type="text" id="custom-highlight-text-color" class="style-input" placeholder="#000000">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-text"></div></div>
-                        </div>
+                        
                         <div class="style-input-row">
                             <label class="style-label">Font Size:</label>
                             <input type="text" id="custom-font-size" class="style-input" placeholder="16px">
@@ -6722,44 +8578,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="font-preview-text" id="font-preview-text"><span class="preview-quote" id="preview-text-quote">&quot;Go right ahead, dearie!&quot;</span> <span class="preview-narration" id="preview-text-narration">Elara smiles. Her phone buzzes.</span> <span class="preview-highlight" id="preview-text-highlight">The drop has been made.</span></div>
                         </div>
                         <div class="style-input-row">
-                            <label class="style-label">Font Weight:</label>
-                            <select id="custom-font-weight" class="style-select">
-                                <option value="normal">Normal</option>
-                                <option value="bold">Bold</option>
-                                <option value="lighter">Lighter</option>
-                                <option value="100">100</option>
-                                <option value="200">200</option>
-                                <option value="300">300</option>
-                                <option value="400">400</option>
-                                <option value="500">500</option>
-                                <option value="600">600</option>
-                                <option value="700">700</option>
-                                <option value="800">800</option>
-                                <option value="900">900</option>
-                            </select>
-                        </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Font Style:</label>
-                            <select id="custom-font-style" class="style-select">
-                                <option value="normal">Normal</option>
-                                <option value="italic">Italic</option>
-                                <option value="oblique">Oblique</option>
-                            </select>
-                        </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Text Decoration:</label>
-                            <select id="custom-text-decoration" class="style-select">
-                                <option value="none">None</option>
-                                <option value="underline">Underline</option>
-                                <option value="overline">Overline</option>
-                                <option value="line-through">Line Through</option>
-                            </select>
-                        </div>
-                        <div class="style-input-row">
                             <label class="style-label">Button Hover:</label>
                             <input type="text" id="custom-hover-button-color" class="style-input" placeholder="#292929">
                             <div class="color-preview"><div class="color-preview-inner" id="preview-hover-button"></div></div>
                         </div>
+                        
+                        <!-- Background Image Section -->
+                        <div class="text-type-section">
+                            <div class="style-input-row" style="margin-bottom: 0;">
+                                <label class="style-label">Background:</label>
+                                <input type="file" id="custom-background-image" class="style-input" accept="image/*">
+                                <button id="clear-background-image-btn" class="clear-btn">Clear</button>
+                            </div>
+                            <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Upload an image for the chat background (converted to data URL)</div>
+                        </div>
+
+                        <!-- Reset to Defaults Button -->
+                        <div class="style-input-row" style="justify-content: center; margin-top: 16px;">
+                            <button id="reset-custom-style-btn" class="sai-button" style="padding: 8px 16px; background-color: #3b82f6; color: white; border-radius: 6px; cursor: pointer; font-weight: 500; border: none; transition: background-color 0.2s;" onmouseover="this.style.backgroundColor='#2563eb'" onmouseout="this.style.backgroundColor='#3b82f6'">
+                                Reset to Defaults
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Message Container Section -->
+                    <div class="custom-style-section">
+                        <div class="section-title">Message Container</div>
+                        <div class="style-input-row">
+                            <label class="style-label">Max Width:</label>
+                            <input type="text" id="message-container-max-width" class="style-input" placeholder="e.g. 1200px, 90%">
+                        </div>
+                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Set max width for message containers (leave empty for default 800px)</div>
                     </div>
                 </div>
                 
@@ -6810,6 +8659,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="setting-desc">Format: "date @ time"</div>
                         </div>
                     </label>
+                    <label class="sub-setting-row hidden" id="timestamp-hour-format-row">
+                        <input type="checkbox" class="setting-checkbox" id="timestamp-hour-format-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Use 24-hour time</div>
+                            <div class="setting-desc">Default: 12-hour format</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="show-message-ids-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Show Message IDs</div>
+                            <div class="setting-desc">Display message IDs</div>
+                        </div>
+                    </label>
                     <label class="setting-row">
                         <input type="checkbox" class="setting-checkbox" id="showchatnametitle-checkbox" autocomplete="off">
                         <div class="setting-text">
@@ -6822,6 +8685,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <div class="setting-text">
                             <div class="setting-title">NSFW Image Toggle</div>
                             <div class="setting-desc">Show NSFW toggle button in chat toolbar</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="wysiwyg-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Live Text Formatting</div>
+                            <div class="setting-desc">WYSIWYG preview in message editor and chat input</div>
+                        </div>
+                    </label>
+                    <label class="setting-row hidden" id="generation-profiles-row">
+                        <input type="checkbox" class="setting-checkbox" id="generation-profiles-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Generation Profiles (Legacy)</div>
+                            <div class="setting-desc">Re-enable generation profile selector</div>
                         </div>
                     </label>
                     
@@ -6837,11 +8714,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 
                 <!-- Data Tab -->
                 <div class="tab-content" id="tab-data">
-                    <div class="section-title">Generation Profiles</div>
-                    <div class="section-desc">Export or import generation profiles</div>
-                    <div class="data-buttons">
-                        <button class="btn-data" id="export-profiles-btn">Export</button>
-                        <button class="btn-data" id="import-profiles-btn">Import</button>
+                    <div id="generation-profiles-section">
+                        <div class="section-title">Generation Profiles</div>
+                        <div class="section-desc">Export or delete generation profiles</div>
+                        <div class="data-buttons">
+                            <button class="btn-data" id="export-profiles-btn">Export</button>
+                            <button class="btn-data" id="import-profiles-btn" style="display: none;">Import</button>
+                            <button class="btn-data" id="delete-profiles-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Delete</button>
+                        </div>
                     </div>
                     
                     <div class="section-title">Custom Style</div>
@@ -6861,12 +8741,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <button class="btn-data" id="clear-all-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Clear All Data</button>
                     </div>
                     
-                    <div class="version-text" id="version-text">v1.0.33</div>
+                    <div class="version-text" id="version-text">v1.0.42</div>
                 </div>
             </div>
             
             <div class="button-row">
-                <button class="btn-cancel" id="cancel-btn">Cancel</button>
+                <button class="btn-cancel" id="cancel-btn">Close</button>
                 <button class="btn-save" id="save-btn">Save & Refresh</button>
             </div>
         `;
@@ -6891,29 +8771,47 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const swapCheckboxPositionCheckbox = shadow.querySelector('#swap-checkbox-position-checkbox');
         const squareMessageEdgesCheckbox = shadow.querySelector('#square-message-edges-checkbox');
         const customBodyColorInput = shadow.querySelector('#custom-body-color');
+        const customBodyFontWeightSelect = shadow.querySelector('#custom-body-font-weight');
+        const customBodyFontStyleSelect = shadow.querySelector('#custom-body-font-style');
+        const customBodyTextDecorationSelect = shadow.querySelector('#custom-body-text-decoration');
         const customSpanQuoteColorInput = shadow.querySelector('#custom-span-quote-color');
+        const customQuoteFontWeightSelect = shadow.querySelector('#custom-quote-font-weight');
+        const customQuoteFontStyleSelect = shadow.querySelector('#custom-quote-font-style');
+        const customQuoteTextDecorationSelect = shadow.querySelector('#custom-quote-text-decoration');
         const customNarrationColorInput = shadow.querySelector('#custom-narration-color');
+        const customNarrationFontWeightSelect = shadow.querySelector('#custom-narration-font-weight');
+        const customNarrationFontStyleSelect = shadow.querySelector('#custom-narration-font-style');
+        const customNarrationTextDecorationSelect = shadow.querySelector('#custom-narration-text-decoration');
         const customHighlightBgColorInput = shadow.querySelector('#custom-highlight-bg-color');
         const customHighlightTextColorInput = shadow.querySelector('#custom-highlight-text-color');
+        const customHighlightFontWeightSelect = shadow.querySelector('#custom-highlight-font-weight');
+        const customHighlightFontStyleSelect = shadow.querySelector('#custom-highlight-font-style');
+        const customHighlightTextDecorationSelect = shadow.querySelector('#custom-highlight-text-decoration');
         const customFontSizeInput = shadow.querySelector('#custom-font-size');
         const customFontFamilyInput = shadow.querySelector('#custom-font-family');
-        const customFontWeightSelect = shadow.querySelector('#custom-font-weight');
-        const customFontStyleSelect = shadow.querySelector('#custom-font-style');
-        const customTextDecorationSelect = shadow.querySelector('#custom-text-decoration');
         const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
         const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
         const modelDetailsCheckbox = shadow.querySelector('#generation-model-details-checkbox');
         const showTimestampCheckbox = shadow.querySelector('#showtimestamp-checkbox');
         const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
+        const timestampHourFormatCheckbox = shadow.querySelector('#timestamp-hour-format-checkbox');
+        const showMessageIdsCheckbox = shadow.querySelector('#show-message-ids-checkbox');
         const showChatNameInTitleCheckbox = shadow.querySelector('#showchatnametitle-checkbox');
         const nsfwToggleCheckbox = shadow.querySelector('#nsfwtoggle-checkbox');
+        const wysiwygCheckbox = shadow.querySelector('#wysiwyg-checkbox');
+        const enableGenerationProfilesCheckbox = shadow.querySelector('#generation-profiles-checkbox');
+        const generationProfilesRow = shadow.querySelector('#generation-profiles-row');
         const modelDetailsRow = shadow.querySelector('#generation-model-details-row');
         const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
+        const timestampHourFormatRow = shadow.querySelector('#timestamp-hour-format-row');
         const compactGenerationRow = shadow.querySelector('#compact-generation-row');
         const sidebarMinWidthRow = shadow.querySelector('#sidebar-min-width-row');
         const sidebarMinWidthInput = shadow.querySelector('#sidebar-min-width-input');
         const customHoverButtonColorInput = shadow.querySelector('#custom-hover-button-color');
+        const customBackgroundImageInput = shadow.querySelector('#custom-background-image');
+        const clearBackgroundImageBtn = shadow.querySelector('#clear-background-image-btn');
+        const messageContainerMaxWidthInput = shadow.querySelector('#message-container-max-width');
         const previewHoverButton = shadow.querySelector('#preview-hover-button');
         const versionText = shadow.querySelector('#version-text');
         
@@ -6934,10 +8832,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     if (DEBUG_MODE) {
                         versionText.style.color = '#4ade80'; // light green
                         console.log('[Toolkit] 🐛 Debug mode ENABLED (saved)');
+                        generationProfilesRow.classList.remove('hidden');
                     } else {
                         versionText.style.color = ''; // reset to default
                         console.log('[Toolkit] Debug mode disabled (saved)');
+                        generationProfilesRow.classList.add('hidden');
                     }
+                    // Update generation profiles section visibility
+                    await updateGenerationProfilesVisibility();
                 }
             });
         }
@@ -6955,24 +8857,52 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         customAiBgInput.value = customStyleValues.aiMessageBg;
         customUserBgInput.value = customStyleValues.userMessageBg;
         customBodyColorInput.value = customStyleValues.bodyColor;
+        customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
+        customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
+        customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
         customSpanQuoteColorInput.value = customStyleValues.spanQuoteColor;
+        customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
+        customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
+        customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
         customNarrationColorInput.value = customStyleValues.narrationColor;
+        customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
+        customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
+        customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
         customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
         customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
+        customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
+        customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
+        customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
         customFontSizeInput.value = customStyleValues.fontSize;
         customFontFamilyInput.value = customStyleValues.fontFamily || '';
         customHoverButtonColorInput.value = customStyleValues.hoverButtonColor || '#292929';
-        customFontWeightSelect.value = customStyleValues.fontWeight || 'normal';
-        customFontStyleSelect.value = customStyleValues.fontStyle || 'normal';
-        customTextDecorationSelect.value = customStyleValues.textDecoration || 'none';
+        messageContainerMaxWidthInput.value = messageContainerMaxWidth || '';
         hideForYouCheckbox.checked = hideForYouEnabled;
         pageJumpCheckbox.checked = pageJumpEnabled;
         showStatsCheckbox.checked = showStatsEnabled;
         modelDetailsCheckbox.checked = showModelDetailsEnabled;
         showTimestampCheckbox.checked = showTimestampEnabled;
         timestampFormatCheckbox.checked = timestampDateFirst;
+        timestampHourFormatCheckbox.checked = timestamp24Hour;
+        showMessageIdsCheckbox.checked = showMessageIdsEnabled;
         showChatNameInTitleCheckbox.checked = showChatNameInTitleEnabled;
         nsfwToggleCheckbox.checked = nsfwToggleEnabled;
+        wysiwygCheckbox.checked = wysiwygEnabled;
+        enableGenerationProfilesCheckbox.checked = enableGenerationProfilesEnabled;
+        
+        // Update generation profiles checkbox when it changes
+        if (enableGenerationProfilesCheckbox) {
+            enableGenerationProfilesCheckbox.addEventListener('change', async () => {
+                await updateGenerationProfilesVisibility();
+            });
+        }
+        
+        // Show/hide generation profiles setting based on debug mode
+        if (DEBUG_MODE) {
+            generationProfilesRow.classList.remove('hidden');
+        } else {
+            generationProfilesRow.classList.add('hidden');
+        }
         
         // Show/hide model details row based on showStats setting
         if (showStatsEnabled) {
@@ -6981,11 +8911,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             modelDetailsRow.classList.add('hidden');
         }
         
-        // Show/hide timestamp format row based on showTimestamp setting
+        // Show/hide timestamp format rows based on showTimestamp setting
         if (showTimestampEnabled) {
             timestampFormatRow.classList.remove('hidden');
+            timestampHourFormatRow.classList.remove('hidden');
         } else {
             timestampFormatRow.classList.add('hidden');
+            timestampHourFormatRow.classList.add('hidden');
         }
         
         // Show/hide compact generation row based on sidebar setting
@@ -7043,13 +8975,43 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         });
         debugLog('[Toolkit] Tab switching initialized');
         
+        // Collapsible text type sections
+        const textTypeHeaders = shadow.querySelectorAll('.text-type-header');
+        textTypeHeaders.forEach(header => {
+            header.addEventListener('click', (e) => {
+                // Only toggle if clicking the caret, label, or header itself
+                // Don't toggle when clicking input boxes or color previews
+                const clickedElement = e.target;
+                const isInput = clickedElement.classList.contains('style-input');
+                const isColorPreview = clickedElement.classList.contains('color-preview') || 
+                                      clickedElement.classList.contains('color-preview-inner');
+                
+                if (isInput || isColorPreview) {
+                    return; // Don't toggle, let the input/preview handle the click
+                }
+                
+                const targetId = header.dataset.target;
+                const optionsDiv = shadow.querySelector(`#${targetId}`);
+                const caret = header.querySelector('.text-type-caret');
+                
+                if (optionsDiv && caret) {
+                    optionsDiv.classList.toggle('hidden');
+                    caret.classList.toggle('expanded');
+                }
+            });
+        });
+        debugLog('[Toolkit] Collapsible text type sections initialized');
+        
         // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
         const exportProfilesBtn = shadow.querySelector('#export-profiles-btn');
         const importProfilesBtn = shadow.querySelector('#import-profiles-btn');
+        const deleteProfilesBtn = shadow.querySelector('#delete-profiles-btn');
+        const generationProfilesSection = shadow.querySelector('#generation-profiles-section');
         const exportCustomStyleBtn = shadow.querySelector('#export-custom-style-btn');
         const importCustomStyleBtn = shadow.querySelector('#import-custom-style-btn');
+        const resetCustomStyleBtn = shadow.querySelector('#reset-custom-style-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
         const clearAllBtn = shadow.querySelector('#clear-all-btn');
@@ -7076,6 +9038,36 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (!importAllBtn) {
             console.error('[Toolkit] ERROR: importAllBtn not found in shadow DOM!');
         }
+        
+        // Helper function to update generation profiles visibility
+        async function updateGenerationProfilesVisibility() {
+            const profiles = await loadProfiles();
+            const hasProfiles = Object.keys(profiles).length > 0;
+            const forceEnabled = enableGenerationProfilesCheckbox.checked;
+            
+            // Show section if: has profiles OR (debug mode AND legacy setting enabled)
+            const showSection = hasProfiles || (DEBUG_MODE && forceEnabled);
+            
+            if (generationProfilesSection) {
+                if (showSection) {
+                    generationProfilesSection.style.display = '';
+                } else {
+                    generationProfilesSection.style.display = 'none';
+                }
+            }
+            
+            // Show Import button only if debug mode AND legacy setting enabled
+            if (importProfilesBtn) {
+                if (DEBUG_MODE && forceEnabled) {
+                    importProfilesBtn.style.display = '';
+                } else {
+                    importProfilesBtn.style.display = 'none';
+                }
+            }
+        }
+        
+        // Initial visibility update
+        await updateGenerationProfilesVisibility();
         
         // Checkbox change handlers track state
         sidebarCheckbox.onchange = (e) => {
@@ -7194,21 +9186,30 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (fontPreviewText) {
                 fontPreviewText.style.fontSize = customStyleValues.fontSize || '16px';
                 fontPreviewText.style.fontFamily = customStyleValues.fontFamily || 'inherit';
-                fontPreviewText.style.fontWeight = customStyleValues.fontWeight || 'normal';
-                fontPreviewText.style.fontStyle = customStyleValues.fontStyle || 'normal';
-                fontPreviewText.style.textDecoration = customStyleValues.textDecoration || 'none';
+                fontPreviewText.style.fontWeight = customStyleValues.bodyFontWeight || 'normal';
+                fontPreviewText.style.fontStyle = customStyleValues.bodyFontStyle || 'normal';
+                fontPreviewText.style.textDecoration = customStyleValues.bodyTextDecoration || 'none';
                 fontPreviewText.style.color = customStyleValues.bodyColor || '#fff';
             }
             if (previewTextQuote) {
                 previewTextQuote.style.color = customStyleValues.spanQuoteColor || '#fff';
+                previewTextQuote.style.fontWeight = customStyleValues.spanQuoteFontWeight || 'normal';
+                previewTextQuote.style.fontStyle = customStyleValues.spanQuoteFontStyle || 'normal';
+                previewTextQuote.style.textDecoration = customStyleValues.spanQuoteTextDecoration || 'none';
             }
             if (previewTextNarration) {
                 previewTextNarration.style.color = customStyleValues.narrationColor || '#06B7DB';
                 previewTextNarration.style.fontFamily = customStyleValues.fontFamily || 'inherit';
+                previewTextNarration.style.fontWeight = customStyleValues.narrationFontWeight || 'normal';
+                previewTextNarration.style.fontStyle = customStyleValues.narrationFontStyle || 'italic';
+                previewTextNarration.style.textDecoration = customStyleValues.narrationTextDecoration || 'none';
             }
             if (previewTextHighlight) {
                 previewTextHighlight.style.backgroundColor = customStyleValues.highlightBgColor || '#ffdd6d';
                 previewTextHighlight.style.color = customStyleValues.highlightTextColor || '#000';
+                previewTextHighlight.style.fontWeight = customStyleValues.highlightFontWeight || 'normal';
+                previewTextHighlight.style.fontStyle = customStyleValues.highlightFontStyle || 'normal';
+                previewTextHighlight.style.textDecoration = customStyleValues.highlightTextDecoration || 'none';
             }
         };
         
@@ -7237,16 +9238,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (previewBodyColor) previewBodyColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
+        customBodyFontWeightSelect.onchange = (e) => { customStyleValues.bodyFontWeight = e.target.value; updateFontPreview(); };
+        customBodyFontStyleSelect.onchange = (e) => { customStyleValues.bodyFontStyle = e.target.value; updateFontPreview(); };
+        customBodyTextDecorationSelect.onchange = (e) => { customStyleValues.bodyTextDecoration = e.target.value; updateFontPreview(); };
         customSpanQuoteColorInput.oninput = (e) => { 
             customStyleValues.spanQuoteColor = e.target.value;
             if (previewQuoteColor) previewQuoteColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
+        customQuoteFontWeightSelect.onchange = (e) => { customStyleValues.spanQuoteFontWeight = e.target.value; updateFontPreview(); };
+        customQuoteFontStyleSelect.onchange = (e) => { customStyleValues.spanQuoteFontStyle = e.target.value; updateFontPreview(); };
+        customQuoteTextDecorationSelect.onchange = (e) => { customStyleValues.spanQuoteTextDecoration = e.target.value; updateFontPreview(); };
         customNarrationColorInput.oninput = (e) => { 
             customStyleValues.narrationColor = e.target.value;
             if (previewNarrationColor) previewNarrationColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
+        customNarrationFontWeightSelect.onchange = (e) => { customStyleValues.narrationFontWeight = e.target.value; updateFontPreview(); };
+        customNarrationFontStyleSelect.onchange = (e) => { customStyleValues.narrationFontStyle = e.target.value; updateFontPreview(); };
+        customNarrationTextDecorationSelect.onchange = (e) => { customStyleValues.narrationTextDecoration = e.target.value; updateFontPreview(); };
         customHighlightBgColorInput.oninput = (e) => { 
             customStyleValues.highlightBgColor = e.target.value;
             if (previewHighlightBg) previewHighlightBg.style.background = e.target.value || 'transparent';
@@ -7257,14 +9267,51 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (previewHighlightText) previewHighlightText.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
+        customHighlightFontWeightSelect.onchange = (e) => { customStyleValues.highlightFontWeight = e.target.value; updateFontPreview(); };
+        customHighlightFontStyleSelect.onchange = (e) => { customStyleValues.highlightFontStyle = e.target.value; updateFontPreview(); };
+        customHighlightTextDecorationSelect.onchange = (e) => { customStyleValues.highlightTextDecoration = e.target.value; updateFontPreview(); };
         customFontSizeInput.oninput = (e) => { customStyleValues.fontSize = e.target.value; updateFontPreview(); };
         customFontFamilyInput.oninput = (e) => { customStyleValues.fontFamily = e.target.value; updateFontPreview(); };
-        customFontWeightSelect.onchange = (e) => { customStyleValues.fontWeight = e.target.value; updateFontPreview(); };
-        customFontStyleSelect.onchange = (e) => { customStyleValues.fontStyle = e.target.value; updateFontPreview(); };
-        customTextDecorationSelect.onchange = (e) => { customStyleValues.textDecoration = e.target.value; updateFontPreview(); };
         customHoverButtonColorInput.oninput = (e) => { 
             customStyleValues.hoverButtonColor = e.target.value;
             if (previewHoverButton) previewHoverButton.style.background = e.target.value || 'transparent';
+        };
+        
+        // Background image upload handler
+        customBackgroundImageInput.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            // Validate file is an image
+            if (!file.type.startsWith('image/')) {
+                alert('Please select an image file');
+                customBackgroundImageInput.value = '';
+                return;
+            }
+            
+            // Convert to data URL for storage
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                customStyleValues.backgroundImage = event.target.result;
+                debugLog('[Toolkit] Background image loaded:', customStyleValues.backgroundImage.substring(0, 50) + '...');
+            };
+            reader.onerror = () => {
+                alert('Error reading image file');
+                customBackgroundImageInput.value = '';
+            };
+            reader.readAsDataURL(file);
+        };
+        
+        // Clear background image button
+        clearBackgroundImageBtn.onclick = (e) => {
+            e.stopPropagation();
+            customStyleValues.backgroundImage = '';
+            customBackgroundImageInput.value = '';
+            debugLog('[Toolkit] Background image cleared');
+        };
+        
+        messageContainerMaxWidthInput.oninput = (e) => { 
+            messageContainerMaxWidth = e.target.value;
         };
         
         hideForYouCheckbox.onchange = (e) => {
@@ -7306,8 +9353,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Toggle timestamp format sub-checkbox visibility
             if (showTimestampEnabled) {
                 timestampFormatRow.classList.remove('hidden');
+                timestampHourFormatRow.classList.remove('hidden');
             } else {
                 timestampFormatRow.classList.add('hidden');
+                timestampHourFormatRow.classList.add('hidden');
             }
         };
         
@@ -7317,6 +9366,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Toolkit] Timestamp Format:', timestampDateFirst ? 'date@time' : 'time@date');
         };
         
+        timestampHourFormatCheckbox.onchange = (e) => {
+            debugLog('[Toolkit] TIMESTAMP HOUR FORMAT CHECKBOX CHANGED');
+            timestamp24Hour = e.target.checked;
+            debugLog('[Toolkit] Timestamp Hour Format:', timestamp24Hour ? '24-hour' : '12-hour');
+        };
+
+        showMessageIdsCheckbox.onchange = (e) => {
+            debugLog('[Toolkit] SHOW MESSAGE IDS CHECKBOX CHANGED');
+            showMessageIdsEnabled = e.target.checked;
+            debugLog('[Toolkit] Show Message IDs:', showMessageIdsEnabled);
+        };
+
         showChatNameInTitleCheckbox.onchange = (e) => {
             debugLog('[Toolkit] SHOW CHAT NAME IN TITLE CHECKBOX CHANGED');
             showChatNameInTitleEnabled = e.target.checked;
@@ -7327,6 +9388,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Toolkit] NSFW TOGGLE CHECKBOX CHANGED');
             nsfwToggleEnabled = e.target.checked;
             debugLog('[Toolkit] NSFW Toggle:', nsfwToggleEnabled);
+        };
+        
+        wysiwygCheckbox.onchange = (e) => {
+            debugLog('[Toolkit] WYSIWYG CHECKBOX CHANGED');
+            wysiwygEnabled = e.target.checked;
+            debugLog('[Toolkit] WYSIWYG Enabled:', wysiwygEnabled);
         };
         
         // Close modal function
@@ -7479,7 +9546,31 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 ? minWidthInputValue 
                 : DEFAULT_SIDEBAR_MIN_WIDTH;
             
-            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled);
+            // Read current checkbox states
+            sidebarEnabled = sidebarCheckbox.checked;
+            compactGenerationEnabled = compactGenerationCheckbox.checked;
+            classicLayoutEnabled = classicLayoutCheckbox.checked;
+            classicStyleEnabled = classicStyleCheckbox.checked;
+            customStyleEnabled = customStyleCheckbox.checked;
+            hideForYouEnabled = hideForYouCheckbox.checked;
+            pageJumpEnabled = pageJumpCheckbox.checked;
+            showStatsEnabled = showStatsCheckbox.checked;
+            showModelDetailsEnabled = modelDetailsCheckbox.checked;
+            showTimestampEnabled = showTimestampCheckbox.checked;
+            timestampDateFirst = timestampFormatCheckbox.checked;
+            timestamp24Hour = timestampHourFormatCheckbox.checked;
+            showMessageIdsEnabled = showMessageIdsCheckbox.checked;
+            showChatNameInTitleEnabled = showChatNameInTitleCheckbox.checked;
+            nsfwToggleEnabled = nsfwToggleCheckbox.checked;
+            smallProfileImagesEnabled = smallProfileImagesCheckbox.checked;
+            roundedProfileImagesEnabled = roundedProfileImagesCheckbox.checked;
+            swapCheckboxPositionEnabled = swapCheckboxPositionCheckbox.checked;
+            squareMessageEdgesEnabled = squareMessageEdgesCheckbox.checked;
+            wysiwygEnabled = wysiwygCheckbox.checked;
+            enableGenerationProfilesEnabled = enableGenerationProfilesCheckbox.checked;
+            messageContainerMaxWidth = messageContainerMaxWidthInput.value.trim();
+            
+            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth);
             await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
             await storage.set(SIDEBAR_MIN_WIDTH_KEY, finalMinWidth);
             await storage.set(COMPACT_GENERATION_KEY, compactGenerationEnabled);
@@ -7493,12 +9584,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set('showModelDetails', showModelDetailsEnabled);
             await storage.set('showTimestamp', showTimestampEnabled);
             await storage.set('timestampDateFirst', timestampDateFirst);
+            await storage.set('timestamp24Hour', timestamp24Hour);
+            await storage.set(SHOW_MESSAGE_IDS_KEY, showMessageIdsEnabled);
             await storage.set('showChatNameInTitle', showChatNameInTitleEnabled);
             await storage.set('nsfwToggleEnabled', nsfwToggleEnabled);
             await storage.set(SMALL_PROFILE_IMAGES_KEY, smallProfileImagesEnabled);
             await storage.set(ROUNDED_PROFILE_IMAGES_KEY, roundedProfileImagesEnabled);
             await storage.set(SWAP_CHECKBOX_POSITION_KEY, swapCheckboxPositionEnabled);
             await storage.set(SQUARE_MESSAGE_EDGES_KEY, squareMessageEdgesEnabled);
+            await storage.set(WYSIWYG_EDITOR_KEY, wysiwygEnabled);
+            await storage.set(ENABLE_GENERATION_PROFILES_KEY, enableGenerationProfilesEnabled);
+            await storage.set(MESSAGE_CONTAINER_MAX_WIDTH_KEY, messageContainerMaxWidth);
             // Mark onboarding as seen when user saves settings
             await storage.set('hasSeenOnboarding', true);
             debugLog('[Toolkit] Settings saved to storage');
@@ -7531,7 +9627,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             };
         }
         
-        // Import Profiles button
+        // Import Profiles button (only visible in debug mode with legacy setting)
         if (importProfilesBtn) {
             importProfilesBtn.onclick = async (e) => {
                 e.stopPropagation();
@@ -7549,6 +9645,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                 Object.assign(profiles, imported);
                                 await saveProfiles(profiles);
                                 showNotification('Profiles imported successfully');
+                                await updateGenerationProfilesVisibility();
                             } catch (err) {
                                 alert('Error importing profiles: ' + err.message);
                             }
@@ -7557,6 +9654,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     }
                 });
                 input.click();
+            };
+        }
+        
+        // Delete Profiles button
+        if (deleteProfilesBtn) {
+            deleteProfilesBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const profiles = await loadProfiles();
+                const profileCount = Object.keys(profiles).length;
+                
+                if (profileCount === 0) {
+                    showNotification('No profiles to delete');
+                    return;
+                }
+                
+                const confirmed = confirm(`Are you sure you want to delete all ${profileCount} generation profile(s)? This cannot be undone.`);
+                
+                if (confirmed) {
+                    try {
+                        await saveProfiles({});
+                        showNotification('All profiles deleted');
+                        await updateGenerationProfilesVisibility();
+                    } catch (error) {
+                        console.error('[Toolkit] Error deleting profiles:', error);
+                        alert('Error deleting profiles: ' + error.message);
+                    }
+                }
             };
         }
         
@@ -7625,7 +9749,57 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 input.click();
             };
         }
-        
+
+        // Reset Custom Style to Defaults button
+        if (resetCustomStyleBtn) {
+            resetCustomStyleBtn.onclick = async (e) => {
+                e.stopPropagation();
+
+                // Reset all values to defaults
+                Object.assign(customStyleValues, DEFAULT_CUSTOM_STYLE);
+
+                // Update all UI inputs with default values
+                customAiBgInput.value = DEFAULT_CUSTOM_STYLE.aiMessageBg;
+                customUserBgInput.value = DEFAULT_CUSTOM_STYLE.userMessageBg;
+                customBodyColorInput.value = DEFAULT_CUSTOM_STYLE.bodyColor;
+                customBodyFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontWeight;
+                customBodyFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontStyle;
+                customBodyTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.bodyTextDecoration;
+                customSpanQuoteColorInput.value = DEFAULT_CUSTOM_STYLE.spanQuoteColor;
+                customQuoteFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontWeight;
+                customQuoteFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontStyle;
+                customQuoteTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteTextDecoration;
+                customNarrationColorInput.value = DEFAULT_CUSTOM_STYLE.narrationColor;
+                customNarrationFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontWeight;
+                customNarrationFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontStyle;
+                customNarrationTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.narrationTextDecoration;
+                customHighlightBgColorInput.value = DEFAULT_CUSTOM_STYLE.highlightBgColor;
+                customHighlightTextColorInput.value = DEFAULT_CUSTOM_STYLE.highlightTextColor;
+                customHighlightFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontWeight;
+                customHighlightFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontStyle;
+                customHighlightTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.highlightTextDecoration;
+                customFontSizeInput.value = DEFAULT_CUSTOM_STYLE.fontSize;
+                customFontFamilyInput.value = DEFAULT_CUSTOM_STYLE.fontFamily;
+                customHoverButtonColorInput.value = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
+                customBackgroundImageInput.value = '';
+
+                // Update preview elements
+                if (previewAiBg) previewAiBg.style.background = DEFAULT_CUSTOM_STYLE.aiMessageBg;
+                if (previewUserBg) previewUserBg.style.background = DEFAULT_CUSTOM_STYLE.userMessageBg;
+                if (previewBodyColor) previewBodyColor.style.background = DEFAULT_CUSTOM_STYLE.bodyColor;
+                if (previewQuoteColor) previewQuoteColor.style.background = DEFAULT_CUSTOM_STYLE.spanQuoteColor;
+                if (previewNarrationColor) previewNarrationColor.style.background = DEFAULT_CUSTOM_STYLE.narrationColor;
+                if (previewHighlightBg) previewHighlightBg.style.background = DEFAULT_CUSTOM_STYLE.highlightBgColor;
+                if (previewHighlightText) previewHighlightText.style.background = DEFAULT_CUSTOM_STYLE.highlightTextColor;
+                if (previewHoverButton) previewHoverButton.style.background = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
+
+                // Update font preview
+                updateFontPreview();
+
+                showNotification('Custom Style reset to defaults - click Save to apply');
+            };
+        }
+
         // Export All Data button
         debugLog('[Toolkit] Attaching exportAllBtn onclick handler...');
         debugLog('[Toolkit] exportAllBtn element:', exportAllBtn);
@@ -7683,9 +9857,57 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 const timestampDateFirst = await storage.get('timestampDateFirst', true);
                 debugLog('[Toolkit] timestampDateFirst result:', timestampDateFirst, 'Type:', typeof timestampDateFirst);
                 
+                debugLog('[Toolkit] Fetching timestamp24Hour...');
+                const timestamp24Hour = await storage.get('timestamp24Hour', false);
+                debugLog('[Toolkit] timestamp24Hour result:', timestamp24Hour, 'Type:', typeof timestamp24Hour);
+                
                 debugLog('[Toolkit] Fetching nsfwToggleEnabled...');
                 const nsfwToggleEnabled = await storage.get('nsfwToggleEnabled', false);
                 debugLog('[Toolkit] nsfwToggleEnabled result:', nsfwToggleEnabled, 'Type:', typeof nsfwToggleEnabled);
+                
+                debugLog('[Toolkit] Fetching enableWysiwygEditor...');
+                const enableWysiwygEditor = await storage.get(WYSIWYG_EDITOR_KEY, false);
+                debugLog('[Toolkit] enableWysiwygEditor result:', enableWysiwygEditor, 'Type:', typeof enableWysiwygEditor);
+                
+                debugLog('[Toolkit] Fetching enableGenerationProfiles...');
+                const enableGenerationProfiles = await storage.get(ENABLE_GENERATION_PROFILES_KEY, false);
+                debugLog('[Toolkit] enableGenerationProfiles result:', enableGenerationProfiles, 'Type:', typeof enableGenerationProfiles);
+                
+                debugLog('[Toolkit] Fetching showModelDetails...');
+                const showModelDetails = await storage.get('showModelDetails', true);
+                debugLog('[Toolkit] showModelDetails result:', showModelDetails, 'Type:', typeof showModelDetails);
+                
+                debugLog('[Toolkit] Fetching showTimestamp...');
+                const showTimestamp = await storage.get('showTimestamp', false);
+                debugLog('[Toolkit] showTimestamp result:', showTimestamp, 'Type:', typeof showTimestamp);
+
+                debugLog('[Toolkit] Fetching showMessageIds...');
+                const showMessageIds = await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+                debugLog('[Toolkit] showMessageIds result:', showMessageIds, 'Type:', typeof showMessageIds);
+
+                debugLog('[Toolkit] Fetching showChatNameInTitle...');
+                const showChatNameInTitle = await storage.get('showChatNameInTitle', false);
+                debugLog('[Toolkit] showChatNameInTitle result:', showChatNameInTitle, 'Type:', typeof showChatNameInTitle);
+                
+                debugLog('[Toolkit] Fetching enableSmallProfileImages...');
+                const enableSmallProfileImages = await storage.get(SMALL_PROFILE_IMAGES_KEY, false);
+                debugLog('[Toolkit] enableSmallProfileImages result:', enableSmallProfileImages, 'Type:', typeof enableSmallProfileImages);
+                
+                debugLog('[Toolkit] Fetching enableRoundedProfileImages...');
+                const enableRoundedProfileImages = await storage.get(ROUNDED_PROFILE_IMAGES_KEY, false);
+                debugLog('[Toolkit] enableRoundedProfileImages result:', enableRoundedProfileImages, 'Type:', typeof enableRoundedProfileImages);
+                
+                debugLog('[Toolkit] Fetching swapCheckboxPosition...');
+                const swapCheckboxPosition = await storage.get(SWAP_CHECKBOX_POSITION_KEY, false);
+                debugLog('[Toolkit] swapCheckboxPosition result:', swapCheckboxPosition, 'Type:', typeof swapCheckboxPosition);
+                
+                debugLog('[Toolkit] Fetching squareMessageEdges...');
+                const squareMessageEdges = await storage.get(SQUARE_MESSAGE_EDGES_KEY, false);
+                debugLog('[Toolkit] squareMessageEdges result:', squareMessageEdges, 'Type:', typeof squareMessageEdges);
+                
+                debugLog('[Toolkit] Fetching sidebarMinWidth...');
+                const sidebarMinWidth = await storage.get(SIDEBAR_MIN_WIDTH_KEY, DEFAULT_SIDEBAR_MIN_WIDTH);
+                debugLog('[Toolkit] sidebarMinWidth result:', sidebarMinWidth, 'Type:', typeof sidebarMinWidth);
                 
                 debugLog('[Toolkit] Fetching generationProfiles...');
                 const generationProfiles = await storage.get('generationProfiles', '{}');
@@ -7712,6 +9934,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 // Build the export object
                 const allData = {
                     enableSidebarLayout,
+                    sidebarMinWidth,
                     enableClassicLayout,
                     enableClassicStyle,
                     enableCustomStyle,
@@ -7720,8 +9943,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     enableHideForYou,
                     enablePageJump,
                     showGenerationStats,
+                    showModelDetails,
+                    showTimestamp,
                     timestampDateFirst,
+                    timestamp24Hour,
+                    showMessageIds,
+                    showChatNameInTitle,
                     nsfwToggleEnabled,
+                    enableWysiwygEditor,
+                    enableGenerationProfiles,
+                    enableSmallProfileImages,
+                    enableRoundedProfileImages,
+                    swapCheckboxPosition,
+                    squareMessageEdges,
                     generationProfiles: generationProfilesParsed,  // Use parsed object
                     lastSelectedProfile,
                     messageGenerationStats: messageGenerationStatsParsed  // Use parsed object
@@ -7821,6 +10055,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         // Build updates object conditionally
                         const updates = {};
                         if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
+                        if (imported.sidebarMinWidth !== undefined) updates.sidebarMinWidth = imported.sidebarMinWidth;
                         if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
                         if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
                         if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
@@ -7834,8 +10069,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
                         if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
                         if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
+                        if (imported.showModelDetails !== undefined) updates.showModelDetails = imported.showModelDetails;
+                        if (imported.showTimestamp !== undefined) updates.showTimestamp = imported.showTimestamp;
                         if (imported.timestampDateFirst !== undefined) updates.timestampDateFirst = imported.timestampDateFirst;
+                        if (imported.timestamp24Hour !== undefined) updates.timestamp24Hour = imported.timestamp24Hour;
+                        if (imported.showMessageIds !== undefined) updates.showMessageIds = imported.showMessageIds;
+                        if (imported.showChatNameInTitle !== undefined) updates.showChatNameInTitle = imported.showChatNameInTitle;
                         if (imported.nsfwToggleEnabled !== undefined) updates.nsfwToggleEnabled = imported.nsfwToggleEnabled;
+                        if (imported.enableWysiwygEditor !== undefined) updates.enableWysiwygEditor = imported.enableWysiwygEditor;
+                        if (imported.enableGenerationProfiles !== undefined) updates.enableGenerationProfiles = imported.enableGenerationProfiles;
+                        if (imported.enableSmallProfileImages !== undefined) updates.enableSmallProfileImages = imported.enableSmallProfileImages;
+                        if (imported.enableRoundedProfileImages !== undefined) updates.enableRoundedProfileImages = imported.enableRoundedProfileImages;
+                        if (imported.swapCheckboxPosition !== undefined) updates.swapCheckboxPosition = imported.swapCheckboxPosition;
+                        if (imported.squareMessageEdges !== undefined) updates.squareMessageEdges = imported.squareMessageEdges;
                         if (generationProfilesValue !== undefined) updates.generationProfiles = generationProfilesValue;
                         if (imported.lastSelectedProfile !== undefined) updates.lastSelectedProfile = imported.lastSelectedProfile;
                         if (messageGenerationStatsValue !== undefined) updates.messageGenerationStats = messageGenerationStatsValue;
@@ -7876,7 +10122,328 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         debugLog('[Toolkit] ===== MODAL SETUP COMPLETE =====');
     }
-    
+
+    // =============================================================================
+    // ===                    UPDATE NOTIFICATION MODAL                         ===
+    // =============================================================================
+    // Show update notification modal with changelog after extension update
+    function showUpdateNotificationModal(version) {
+        debugLog('[Toolkit] Showing update notification for version:', version);
+
+        // Get changelog data from global CHANGELOG object (defined at top of file)
+        const changelogData = CHANGELOG[version] || {
+            title: `Version ${version}`,
+            date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+            features: ['Bug fixes and improvements']
+        };
+
+        // Create container with shadow DOM
+        let updateModalRoot = document.getElementById('update-notification-root');
+        if (updateModalRoot) {
+            updateModalRoot.remove(); // Remove if already exists
+        }
+
+        updateModalRoot = document.createElement('div');
+        updateModalRoot.id = 'update-notification-root';
+        updateModalRoot.style.cssText = 'position: fixed; inset: 0; pointer-events: none; z-index: 10000005;';
+        document.body.appendChild(updateModalRoot);
+
+        const shadow = updateModalRoot.attachShadow({ mode: 'open' });
+
+        // Styles
+        const style = document.createElement('style');
+        style.textContent = `
+            * { box-sizing: border-box; }
+
+            .backdrop {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.4);
+                backdrop-filter: blur(4px);
+                z-index: 10000005;
+                pointer-events: auto;
+                animation: fadeIn 0.2s ease-out;
+            }
+
+            @keyframes fadeIn {
+                from { opacity: 0; }
+                to { opacity: 1; }
+            }
+
+            @keyframes slideIn {
+                from {
+                    opacity: 0;
+                    transform: translate(-50%, -45%);
+                }
+                to {
+                    opacity: 1;
+                    transform: translate(-50%, -50%);
+                }
+            }
+
+            .modal {
+                position: fixed;
+                left: 50%;
+                top: 50%;
+                transform: translate(-50%, -50%);
+                background: white;
+                border-radius: 16px;
+                width: 480px;
+                max-width: 95vw;
+                max-height: 85vh;
+                z-index: 10000006;
+                pointer-events: auto;
+                display: flex;
+                flex-direction: column;
+                padding: 0;
+                box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+                animation: slideIn 0.3s ease-out;
+            }
+
+            @media (max-width: 480px) {
+                .modal {
+                    width: 100%;
+                    max-width: 100vw;
+                    max-height: 100vh;
+                    border-radius: 0;
+                }
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .modal {
+                    background: #1a1a1a;
+                    color: white;
+                }
+            }
+
+            .modal-header {
+                padding: 1.5rem 1.5rem 1rem 1.5rem;
+                border-bottom: 1px solid #e5e7eb;
+                text-align: center;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .modal-header {
+                    border-color: #404040;
+                }
+            }
+
+            .update-icon {
+                width: 48px;
+                height: 48px;
+                margin: 0 auto 0.75rem auto;
+                background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 24px;
+            }
+
+            .modal-title {
+                font-size: 1.25rem;
+                font-weight: 700;
+                margin-bottom: 0.25rem;
+                color: #111827;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .modal-title {
+                    color: #f9fafb;
+                }
+            }
+
+            .modal-date {
+                font-size: 0.875rem;
+                color: #6b7280;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .modal-date {
+                    color: #9ca3af;
+                }
+            }
+
+            .modal-body {
+                padding: 1.5rem;
+                overflow-y: auto;
+                flex: 1;
+            }
+
+            .changelog-title {
+                font-size: 0.875rem;
+                font-weight: 600;
+                color: #6b7280;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                margin-bottom: 0.75rem;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .changelog-title {
+                    color: #9ca3af;
+                }
+            }
+
+            .changelog-list {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+
+            .changelog-item {
+                padding-left: 1.5rem;
+                position: relative;
+                font-size: 0.9375rem;
+                line-height: 1.6;
+                color: #374151;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .changelog-item {
+                    color: #d1d5db;
+                }
+            }
+
+            .changelog-item::before {
+                content: "✓";
+                position: absolute;
+                left: 0;
+                color: #10b981;
+                font-weight: bold;
+            }
+
+            .modal-footer {
+                padding: 1rem 1.5rem;
+                border-top: 1px solid #e5e7eb;
+                display: flex;
+                justify-content: center;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .modal-footer {
+                    border-color: #404040;
+                }
+            }
+
+            .btn-close {
+                background: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0.625rem 2rem;
+                font-size: 0.9375rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+
+            .btn-close:hover {
+                background: #2563eb;
+                transform: translateY(-1px);
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            }
+
+            .btn-close:active {
+                transform: translateY(0);
+            }
+        `;
+
+        // Create backdrop
+        const backdrop = document.createElement('div');
+        backdrop.className = 'backdrop';
+
+        // Create modal
+        const modal = document.createElement('div');
+        modal.className = 'modal';
+        
+        // Create modal header
+        const modalHeader = document.createElement('div');
+        modalHeader.className = 'modal-header';
+        
+        const updateIcon = document.createElement('div');
+        updateIcon.className = 'update-icon';
+        updateIcon.textContent = '🎉';
+        
+        const modalTitle = document.createElement('div');
+        modalTitle.className = 'modal-title';
+        modalTitle.textContent = changelogData.title;
+        
+        const modalDate = document.createElement('div');
+        modalDate.className = 'modal-date';
+        modalDate.textContent = changelogData.date;
+        
+        modalHeader.appendChild(updateIcon);
+        modalHeader.appendChild(modalTitle);
+        modalHeader.appendChild(modalDate);
+        
+        // Create modal body
+        const modalBody = document.createElement('div');
+        modalBody.className = 'modal-body';
+        
+        const changelogTitle = document.createElement('div');
+        changelogTitle.className = 'changelog-title';
+        changelogTitle.textContent = "What's New";
+        
+        const changelogList = document.createElement('ul');
+        changelogList.className = 'changelog-list';
+        
+        changelogData.features.forEach(feature => {
+            const li = document.createElement('li');
+            li.className = 'changelog-item';
+            li.textContent = feature;
+            changelogList.appendChild(li);
+        });
+        
+        modalBody.appendChild(changelogTitle);
+        modalBody.appendChild(changelogList);
+        
+        // Create modal footer
+        const modalFooter = document.createElement('div');
+        modalFooter.className = 'modal-footer';
+        
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn-close';
+        closeBtn.id = 'close-btn';
+        closeBtn.textContent = 'Got it!';
+        
+        modalFooter.appendChild(closeBtn);
+        
+        // Assemble modal
+        modal.appendChild(modalHeader);
+        modal.appendChild(modalBody);
+        modal.appendChild(modalFooter);
+
+        shadow.appendChild(style);
+        shadow.appendChild(backdrop);
+        shadow.appendChild(modal);
+
+        // Close handler
+        async function closeModal() {
+            // Mark this version as seen
+            await storage.set('lastSeenVersion', version);
+            debugLog('[Toolkit] Update notification dismissed, marked version as seen:', version);
+
+            // Animate out
+            backdrop.style.animation = 'fadeIn 0.2s ease-out reverse';
+            modal.style.animation = 'slideIn 0.2s ease-out reverse';
+
+            setTimeout(() => {
+                updateModalRoot.remove();
+            }, 200);
+        }
+
+        closeBtn.addEventListener('click', closeModal);
+        backdrop.addEventListener('click', closeModal);
+
+        // Prevent modal click from closing
+        modal.addEventListener('click', (e) => e.stopPropagation());
+    }
+
     // Global error monitoring to track React crashes
     window.addEventListener('error', async (event) => {
         debugLog('[Toolkit] ===== GLOBAL ERROR DETECTED =====');
@@ -7992,6 +10559,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Toolkit] Not first run - skipping onboarding modal');
     }
 
+    // Track button check interval to prevent multiple intervals (memory leak fix)
+    let buttonCheckInterval = null;
+
     // Observe for modal appearance
     const observer = new MutationObserver(function(mutations) {
         // Look specifically for the Generation Settings modal (supports both old and new UI)
@@ -8064,7 +10634,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         
         // Instead of heavy MutationObservers, use lightweight periodic checks
         // Check every 2 seconds if buttons still exist and text element is present
-        setInterval(() => {
+        // Only create interval once to prevent memory leak from multiple intervals
+        if (!buttonCheckInterval) {
+            buttonCheckInterval = setInterval(() => {
             const sidebarButton = document.getElementById('sai-toolkit-sidebar-btn');
             if (sidebarButton) {
                 // Check if text element exists, if not re-add it
@@ -8093,20 +10665,21 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 }
             }
             
-            // Check export button (only on chat pages)
-            if (window.location.pathname.startsWith('/chat/')) {
+            // Check export button (only on chat pages - case-insensitive)
+            if (window.location.pathname.toLowerCase().startsWith('/chat/')) {
                 const exportButton = document.getElementById('sai-export-btn');
                 if (!exportButton) {
                     injectChatExportButton();
                 }
-                
+
                 // Check NSFW toggle button
                 const nsfwButton = document.getElementById('sai-nsfw-btn');
                 if (!nsfwButton) {
                     injectNSFWToggleButton();
                 }
             }
-        }, TIMING.PERIODIC_CHECK); // Check periodically instead of on every DOM mutation
+            }, TIMING.PERIODIC_CHECK); // Check periodically instead of on every DOM mutation
+        }
     });
 
     // Wait for body before starting observer (fixes middle-click new tab issue)
@@ -8185,29 +10758,57 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     // Special function to insert stats for a regenerated message
     // This is needed because regenerations REPLACE the message content, not add a new element
     // So processMessagesForStats can't find them by DOM index
-    // Track which message IDs have already had stats inserted to prevent duplicates
-    // Note: We clear this set when navigating conversations to allow re-insertion
-    const statsInsertedForMessageIds = new Set();      // Successfully inserted
-    const statsInsertionInProgress = new Set();        // Currently being processed (prevents parallel runs)
+    // Note: statsInsertedForMessageIds and statsInsertionInProgress are defined earlier in the file
+    const statsFailedForWrappers = new WeakSet();      // Wrappers that failed ID extraction (prevents retries)
     let lastConversationIdForStatsSet = null;
+
+    // Memory optimization: Maximum tracked message IDs to prevent unbounded growth
+    const MAX_STATS_TRACKING = 200;
+
+    // Helper to limit Set size - removes oldest entries when over limit
+    function limitSetSize(set, maxSize) {
+        if (set.size > maxSize) {
+            // Only remove enough to get back to maxSize (Sets maintain insertion order)
+            const excess = set.size - maxSize;
+            const iterator = set.values();
+            for (let i = 0; i < excess; i++) {
+                set.delete(iterator.next().value);
+            }
+        }
+    }
     
     // Sequential retry wrapper - prevents race conditions from browser timer throttling
     // When a tab is in background, multiple setTimeout calls can fire at once on restore
     async function insertStatsWithRetry(messageId, model, settings, createdAt, attempt = 1) {
         const maxAttempts = 4;
-        const delays = [500, 1000, 1500, 2000]; // Delay before each attempt
-        
+        // First attempt is immediate (0ms delay), then use increasing delays for retries
+        // This ensures we try to insert stats BEFORE processMessagesForStats runs (150ms debounce)
+        const delays = [0, 500, 1000, 1500]; // Delay before each attempt
+
         if (attempt > maxAttempts) {
             debugLog('[Stats RETRY] Max attempts reached for message:', messageId?.substring(0, 8));
+            // Decrement pending count since we're done trying (failed)
+            if (pendingNewMessageCount > 0) {
+                pendingNewMessageCount--;
+                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+            }
             return;
         }
-        
-        // Wait before attempting
-        await new Promise(resolve => setTimeout(resolve, delays[attempt - 1] || 500));
+
+        // Wait before attempting (first attempt is immediate with 0ms delay)
+        const delay = delays[attempt - 1] || 500;
+        if (delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
         
         // Check if already successfully inserted (by this or another call)
         if (statsInsertedForMessageIds.has(messageId)) {
             debugLog('[Stats RETRY] Already inserted, stopping retries for:', messageId?.substring(0, 8));
+            // Decrement pending count since insertion is complete
+            if (pendingNewMessageCount > 0) {
+                pendingNewMessageCount--;
+                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+            }
             return;
         }
         
@@ -8228,7 +10829,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         if (currentConversationId && currentConversationId !== lastConversationIdForStatsSet) {
             debugLog('[Stats REGEN] Conversation changed, clearing insertion tracking sets');
             statsInsertedForMessageIds.clear();
-            statsInsertionInProgress.clear();;
+            statsInsertionInProgress.clear();
+            pendingNewMessageCount = 0; // Reset pending count on conversation change
             lastConversationIdForStatsSet = currentConversationId;
         }
         
@@ -8251,9 +10853,10 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
         const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
         const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-        
-        if (!statsEnabled && !timestampEnabled) {
-            debugLog('[Stats REGEN] Neither stats nor timestamp enabled, skipping');
+        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+
+        if (!statsEnabled && !timestampEnabled && !showMessageIds) {
+            debugLog('[Stats REGEN] Neither stats, timestamp, nor message IDs enabled, skipping');
             // Remove from in-progress so future attempts can try again if settings change
             statsInsertionInProgress.delete(messageId);
             return true; // Not an error, just nothing to do
@@ -8333,9 +10936,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
         
         debugLog('[Stats REGEN] Found target bubble for message');
-        
-        // Find the header container
-        const headerContainer = targetBubble.querySelector('div.flex.justify-between.items-center.gap-md');
+
+        // Mark the message wrapper with the message ID so extractMessageId can find it
+        const messageWrapper = targetBubble.closest('div.w-full.flex.mb-lg');
+        if (messageWrapper) {
+            messageWrapper.dataset.messageId = messageId;
+            debugLog('[Stats REGEN] Marked message wrapper with data-message-id');
+        }
+
+        // Find the header container (supports both gap-md and gap-0)
+        const headerContainer = targetBubble.querySelector('div.flex.justify-between.items-center.gap-md, div.flex.justify-between.items-center.gap-0, div.flex.justify-between.items-center');
         if (!headerContainer) {
             debugLog('[Stats REGEN] Could not find header container');
             // Remove from in-progress so later retry attempts can try again
@@ -8377,7 +10987,11 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 displayLines.push(timestamp);
             }
         }
-        
+
+        if (showMessageIds && messageId) {
+            displayLines.push(`ID: ${messageId}`);
+        }
+
         if (displayLines.length === 0) {
             debugLog('[Stats REGEN] No displayable data');
             // Remove from in-progress, allow retries (data might not be in storage yet)
@@ -8391,15 +11005,34 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             // Create new stats div
             statsDiv = document.createElement('div');
             statsDiv.className = 'generation-stats';
-            statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
             
-            // Insert before the menu button container
-            const menuButtonContainer = headerContainer.querySelector('.relative');
-            if (menuButtonContainer) {
-                headerContainer.insertBefore(statsDiv, menuButtonContainer);
-                headerContainer.style.setProperty('gap', '4px', 'important');
+            // Check if we're in story mode for different positioning
+            const inStoryMode = isStoryMode();
+            
+            if (inStoryMode) {
+                // In story mode: position above the message, inside the container
+                statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                // Find the inner flex-col container and insert inside it
+                const innerContainer = headerContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                if (innerContainer) {
+                    // Insert stats as first child inside the container
+                    innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                } else {
+                    // Fallback: insert at the top of header
+                    headerContainer.insertBefore(statsDiv, headerContainer.firstChild);
+                }
             } else {
-                headerContainer.appendChild(statsDiv);
+                // Normal mode: position to the right in the header
+                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                
+                // Insert before the menu button container
+                const menuButtonContainer = headerContainer.querySelector('.relative');
+                if (menuButtonContainer) {
+                    headerContainer.insertBefore(statsDiv, menuButtonContainer);
+                    headerContainer.style.setProperty('gap', '4px', 'important');
+                } else {
+                    headerContainer.appendChild(statsDiv);
+                }
             }
         }
         
@@ -8409,9 +11042,15 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         
         // Mark as successfully inserted (prevents future retries)
         statsInsertedForMessageIds.add(messageId);
+        limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
         // Remove from in-progress
         statsInsertionInProgress.delete(messageId);
-        
+        // Decrement pending count since insertion is complete
+        if (pendingNewMessageCount > 0) {
+            pendingNewMessageCount--;
+            debugLog('[Stats REGEN] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+        }
+
         debugLog('[Stats REGEN] Successfully inserted/updated stats for regenerated message');
         return true;
     }
@@ -8430,35 +11069,58 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
         const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
         const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-        
+        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
 
-        debugLog('[Stats DISPLAY] Stats enabled:', statsEnabled, 'Timestamp enabled:', timestampEnabled, 'Model details:', showModelDetails);
+        debugLog('[Stats DISPLAY] Stats enabled:', statsEnabled, 'Timestamp enabled:', timestampEnabled, 'Model details:', showModelDetails, 'Message IDs:', showMessageIds);
 
-        
-        // If neither is enabled, no need to process
-        if (!statsEnabled && !timestampEnabled) return;
+
+        // If none are enabled, no need to process
+        if (!statsEnabled && !timestampEnabled && !showMessageIds) return;
         
         const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
 
         debugLog('[Stats] Found message wrappers:', messageWrappers.length);
-        
+
         // Calculate total messages in the combined index map
         const totalMessages = Object.keys(messageIdToIndexMap).length;
         debugLog('[Stats] Total messages in combined index map:', totalMessages);
-        
+
         // Calculate offset: if page shows fewer messages than stored, offset to the end
         const messagesOnPage = messageWrappers.length;
         const storageOffset = Math.max(0, totalMessages - messagesOnPage);
         debugLog('[Stats] Messages on page:', messagesOnPage, 'Storage offset:', storageOffset);
-        
-        let messageIndex = 0; // Combined index for all messages
-        
-        for (const wrapper of messageWrappers) {
+
+        // Process messages in reverse order (bottom to top, newest first)
+        // This ensures the most recent messages get correct stats even if there's an index issue
+        const wrappersArray = Array.from(messageWrappers).reverse();
+        let messageIndex = messagesOnPage - 1; // Start from the last message
+
+        for (const wrapper of wrappersArray) {
+            // Skip wrappers that we've already failed to extract IDs from
+            // This prevents endless retries on messages that don't have IDs yet
+            if (statsFailedForWrappers.has(wrapper)) {
+                debugLog('[Stats] Skipping wrapper that previously failed ID extraction');
+                messageIndex--;
+                continue;
+            }
+
             // Check if this is a bot message (has character link) or user message
+            // In Story Mode, there's no chatbot link, so we need alternative detection
             const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
-            const isBotMessage = !!characterLink;
-            debugLog('[Stats] Processing message, isBotMessage:', isBotMessage, 'messageIndex:', messageIndex);
+            let isBotMessage = !!characterLink;
             
+            // Story Mode fallback: check for bot-specific UI elements or message styling
+            // Bot messages in Story Mode have different styling (e.g., rounded corners)
+            if (!isBotMessage && isStoryMode()) {
+                // In Story Mode, check message bubble styling to detect bot vs user
+                // Bot messages typically have left-aligned rounded corners, user has right-aligned
+                const messageBubble = wrapper.querySelector('.rounded-\\[4px_20px_20px_20px\\]');
+                if (messageBubble) {
+                    isBotMessage = true;
+                }
+            }
+            debugLog('[Stats] Processing message, isBotMessage:', isBotMessage, 'messageIndex:', messageIndex);
+
             // Skip messages with version counters when processing new messages
             // (they're handled by insertStatsForRegeneratedMessage in that case)
             // But on initial page load, we need to process them here
@@ -8466,15 +11128,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             const hasVersionCounter = versionCounter && /^\d+\/\d+$/.test(versionCounter.textContent.trim());
             if (skipVersionCounterMessages && hasVersionCounter) {
                 debugLog('[Stats] Skipping message with version counter (handled by insertStatsForRegeneratedMessage)');
-                messageIndex++;
+                messageIndex--;
                 continue;
             }
             
-            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center');
+            // Update selector to match new DOM structure - action container has gap-0 and may have flex-row-reverse
+            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center.gap-0, .flex.justify-between.items-center');
             
             if (!actionContainer) {
                 debugLog('[Stats] No action container found!');
-                messageIndex++;
+                messageIndex--;
                 continue;
             }
             
@@ -8487,7 +11150,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // This prevents unnecessary storage reads for every message on every mutation
                 if (actionContainer.dataset.statsFinalized === 'true') {
                     debugLog('[Stats] Stats already finalized, skipping without storage check');
-                    messageIndex++;
+                    messageIndex--;
                     continue;
                 }
                 
@@ -8527,31 +11190,32 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                                 // Mark as finalized so we don't check again
                                 actionContainer.dataset.statsFinalized = 'true';
                                 debugLog('[Stats] Stats already up-to-date, marking as finalized');
-                                messageIndex++;
+                                messageIndex--;
                                 continue;
                             }
                         } else {
                             debugLog('[Stats] Storage does not have arrow format, skipping update');
                             debugLog('[Stats] Stats already present, skipping');
-                            messageIndex++;
+                            messageIndex--;
                             continue;
                         }
                     } else {
                         debugLog('[Stats] No messageId extracted, skipping');
                         debugLog('[Stats] Stats already present, skipping');
-                        messageIndex++;
+                        messageIndex--;
                         continue;
                     }
                 } else {
                     debugLog('[Stats] User message, skipping');
                     debugLog('[Stats] Stats already present, skipping');
+                    messageIndex--;
                     continue;
                 }
             }
             
             if (actionContainer.dataset.statsProcessing) {
                 debugLog('[Stats] Already being processed (race condition), skipping');
-                messageIndex++;
+                messageIndex--;
                 continue;
             }
             
@@ -8560,7 +11224,30 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             
             // Wrap entire processing in try/catch to ensure cleanup on errors
             try {
-                if (isBotMessage) {
+                // In Story Mode, we may misdetect bot messages as user messages due to DOM differences
+                // We'll do a preliminary check here and potentially correct isBotMessage later based on stored role
+                let effectiveIsBotMessage = isBotMessage;
+                
+                // Story Mode: If we can extract a messageId and check its role, use that for detection
+                if (!isBotMessage && isStoryMode()) {
+                    let preCheckMessageId = extractMessageId(wrapper);
+                    if (!preCheckMessageId) {
+                        const correctedIndex = storageOffset + messageIndex;
+                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                            preCheckMessageId = messageIdToIndexMap[correctedIndex];
+                        }
+                    }
+                    if (preCheckMessageId) {
+                        const preCheckStats = await getStatsForMessage(preCheckMessageId);
+                        // If role is 'bot' OR we have generation settings (max_tokens), treat as bot message
+                        if (preCheckStats?.role === 'bot' || (preCheckStats?.max_tokens !== null && preCheckStats?.max_tokens !== undefined)) {
+                            effectiveIsBotMessage = true;
+                            debugLog('[Stats] Story Mode: Corrected isBotMessage to true based on stored role/stats');
+                        }
+                    }
+                }
+                
+                if (effectiveIsBotMessage) {
                 // Bot message - show full stats
                 let messageId = extractMessageId(wrapper);
                 
@@ -8617,12 +11304,12 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     console.log('[Stats DISPLAY] Final messageId to lookup:', messageId);
                 }
                 
-                // Skip if this message was already handled by insertStatsWithRetry
+                // Skip if this message was already handled or is being handled by insertStatsWithRetry
                 // This prevents duplicate stats when both paths try to insert
-                if (messageId && statsInsertedForMessageIds.has(messageId)) {
-                    debugLog('[Stats DISPLAY] Message already handled by insertStatsForRegeneratedMessage, skipping');
+                if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
+                    debugLog('[Stats DISPLAY] Message already handled or in progress by insertStatsForRegeneratedMessage, skipping');
                     delete actionContainer.dataset.statsProcessing;
-                    messageIndex++;
+                    messageIndex--;
                     continue;
                 }
                 
@@ -8639,16 +11326,37 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 
                 if (!generationStats) {
                     debugLog('[Stats] No stats found, skipping message');
-                    // Clear the processing flag so it can be retried later
+                    // If we couldn't extract a messageId, mark this wrapper as failed
+                    // to prevent endless retries on every mutation
+                    // BUT: Only mark as failed if there are no pending new messages
+                    // New messages may not have their data-message-id set yet
+                    if (!messageId && pendingNewMessageCount === 0) {
+                        statsFailedForWrappers.add(wrapper);
+                        debugLog('[Stats] Marked wrapper as failed (no message ID)');
+                    } else if (!messageId) {
+                        debugLog('[Stats] Not marking wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
+                    }
+                    // Clear the processing flag so it can be retried later if messageId becomes available
                     delete actionContainer.dataset.statsProcessing;
-                    messageIndex++;
+                    messageIndex--;
                     continue;
                 }
                 
                 debugLog('[Stats] Creating stats div...');
                 const statsDiv = document.createElement('div');
                 statsDiv.className = 'generation-stats';
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                
+                // Check if we're in story mode for different positioning
+                const inStoryMode = isStoryMode();
+                
+                if (inStoryMode) {
+                    // In story mode: position above the message
+                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                } else {
+                    // Normal mode: position to the right in the header
+                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                }
+                
                 // Add data-version-id to prevent being hidden by the regeneration switcher CSS
                 if (messageId) {
                     statsDiv.dataset.versionId = messageId;
@@ -8692,12 +11400,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                         displayLines.push(timestamp);
                     }
                 }
-                
+
+                if (showMessageIds && messageId) {
+                    displayLines.push(`ID: ${messageId}`);
+                }
+
                 // If we have nothing to display, skip
                 if (displayLines.length === 0) {
                     debugLog('[Stats] No displayable data, skipping');
                     delete actionContainer.dataset.statsProcessing;
-                    messageIndex++;
+                    messageIndex--;
                     continue;
                 }
                 
@@ -8709,55 +11421,75 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 }
                 debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                 
-                // Insert before the menu button's parent container
-                const menuButtonContainer = actionContainer.querySelector('.relative');
-                debugLog('[Stats] Menu button container:', menuButtonContainer);
-                if (menuButtonContainer) {
-                    if (DEBUG_MODE) {
-                        console.log('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
-                        console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
-                        console.log('[Stats DISPLAY] Inserting into action container');
+                // Insert positioning based on story mode
+                if (inStoryMode) {
+                    // In story mode: insert INSIDE the message container as first child
+                    // This keeps the stats within the same width constraints as the message
+                    const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                    if (innerContainer) {
+                        // Insert stats as first child inside the flex-col container
+                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%;';
+                        innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                        if (DEBUG_MODE) {
+                            console.log('[Stats DISPLAY] ========== INSERTING STATS DIV (STORY MODE) ==========');
+                            console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
+                            console.log('[Stats DISPLAY] Inserted inside message container as first child');
+                        }
+                    } else {
+                        // Fallback: insert in action container
+                        actionContainer.appendChild(statsDiv);
                     }
-                    debugLog('[Stats] Inserting stats div...');
-                    actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                    actionContainer.style.setProperty('gap', '4px', 'important');
-                    
-                    // Mark this message as having stats inserted to prevent duplicates
-                    if (messageId) {
-                        statsInsertedForMessageIds.add(messageId);
-                        debugLog('[Stats] Added messageId to statsInsertedForMessageIds:', messageId);
-                    }
-                    
-                    // OPTIMIZATION: Mark stats as finalized if they have arrow format
-                    // This prevents unnecessary storage checks on future mutations
-                    if (generationStats.model && generationStats.model.includes('→')) {
-                        actionContainer.dataset.statsFinalized = 'true';
-                        debugLog('[Stats] Marked stats as finalized (has arrow format)');
-                    }
-                    
-                    delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                    if (DEBUG_MODE) {
-                        console.log('[Stats DISPLAY] Stats div inserted! Final content:', statsDiv.textContent);
-                        console.log('[Stats DISPLAY] Stats div is in DOM:', document.contains(statsDiv));
-                        console.log('[Stats DISPLAY] ===========================================');
-                    }
-                    debugLog('[Stats] Stats div inserted successfully!');
                 } else {
-                    debugLog('[Stats] No menu button container found, cannot insert stats');
-                    delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                    // Normal mode: insert in the action container header
+                    const menuButtonContainer = actionContainer.querySelector('.relative');
+                    debugLog('[Stats] Menu button container:', menuButtonContainer);
+                    if (menuButtonContainer) {
+                        if (DEBUG_MODE) {
+                            console.log('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
+                            console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
+                            console.log('[Stats DISPLAY] Inserting into action container');
+                        }
+                        debugLog('[Stats] Inserting stats div...');
+                        actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                        actionContainer.style.setProperty('gap', '4px', 'important');
+                    } else {
+                        actionContainer.appendChild(statsDiv);
+                    }
                 }
                 
-                messageIndex++;
-                } else {
-                    // User message - show only timestamp if enabled
-                    if (!timestampEnabled) {
-                        delete actionContainer.dataset.statsProcessing;
-                        messageIndex++;
-                        continue;
-                    }
-                    
-                    let messageId = extractMessageId(wrapper);
-                    debugLog('[Stats] User message - extracted messageId:', messageId, 'messageIndex:', messageIndex);
+                // Mark this message as having stats inserted to prevent duplicates
+                if (messageId) {
+                    statsInsertedForMessageIds.add(messageId);
+                    limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                    debugLog('[Stats] Added messageId to statsInsertedForMessageIds:', messageId);
+                }
+                
+                // OPTIMIZATION: Mark stats as finalized if they have arrow format
+                // This prevents unnecessary storage checks on future mutations
+                if (generationStats.model && generationStats.model.includes('→')) {
+                    actionContainer.dataset.statsFinalized = 'true';
+                    debugLog('[Stats] Marked stats as finalized (has arrow format)');
+                }
+                
+                delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                if (DEBUG_MODE) {
+                    console.log('[Stats DISPLAY] Stats div inserted! Final content:', statsDiv.textContent);
+                    console.log('[Stats DISPLAY] Stats div is in DOM:', document.contains(statsDiv));
+                    console.log('[Stats DISPLAY] ===========================================');
+                }
+                debugLog('[Stats] Stats div inserted successfully!');
+
+                messageIndex--;
+            } else {
+                // User message - show only timestamp if enabled
+                if (!timestampEnabled) {
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
+                
+                let messageId = extractMessageId(wrapper);
+                debugLog('[Stats] User message - extracted messageId:', messageId, 'messageIndex:', messageIndex);
                     
                     // Fallback to combined index map if extraction failed
                     if (!messageId) {
@@ -8771,61 +11503,108 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     let generationStats = messageId ? await getStatsForMessage(messageId) : null;
                     debugLog('[Stats] User message - generationStats:', generationStats);
                     
-                    // Skip if this message was already handled
-                    if (messageId && statsInsertedForMessageIds.has(messageId)) {
-                        debugLog('[Stats] User message already handled, skipping');
+                    // Skip if this message was already handled or is being handled
+                    if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
+                        debugLog('[Stats] User message already handled or in progress, skipping');
                         delete actionContainer.dataset.statsProcessing;
-                        messageIndex++;
+                        messageIndex--;
                         continue;
                     }
-                    
+
                     // Only display if we have a valid timestamp
                     if (!generationStats?.timestamp) {
                         debugLog('[Stats] User message - no timestamp, skipping');
+                        // If we couldn't extract a messageId, mark this wrapper as failed
+                        // BUT: Only mark as failed if there are no pending new messages
+                        if (!messageId && pendingNewMessageCount === 0) {
+                            statsFailedForWrappers.add(wrapper);
+                            debugLog('[Stats] Marked user message wrapper as failed (no message ID)');
+                        } else if (!messageId) {
+                            debugLog('[Stats] Not marking user wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
+                        }
                         delete actionContainer.dataset.statsProcessing;
-                        messageIndex++;
+                        messageIndex--;
                         continue;
                     }
-                    
+
                     const timestamp = await formatTimestamp(generationStats.timestamp);
                     if (!timestamp) {
                         delete actionContainer.dataset.statsProcessing;
-                        messageIndex++;
+                        messageIndex--;
                         continue;
                     }
-                    
+
                     // Create timestamp div for user messages
                     const statsDiv = document.createElement('div');
                     statsDiv.className = 'generation-stats';
-                    statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                    
+                    // Check if we're in story mode for different positioning
+                    const inStoryMode = isStoryMode();
+                    
+                    if (inStoryMode) {
+                        // In story mode: position above the message
+                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                    } else {
+                        // Normal mode: position to the right in the header
+                        statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                    }
+                    
                     // Add data-version-id to prevent being hidden by the regeneration switcher CSS
                     if (messageId) {
                         statsDiv.dataset.versionId = messageId;
                     }
-                    
-                    safeSetHTML(statsDiv, timestamp);
-                    
-                    // Insert before the menu button's parent container
-                    const menuButtonContainer = actionContainer.querySelector('.relative');
-                    if (menuButtonContainer) {
-                        actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                        actionContainer.style.setProperty('gap', '4px', 'important');
-                        // Mark this message as having stats inserted
-                        if (messageId) {
-                            statsInsertedForMessageIds.add(messageId);
-                        }
-                        delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                        debugLog('[Stats] User message - timestamp inserted successfully');
-                    } else {
-                        delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+
+                    // Build display content for user messages
+                    let displayLines = [timestamp];
+
+                    // Add message ID if enabled
+                    if (showMessageIds && messageId) {
+                        displayLines.push(`ID: ${messageId}`);
                     }
-                    messageIndex++;
+
+                    safeSetHTML(statsDiv, displayLines.join('<br>'));
+                    
+                    // Insert positioning based on story mode
+                    if (inStoryMode) {
+                        // In story mode: insert INSIDE the message container as first child
+                        const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                        if (innerContainer) {
+                            // Insert stats as first child inside the container
+                            innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                            // Mark this message as having stats inserted
+                            if (messageId) {
+                                statsInsertedForMessageIds.add(messageId);
+                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                            }
+                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                            debugLog('[Stats] User message - timestamp inserted successfully (story mode)');
+                        } else {
+                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                        }
+                    } else {
+                        // Normal mode: insert in the action container header
+                        const menuButtonContainer = actionContainer.querySelector('.relative');
+                        if (menuButtonContainer) {
+                            actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                            actionContainer.style.setProperty('gap', '4px', 'important');
+                            // Mark this message as having stats inserted
+                            if (messageId) {
+                                statsInsertedForMessageIds.add(messageId);
+                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                            }
+                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                            debugLog('[Stats] User message - timestamp inserted successfully');
+                        } else {
+                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                        }
+                    }
+                    messageIndex--;
                 }
             } catch (error) {
                 // Ensure cleanup on any error during stats processing
                 console.error('[Toolkit] Error processing message stats:', error);
                 delete actionContainer.dataset.statsProcessing;
-                messageIndex++;
+                messageIndex--;
             }
         }
     }
@@ -9020,8 +11799,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
             const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
             const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-            
-            debugLog('[Toolkit] Settings:', { statsEnabled, timestampEnabled, showModelDetails });
+            const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+
+            debugLog('[Toolkit] Settings:', { statsEnabled, timestampEnabled, showModelDetails, showMessageIds });
             
             // Build updated display
             let displayLines = [];
@@ -9045,7 +11825,11 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     displayLines.push(timestamp);
                 }
             }
-            
+
+            if (showMessageIds && newMessageId) {
+                displayLines.push(`ID: ${newMessageId}`);
+            }
+
             debugLog('[Toolkit] Display lines:', displayLines);
             
             if (displayLines.length > 0) {
@@ -9066,7 +11850,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     debugLog('[Toolkit] No stats div found, creating new one in header container');
                     liveStatsDiv = document.createElement('div');
                     liveStatsDiv.className = 'generation-stats';
-                    liveStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                    liveStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
                     
                     // Insert before the menu button container
                     const menuButtonContainer = liveHeaderContainer.querySelector('.relative');
@@ -9128,7 +11912,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                                         debugLog('[Toolkit] reapplyStats: No stats div found, creating new one');
                                         const newStatsDiv = document.createElement('div');
                                         newStatsDiv.className = 'generation-stats';
-                                        newStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right;';
+                                        newStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
                                         newStatsDiv.dataset.versionId = newMessageId;
                                         safeSetHTML(newStatsDiv, displayText);
                                         
@@ -9932,8 +12716,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     /**
      * Monitors for Memory Manager modal opening
      */
+    // Store observer reference to prevent duplicate observers (memory leak fix)
+    let memoryModalObserver = null;
+
     function monitorMemoryModal() {
-        const observer = new MutationObserver((mutations) => {
+        // Disconnect existing observer if any to prevent accumulation
+        if (memoryModalObserver) {
+            memoryModalObserver.disconnect();
+        }
+
+        memoryModalObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
                 for (const node of mutation.addedNodes) {
                     if (node.nodeType === Node.ELEMENT_NODE) {
@@ -9980,12 +12772,12 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 }
             }
         });
-        
-        observer.observe(document.body, {
+
+        memoryModalObserver.observe(document.body, {
             childList: true,
             subtree: true
         });
-        
+
         debugLog('[S.AI] Memory Manager auto-refresh monitor initialized');
     }
     
@@ -10027,7 +12819,39 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     
     const RELOAD_FLAG_KEY = 'sai-toolkit-reloaded-for-init';
     const hasAlreadyReloaded = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
-    
+
+    // =============================================================================
+    // ===                 UPDATE NOTIFICATION CHECK                            ===
+    // =============================================================================
+    // Check for update notification on page load
+    async function checkForUpdateNotification() {
+        try {
+            const showUpdate = await storage.get('showUpdateNotification', false);
+
+            if (showUpdate) {
+                const newVersion = await storage.get('updatedToVersion', null);
+                const lastSeenVersion = await storage.get('lastSeenVersion', null);
+
+                debugLog('[Toolkit] Update check - showUpdate:', showUpdate, 'newVersion:', newVersion, 'lastSeenVersion:', lastSeenVersion);
+
+                // Only show if user hasn't seen this version yet
+                if (newVersion && newVersion !== lastSeenVersion) {
+                    // Small delay to let page load first
+                    setTimeout(() => showUpdateNotificationModal(newVersion), 1000);
+                } else {
+                    debugLog('[Toolkit] User has already seen version:', newVersion);
+                }
+
+                // Clear the flag regardless
+                await storage.remove('showUpdateNotification');
+            } else {
+                debugLog('[Toolkit] No update notification pending');
+            }
+        } catch (err) {
+            console.error('[Toolkit] Error checking for update notification:', err);
+        }
+    }
+
     // For new tab detection: check if this is a fresh navigation (not a reload)
     // Use newer PerformanceNavigationTiming API with fallback to deprecated API
     function getNavigationType() {
@@ -10056,9 +12880,12 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     
     async function checkAndReloadIfNeeded() {
         await initializeMainCode();
-        
+
         debugLog('[Toolkit] initializeMainCode completed');
-        
+
+        // Check for update notification after initialization
+        await checkForUpdateNotification();
+
         // Only check on chat pages
         const isChatPage = location.href.includes('/chat') || location.href.includes('/messages');
         debugLog('[Toolkit] isChatPage:', isChatPage);

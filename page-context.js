@@ -141,3 +141,75 @@ window.resetSAIToolkitOnboarding = function() {
     return 'Resetting... Page will reload in 1 second.';
 };
 console.log('[Toolkit] Reset function available: resetSAIToolkitOnboarding()');
+
+// ============================================================================
+// ARROW KEY BLOCKER FOR MESSAGE EDITING
+// ============================================================================
+// When editing a message, arrow keys should NOT switch between regenerations.
+// This runs in the page context so it can intercept React's event handling.
+
+(function() {
+    'use strict';
+    
+    // Check if a message edit mode is currently active
+    function isMessageEditActive() {
+        // Method 1: Look for Save/Cancel buttons that appear in edit mode
+        const saveButton = document.querySelector('button[aria-label="save-edit"], button:has(svg.lucide-check)');
+        const cancelButton = document.querySelector('button[aria-label="cancel-edit"], button:has(svg.lucide-x)');
+        
+        // Method 2: Look for edit mode textareas
+        // Edit textareas are typically in a flex-col container, NOT inside the main chat input
+        const editTextareas = document.querySelectorAll('textarea');
+        for (const textarea of editTextareas) {
+            // Skip the main chat input (it's inside .border-1.border-solid.rounded-\[13px\])
+            if (textarea.closest('.border-1.border-solid.rounded-\\[13px\\]')) {
+                continue;
+            }
+            // Skip hidden WYSIWYG textareas
+            if (textarea.classList.contains('sai-wysiwyg-hidden')) {
+                continue;
+            }
+            // Check if it's visible
+            const style = window.getComputedStyle(textarea);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
+                // Check if it looks like a message edit textarea (has certain classes or parent structure)
+                if (textarea.closest('.flex.flex-col.gap-1\\.5') || 
+                    textarea.closest('.flex.flex-col.gap-md') ||
+                    textarea.classList.contains('resize-none')) {
+                    return true;
+                }
+            }
+        }
+        
+        // Method 3: Check for Save/Cancel buttons near textareas
+        if (saveButton || cancelButton) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Block arrow keys at the earliest possible point
+    window.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            if (isMessageEditActive()) {
+                // Only block if focus is NOT on an input/textarea
+                // (so cursor movement inside the textarea still works)
+                const activeElement = document.activeElement;
+                const isInInput = activeElement && 
+                    (activeElement.tagName === 'TEXTAREA' || 
+                     activeElement.tagName === 'INPUT' ||
+                     activeElement.contentEditable === 'true');
+                
+                if (!isInInput) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    return false;
+                }
+            }
+        }
+    }, true); // Use capture phase
+    
+    console.log('[SAI Toolkit] Arrow key blocker for message editing initialized');
+})();

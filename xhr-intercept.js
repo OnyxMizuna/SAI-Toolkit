@@ -76,7 +76,8 @@
     
     let lastGenerationSettings = null;
     let loadedMessageIds = [];
-    let messageIdToIndexMap = {};
+    // Memory optimization: Maximum message IDs to track (prevents unbounded growth)
+    const MAX_LOADED_MESSAGE_IDS = 500;
     
     // NSFW Mode state - can be toggled via postMessage from content script
     // Initialize from localStorage if available
@@ -148,11 +149,11 @@
                     // Extract conversation_id and label from response
                     const conversationId = response.conversation_id || response.chat_id || response.id || null;
                     const label = response.label || null;
-                    console.log('[ChatTitle XHR] ========== GET /messages RESPONSE ==========');
-                    console.log('[ChatTitle XHR] Full response keys:', Object.keys(response));
-                    console.log('[ChatTitle XHR] Extracted conversation ID:', conversationId);
-                    console.log('[ChatTitle XHR] Extracted label:', label);
-                    console.log('[ChatTitle XHR] Label type:', typeof label);
+                    debugLog('[ChatTitle XHR] ========== GET /messages RESPONSE ==========');
+                    debugLog('[ChatTitle XHR] Full response keys:', Object.keys(response));
+                    debugLog('[ChatTitle XHR] Extracted conversation ID:', conversationId);
+                    debugLog('[ChatTitle XHR] Extracted label:', label);
+                    debugLog('[ChatTitle XHR] Label type:', typeof label);
                     debugLog('[Stats] Extracted conversation ID:', conversationId, 'label:', label);
                     
                     if (response.messages && Array.isArray(response.messages)) {
@@ -191,16 +192,16 @@
                                 createdAt: msg.createdAt
                             }))
                         };
-                        console.log('[ChatTitle XHR] Sending postMessage SAI_MESSAGES_LOADED');
-                        console.log('[ChatTitle XHR] Message data includes label:', label);
+                        debugLog('[ChatTitle XHR] Sending postMessage SAI_MESSAGES_LOADED');
+                        debugLog('[ChatTitle XHR] Message data includes label:', label);
                         window.postMessage(messageData, '*');
                         debugLog('[Stats] Sent SAI_MESSAGES_LOADED postMessage with label:', label);
                         
                         loadedMessageIds = botMessages.map(msg => msg.id).reverse();
-                        messageIdToIndexMap = {};
-                        loadedMessageIds.forEach((id, index) => {
-                            messageIdToIndexMap[index] = id;
-                        });
+                        // Limit array size to prevent memory growth
+                        if (loadedMessageIds.length > MAX_LOADED_MESSAGE_IDS) {
+                            loadedMessageIds = loadedMessageIds.slice(-MAX_LOADED_MESSAGE_IDS);
+                        }
                     } else {
                         debugLog('[Stats] No messages array in response:', response);
                     }
@@ -210,9 +211,12 @@
             });
         }
         
-        // POST /chat - new message generation
-        if (this._method === 'POST' && this._url && this._url.includes('/chat')) {
-            debugLog('[Stats] Intercepted POST to /chat');
+        // POST /chat or /story-chat - new message generation
+        // Story mode may use a different endpoint, so check for both
+        const isChatPost = this._method === 'POST' && this._url && 
+            (this._url.includes('/chat') || this._url.includes('/story'));
+        if (isChatPost) {
+            debugLog('[Stats] Intercepted POST to chat/story endpoint:', this._url);
             try {
                 const parsedBody = JSON.parse(body);
                 
@@ -222,9 +226,19 @@
                     debugLog('[Stats] inference_settings:', parsedBody.inference_settings);
                     lastGenerationSettings = {
                         model: parsedBody.inference_model,
-                        settings: parsedBody.inference_settings
+                        settings: parsedBody.inference_settings,
+                        timestamp: Date.now() // Track when this was captured
                     };
                     debugLog('[Stats] Stored lastGenerationSettings:', lastGenerationSettings);
+
+                    // Memory optimization: Clear settings if not used within 30 seconds
+                    const capturedTimestamp = lastGenerationSettings.timestamp;
+                    setTimeout(() => {
+                        if (lastGenerationSettings && lastGenerationSettings.timestamp === capturedTimestamp) {
+                            debugLog('[Stats] Clearing stale lastGenerationSettings (30s timeout)');
+                            lastGenerationSettings = null;
+                        }
+                    }, 30000);
                     
                     // Capture the POST send timestamp for user message
                     const userMessageTimestamp = Date.now();
@@ -299,12 +313,11 @@
                                     prevId: prevId
                                 }, '*');
                                 
-                                // Update local tracking
+                                // Update local tracking with size limit
                                 loadedMessageIds.push(messageId);
-                                messageIdToIndexMap = {};
-                                loadedMessageIds.forEach((id, index) => {
-                                    messageIdToIndexMap[index] = id;
-                                });
+                                if (loadedMessageIds.length > MAX_LOADED_MESSAGE_IDS) {
+                                    loadedMessageIds = loadedMessageIds.slice(-MAX_LOADED_MESSAGE_IDS);
+                                }
                             }
                             
                             // Send notification for user message using captured timestamp
@@ -359,8 +372,8 @@
         
         // Log ALL character-related URLs to see what's actually being called
         if (url && typeof url === 'string' && url.includes('characters')) {
-            console.log('[ChatTitle FETCH DEBUG] Character-related URL detected:', url);
-            console.log('[ChatTitle FETCH DEBUG] Method:', options?.method || 'GET');
+            debugLog('[ChatTitle FETCH DEBUG] Character-related URL detected:', url);
+            debugLog('[ChatTitle FETCH DEBUG] Method:', options?.method || 'GET');
         }
         
         // Intercept image generation requests to inject NSFW mode override (fetch version)
@@ -389,9 +402,12 @@
         // Capture timestamp when POST /chat is sent
         let userMessageTimestamp = null;
         
-        // POST /chat via fetch
-        if (url && typeof url === 'string' && url.includes('/chat') && options && options.method === 'POST') {
-            debugLog('[Stats] Intercepted POST to /chat via fetch');
+        // POST /chat or /story via fetch
+        const isFetchChatPost = url && typeof url === 'string' && 
+            (url.includes('/chat') || url.includes('/story')) && 
+            options && options.method === 'POST';
+        if (isFetchChatPost) {
+            debugLog('[Stats] Intercepted POST to chat/story via fetch:', url);
             userMessageTimestamp = Date.now();
             try {
                 const body = JSON.parse(options.body);
@@ -399,8 +415,18 @@
                     debugLog('[Stats] Found inference settings in fetch body');
                     lastGenerationSettings = {
                         model: body.inference_model,
-                        settings: body.inference_settings
+                        settings: body.inference_settings,
+                        timestamp: Date.now() // Track when this was captured
                     };
+
+                    // Memory optimization: Clear settings if not used within 30 seconds
+                    const capturedTimestamp = lastGenerationSettings.timestamp;
+                    setTimeout(() => {
+                        if (lastGenerationSettings && lastGenerationSettings.timestamp === capturedTimestamp) {
+                            debugLog('[Stats] Clearing stale lastGenerationSettings (30s timeout)');
+                            lastGenerationSettings = null;
+                        }
+                    }, 30000);
                 }
             } catch (e) {
                 console.error('[Stats] Error parsing fetch body:', e);
@@ -413,7 +439,7 @@
         // Intercept GET /v2/characters/{id} - character details for page title
         // Try multiple patterns to catch the actual endpoint
         const fetchUrlString = typeof url === 'string' ? url : url?.toString();
-        console.log('[ChatTitle FETCH DEBUG] Checking URL:', fetchUrlString);
+        debugLog('[ChatTitle FETCH DEBUG] Checking URL:', fetchUrlString);
         
         // Pattern 1: /v2/characters/{uuid}
         const v2Pattern = /\/v2\/characters\/[a-f0-9-]+/;
@@ -423,16 +449,16 @@
         const anyCharPattern = /\/characters\/[a-f0-9-]+/;
         
         if (fetchUrlString && (v2Pattern.test(fetchUrlString) || v1Pattern.test(fetchUrlString) || anyCharPattern.test(fetchUrlString)) && (!options || !options.method || options.method === 'GET')) {
-            console.log('[ChatTitle FETCH] ========== CHARACTER API MATCHED ==========');
-            console.log('[ChatTitle FETCH] URL:', fetchUrlString);
-            console.log('[ChatTitle FETCH] Matched pattern:', v2Pattern.test(fetchUrlString) ? 'v2' : v1Pattern.test(fetchUrlString) ? 'v1' : 'any');
+            debugLog('[ChatTitle FETCH] ========== CHARACTER API MATCHED ==========');
+            debugLog('[ChatTitle FETCH] URL:', fetchUrlString);
+            debugLog('[ChatTitle FETCH] Matched pattern:', v2Pattern.test(fetchUrlString) ? 'v2' : v1Pattern.test(fetchUrlString) ? 'v1' : 'any');
             const clonedResponse = response.clone();
             try {
                 const data = await clonedResponse.json();
-                console.log('[ChatTitle FETCH] Response keys:', Object.keys(data));
-                console.log('[ChatTitle FETCH] Character name:', data.name);
+                debugLog('[ChatTitle FETCH] Response keys:', Object.keys(data));
+                debugLog('[ChatTitle FETCH] Character name:', data.name);
                 if (data.name) {
-                    console.log('[ChatTitle FETCH] Sending postMessage SAI_CHARACTER_LOADED with name:', data.name);
+                    debugLog('[ChatTitle FETCH] Sending postMessage SAI_CHARACTER_LOADED with name:', data.name);
                     debugLog('[ChatTitle] Got character name from API:', data.name);
                     // Send to content script
                     window.postMessage({
@@ -516,12 +542,11 @@
                         }, '*');
                     }
                     
-                    // Update local tracking
+                    // Update local tracking with size limit
                     loadedMessageIds.push(messageId);
-                    messageIdToIndexMap = {};
-                    loadedMessageIds.forEach((id, index) => {
-                        messageIdToIndexMap[index] = id;
-                    });
+                    if (loadedMessageIds.length > MAX_LOADED_MESSAGE_IDS) {
+                        loadedMessageIds = loadedMessageIds.slice(-MAX_LOADED_MESSAGE_IDS);
+                    }
                 }
             } catch (e) {
                 // Response might not be JSON, that's OK

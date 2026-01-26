@@ -16,10 +16,21 @@ storageAPI.runtime.onInstalled.addListener((details) => {
             'enableHideForYou': true,
             'enablePageJump': true,
             'showGenerationStats': false,
-            'timestampDateFirst': true
+            'timestampDateFirst': true,
+            'lastSeenVersion': null  // Track for update notifications
         });
-        
+
         // First install complete
+        console.log('[Toolkit] Extension installed');
+    } else if (details.reason === 'update') {
+        // Extension was updated - set flag to show update notification
+        const currentVersion = storageAPI.runtime.getManifest().version;
+        console.log('[Toolkit] Extension updated to version:', currentVersion);
+
+        storageAPI.storage.local.set({
+            'showUpdateNotification': true,
+            'updatedToVersion': currentVersion
+        });
     }
 });
 
