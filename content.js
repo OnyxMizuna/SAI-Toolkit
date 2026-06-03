@@ -68,7 +68,7 @@ if (typeof storage !== 'undefined') {
     storage.get('debugMode', false).then(savedDebugMode => {
         DEBUG_MODE = savedDebugMode;
         if (DEBUG_MODE) {
-            console.log('[Toolkit] 🐛 Debug mode loaded from storage (ENABLED)');
+            console.log('[Core] 🐛 Debug mode loaded from storage (ENABLED)');
             window.__SAI_DEBUG_MODE__ = true;
         }
     }).catch(() => {
@@ -76,9 +76,67 @@ if (typeof storage !== 'undefined') {
     });
 }
 
+// Debug log category filters - controls which log categories are shown
+// Categories: Core, Stats, Memories, Export, NSFW, ChatTitle, WYSIWYG, WYSIWYG-Text, Profile, Model, Cache, Migration
+let debugLogFilters = {
+    Core: true,
+    Stats: true,
+    Memories: true,
+    Export: true,
+    NSFW: true,
+    ChatTitle: true,
+    WYSIWYG: true,
+    'WYSIWYG-Text': false,  // Disabled by default - very noisy
+    Profile: true,
+    Model: true,
+    Cache: true,
+    Migration: true,
+    Custom: true,
+    Compact: true
+};
+
+// Track sidebar width to detect transitions - prevents injection during React re-renders
+let lastKnownSidebarWidth = null;
+let sidebarWidthTransitionPending = false;
+
+// Load debug filters from storage
+if (typeof storage !== 'undefined' && storage.get) {
+    storage.get('debugLogFilters').then(filters => {
+        if (filters && typeof filters === 'object') {
+            debugLogFilters = { ...debugLogFilters, ...filters };
+        }
+    }).catch(() => {});
+}
+
+// Helper to extract category from log message
+function getLogCategory(message) {
+    if (typeof message !== 'string') return null;
+    const match = message.match(/^\[([^\]]+)\]/);
+    if (!match) return null;
+    
+    const fullCategory = match[1];
+    // Map sub-categories to main categories
+    if (fullCategory.startsWith('Stats')) return 'Stats';
+    if (fullCategory.startsWith('ChatTitle')) return 'ChatTitle';
+    if (fullCategory.startsWith('Memories')) return 'Memories';
+    if (fullCategory === 'Profile Controls') return 'Profile';
+    if (fullCategory === 'Change Model' || fullCategory === 'Model Change') return 'Model';
+    if (fullCategory === 'Custom Style') return 'Custom';
+    if (fullCategory === 'Compact') return 'Compact';
+    
+    return fullCategory;
+}
+
 // Production-safe debug logging helper - sanitizes sensitive data
 function debugLog(...args) {
     if (DEBUG_MODE) {
+        // Check category filter - first arg usually contains [Category]
+        const firstArg = args[0];
+        const category = getLogCategory(firstArg);
+        if (category && debugLogFilters[category] === false) {
+            return; // Skip this log category
+        }
+        
         // Sanitize arguments to prevent logging sensitive data
         const sanitized = args.map(arg => {
             if (typeof arg === 'string') {
@@ -98,7 +156,7 @@ function debugLog(...args) {
             }
             return arg;
         });
-        console.log('[Toolkit]', ...sanitized);
+        console.log('[Core]', ...sanitized);
     }
 }
 
@@ -111,7 +169,7 @@ const prodLog = (...args) => {
 
 // Prevent duplicate initialization if script is injected multiple times
 if (window.__saiToolkitLoaded) {
-    debugLog('[Toolkit] Already loaded, skipping duplicate initialization');
+    debugLog('[Core] Already loaded, skipping duplicate initialization');
 } else {
     window.__saiToolkitLoaded = true;
 }
@@ -127,9 +185,9 @@ if (runtimeAPI && runtimeAPI.runtime && runtimeAPI.runtime.onMessage) {
     });
 }
 
-debugLog('[S.AI Toolkit] Content script starting...');
-debugLog('[S.AI Toolkit] URL:', window.location.href);
-debugLog('[S.AI Toolkit] Document ready state:', document.readyState);
+debugLog('[Core] Content script starting...');
+debugLog('[Core] URL:', window.location.href);
+debugLog('[Core] Document ready state:', document.readyState);
 
 // Inject debug functions into page context using external file (MV3 compatible - no inline scripts)
 const debugScript = document.createElement('script');
@@ -289,6 +347,67 @@ window.addEventListener('message', async (event) => {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // MESSAGE RECOVERY — receive failed-send snapshots from page context
+    // -------------------------------------------------------------------------
+    // The page-context interceptor (xhr-intercept.js) detected a failure on a
+    // POST /chat or /story request and is handing us the user's typed text.
+    // We persist it to chrome.storage.local under 'failedMessages' as a FIFO
+    // ring buffer (oldest entries dropped at the cap). We never transmit this
+    // data anywhere — it's stored locally so the user can recover it via the
+    // "Recover message" button injected next to SpicyChat's "Oops!" banner.
+    //
+    // STORAGE SHAPE
+    //   key: 'failedMessages'
+    //   value: Array<{
+    //     id: string,            // local UUID for delete-by-id
+    //     message: string,       // the user's original typed text
+    //     conversationId: string|null,
+    //     characterId: string|null,
+    //     url: string,           // the failing endpoint, for debugging
+    //     capturedAt: number,    // ms epoch
+    //     reason: string,        // e.g. 'xhr-status-502', 'fetch-throw'
+    //     transport: 'xhr'|'fetch'
+    //   }>
+    //
+    // CAP: 50 entries. Old ones are evicted FIFO so the queue can't grow
+    // unbounded if the user has a long outage.
+    if (event.data.type === 'SAI_MESSAGE_SEND_FAILED') {
+        try {
+            const snapshot = event.data.snapshot || {};
+            const reason = event.data.reason || 'unknown';
+            if (!snapshot.message || typeof snapshot.message !== 'string') return;
+
+            const entry = {
+                id: 'fm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+                message: snapshot.message,
+                conversationId: snapshot.conversationId || null,
+                characterId: snapshot.characterId || null,
+                url: snapshot.url || null,
+                capturedAt: snapshot.capturedAt || Date.now(),
+                reason: reason,
+                transport: snapshot.transport || 'unknown'
+            };
+
+            const MAX_FAILED = 50;
+            const existing = await storage.get('failedMessages', []);
+            const list = Array.isArray(existing) ? existing.slice() : [];
+            list.push(entry);
+            while (list.length > MAX_FAILED) list.shift();
+            await storage.set('failedMessages', list);
+            debugLog('[MsgRecovery] Persisted failed message, reason:', reason, 'queue size:', list.length);
+
+            // If the "Oops!" banner is already on screen by the time we get
+            // here (race between fetch failure and banner render), make sure
+            // the recover button is present.
+            if (typeof injectRecoverButtonIfNeeded === 'function') {
+                injectRecoverButtonIfNeeded();
+            }
+        } catch (e) {
+            console.error('[MsgRecovery] Failed to persist message:', e);
+        }
+    }
 });
 
 'use strict';
@@ -318,10 +437,18 @@ window.addEventListener('message', async (event) => {
 // SECURITY GUARANTEES:
 // ✓ NO REMOTE CODE: All injected scripts are bundled with extension
 // ✓ NO EXTERNAL REQUESTS: Scripts make zero network calls to external servers
-// ✓ READ-ONLY INTERCEPTION: Never modifies requests/responses
+// ✓ READ-ONLY ON RESPONSES: Server responses are never modified
 // ✓ LOCAL STORAGE ONLY: All data saved to chrome.storage.local
-// ✓ NO SENSITIVE DATA: Does not access messages, credentials, or personal info
+// ✓ NO CREDENTIALS: Does not access passwords, tokens, or auth headers
 // ✓ TRANSPARENT: Fully open source at github.com/CLedebur/Spicychat.ai-Mods
+//
+// ABOUT MESSAGE CONTENT:
+// By default, message content is NOT read or stored. The optional
+// "Message Recovery" feature (Features tab → Message Recovery, default OFF)
+// captures the text of an outgoing chat message ONLY at send time, and ONLY
+// persists it locally if the send fails — so the user can recover what they
+// typed when SpicyChat's backend errors out. See xhr-intercept.js header
+// for the full disclosure.
 //
 // DATA FLOW:
 // Page Context (xhr-intercept.js)
@@ -398,9 +525,30 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
 // This pattern lets us wait for storage operations before proceeding
 (async function() {
     'use strict';
-    
-    debugLog('[Toolkit] Content script loaded - starting initialization...');
-    debugLog('[Toolkit] Storage object available:', typeof storage !== 'undefined');
+
+    // ------------------------------------------------------------------
+    // EARLY-DECLARED STATE
+    // ------------------------------------------------------------------
+    // Hoisted here because asynchronous observers (WYSIWYG, body-class,
+    // resize) are wired up partway through this IIFE and can fire BEFORE
+    // execution reaches the later `let` declarations. Reading a let/const
+    // before its declaration line throws TDZ ("Cannot access … before
+    // initialization"). The values themselves are re-assigned later; this
+    // block only ensures the bindings exist as soon as the IIFE starts.
+    let isResizing = false;
+    let resizeEndTimer = null;
+    // Sidebar Layout body-class observer state — accessed by the
+    // startSidebarLayoutBodyClassObserver function, which is called from the
+    // early-inject block (~line 895) long before the later declarations would
+    // run. Without these hoists, the first call hit TDZ on
+    // `sidebarLayoutBodyObserver`, threw ReferenceError, and halted the
+    // entire early-init block — which manifested as ALL injections/page
+    // modifications appearing broken because the IIFE never reached them.
+    let sidebarLayoutBodyObserver = null;
+    let sidebarLayoutBodyClassRafPending = false;
+
+    debugLog('[Core] Content script loaded - starting initialization...');
+    debugLog('[Core] Storage object available:', typeof storage !== 'undefined');
 
     // =============================================================================
     // MIGRATION NOTE: Tampermonkey → Extension
@@ -454,6 +602,9 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const WYSIWYG_EDITOR_KEY = 'enableWysiwygEditor';  // Live formatting in textareas
     const SHOW_MESSAGE_IDS_KEY = 'showMessageIds';  // Show message IDs in stats display
     const ENABLE_GENERATION_PROFILES_KEY = 'enableGenerationProfiles';  // Override to force-enable generation profiles (debug only)
+    const MEMORY_DOT_ENABLED_KEY = 'memoryDotEnabled';  // Show/hide memory limit indicator dot
+    const MEMORY_DOT_COLOR_KEY = 'memoryDotColor';  // Custom color for memory limit indicator dot
+    const HIDE_CREATOR_KEY = 'hideCreatorName';  // Hide bot creator @username link under bot messages
 
     // Default custom style values
     const DEFAULT_CUSTOM_STYLE = {
@@ -479,6 +630,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         fontSize: '16px',
         fontFamily: '',
         hoverButtonColor: '#292929',
+        creatorLinkColor: '',
         backgroundImage: ''
     };
     
@@ -544,10 +696,10 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // and DOM manipulations wait for body to be available.
     function waitForBody(timeoutMs = 10000) {
         return new Promise((resolve, reject) => {
-            debugLog('[Toolkit] waitForBody called, readyState:', document.readyState, 'body:', !!document.body);
+            debugLog('[Core] waitForBody called, readyState:', document.readyState, 'body:', !!document.body);
             
             if (document.body) {
-                debugLog('[Toolkit] document.body already exists');
+                debugLog('[Core] document.body already exists');
                 resolve(document.body);
                 return;
             }
@@ -555,7 +707,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
             let resolved = false;
             const timeout = setTimeout(() => {
                 if (!resolved) {
-                    console.error('[Toolkit] waitForBody timed out after', timeoutMs, 'ms');
+                    console.error('[Core] waitForBody timed out after', timeoutMs, 'ms');
                     // Still try to resolve with body if it exists now, otherwise reject
                     if (document.body) {
                         resolved = true;
@@ -570,18 +722,18 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 if (!resolved && document.body) {
                     resolved = true;
                     clearTimeout(timeout);
-                    debugLog('[Toolkit] document.body now available');
+                    debugLog('[Core] document.body now available');
                     resolve(document.body);
                 }
             };
             
             // Try DOMContentLoaded first
             if (document.readyState === 'loading') {
-                debugLog('[Toolkit] Waiting for DOMContentLoaded...');
+                debugLog('[Core] Waiting for DOMContentLoaded...');
                 document.addEventListener('DOMContentLoaded', onBodyReady, { once: true });
             } else {
                 // DOM should be ready - poll briefly in case body is just not set yet
-                debugLog('[Toolkit] DOM ready but no body, polling...');
+                debugLog('[Core] DOM ready but no body, polling...');
                 const checkBody = setInterval(() => {
                     if (document.body) {
                         clearInterval(checkBody);
@@ -643,11 +795,28 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
 
     // Load feature flags from storage (async operations)
     // These determine which CSS to inject before page renders
-    const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-    const classicLayoutEnabled = await storage.get(CLASSIC_LAYOUT_KEY, false);
-    const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
-    const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
-    const customStyleValues = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+    // PERFORMANCE: Batch all early CSS settings into a single storage read
+    const earlySettings = await storage.getMultiple({
+        [SIDEBAR_LAYOUT_KEY]: false,
+        [CLASSIC_LAYOUT_KEY]: false,
+        [CLASSIC_STYLE_KEY]: false,
+        [CUSTOM_STYLE_KEY]: false,
+        [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
+        [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
+        [SMALL_PROFILE_IMAGES_KEY]: false,
+        [ROUNDED_PROFILE_IMAGES_KEY]: false,
+        [SWAP_CHECKBOX_POSITION_KEY]: false,
+        [SQUARE_MESSAGE_EDGES_KEY]: false,
+        [MEMORY_DOT_ENABLED_KEY]: true,
+        [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
+        [HIDE_CREATOR_KEY]: false
+    });
+    
+    const sidebarEnabled = earlySettings[SIDEBAR_LAYOUT_KEY];
+    const classicLayoutEnabled = earlySettings[CLASSIC_LAYOUT_KEY];
+    const classicStyleEnabled = earlySettings[CLASSIC_STYLE_KEY];
+    const customStyleEnabled = earlySettings[CUSTOM_STYLE_KEY];
+    const customStyleValues = earlySettings[CUSTOM_STYLE_VALUES_KEY];
     
     // -------------------------------------------------------------------------
     // COMPOSER CSS INJECTION (Dependency: Sidebar Layout)
@@ -656,10 +825,9 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // sidebar layout enabled. It's designed specifically for that layout mode.
     // Without sidebar, the default SpicyChat layout is fine.
     // 
-    // Skip on lorebook, chatbot, and group pages - different layouts there
-    const isNonChatPage = window.location.pathname.startsWith('/lorebook') ||
-                          window.location.pathname.startsWith('/chatbot/') ||
-                          window.location.pathname.startsWith('/group');
+    // Skip on lorebook, chatbot/edit, create, and group pages - different layouts there
+    // Supports localized URLs: /{language}/lorebook, /{language}/chatbot/edit, /{language}/create, /{language}/group
+    const isNonChatPage = /^\/(([a-z]{2}\/)?)(lorebook|chatbot\/edit|create|group)/i.test(window.location.pathname);
     if (sidebarEnabled && !isNonChatPage) {
         const injectComposerCSS = () => {
             // Wait for document.head to exist (very early in page lifecycle)
@@ -690,7 +858,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Composer Layout CSS injected EARLY (before React initialization)');
+            debugLog('[Core] Composer Layout CSS injected EARLY (before React initialization)');
         };
         
         injectComposerCSS();
@@ -723,10 +891,26 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Sidebar Layout CSS injected EARLY (before React initialization)');
+            debugLog('[Core] Sidebar Layout CSS injected EARLY (before React initialization)');
         };
-        
+
         injectSidebarCSS();
+
+        // Start the body-class observer that drives Sidebar Layout state. The
+        // observer waits for document.body internally, so it's safe to call
+        // before the body exists. This replaces ~30 chained body:has() rules
+        // with simple class selectors — fixes the 8s+ forced reflows reported
+        // on older CPUs during typing. (Defined later in the IIFE — defer the
+        // call so the function is in scope when the page actually has a body.)
+        const startObserverWhenReady = () => {
+            if (typeof startSidebarLayoutBodyClassObserver === 'function') {
+                startSidebarLayoutBodyClassObserver();
+            } else {
+                // Function defined later in the same IIFE; retry once microtask is clear
+                setTimeout(startObserverWhenReady, 0);
+            }
+        };
+        startObserverWhenReady();
     }
     
     // Inject Classic Layout CSS early if enabled
@@ -755,7 +939,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Classic Layout CSS injected EARLY (before React initialization)');
+            debugLog('[Core] Classic Layout CSS injected EARLY (before React initialization)');
         };
         
         injectClassicLayoutCSS();
@@ -787,7 +971,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Classic Style CSS injected EARLY (before React initialization)');
+            debugLog('[Core] Classic Style CSS injected EARLY (before React initialization)');
         };
         
         injectClassicStyleCSS();
@@ -819,14 +1003,15 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Custom Style CSS injected EARLY (before React initialization)');
+            debugLog('[Core] Custom Style CSS injected EARLY (before React initialization)');
         };
         
         injectCustomStyleCSS();
     }
     
     // Inject Message Container Max Width CSS - inject into BODY to override HEAD stylesheets
-    const messageContainerMaxWidth = await storage.get(MESSAGE_CONTAINER_MAX_WIDTH_KEY, '');
+    // PERFORMANCE: Use value from batched earlySettings read above
+    const messageContainerMaxWidth = earlySettings[MESSAGE_CONTAINER_MAX_WIDTH_KEY];
     if (messageContainerMaxWidth) {
         const injectMessageContainerMaxWidthCSS = () => {
             // For this specific CSS, we inject into body, not head
@@ -840,30 +1025,30 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 }
                 return;
             }
-            
+
             // Remove existing style if present (to re-inject at end)
             const existing = document.getElementById('sai-toolkit-message-container-width');
             if (existing) {
                 existing.remove();
             }
-            
+
             const style = document.createElement('style');
             style.id = 'sai-toolkit-message-container-width';
             style.textContent = getMessageContainerMaxWidthCSS(messageContainerMaxWidth);
-            
+
             // Append to body (or head if body not ready) - this ensures it comes AFTER all head stylesheets
             if (document.body) {
                 document.body.appendChild(style);
-                debugLog('[Toolkit] Message Container Max Width CSS injected into BODY:', messageContainerMaxWidth);
+                debugLog('[Core] Message Container Max Width CSS injected into BODY:', messageContainerMaxWidth);
             } else {
                 document.head.appendChild(style);
-                debugLog('[Toolkit] Message Container Max Width CSS injected into HEAD (body not ready):', messageContainerMaxWidth);
+                debugLog('[Core] Message Container Max Width CSS injected into HEAD (body not ready):', messageContainerMaxWidth);
             }
         };
-        
+
         // Inject immediately if possible
         injectMessageContainerMaxWidthCSS();
-        
+
         // Also re-inject after page is fully loaded to ensure we override all stylesheets
         if (document.readyState !== 'complete') {
             window.addEventListener('load', () => {
@@ -873,11 +1058,12 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     }
     
     // Load new layout options from storage
-    const smallProfileImagesEnabled = await storage.get(SMALL_PROFILE_IMAGES_KEY, false);
-    const roundedProfileImagesEnabled = await storage.get(ROUNDED_PROFILE_IMAGES_KEY, false);
-    const swapCheckboxPositionEnabled = await storage.get(SWAP_CHECKBOX_POSITION_KEY, false);
-    const squareMessageEdgesEnabled = await storage.get(SQUARE_MESSAGE_EDGES_KEY, false);
-    
+    // PERFORMANCE: Use values from batched earlySettings read above
+    const smallProfileImagesEnabled = earlySettings[SMALL_PROFILE_IMAGES_KEY];
+    const roundedProfileImagesEnabled = earlySettings[ROUNDED_PROFILE_IMAGES_KEY];
+    const swapCheckboxPositionEnabled = earlySettings[SWAP_CHECKBOX_POSITION_KEY];
+    const squareMessageEdgesEnabled = earlySettings[SQUARE_MESSAGE_EDGES_KEY];
+
     // Inject Small Profile Images CSS early if enabled
     if (smallProfileImagesEnabled) {
         const injectSmallProfileImagesCSS = () => {
@@ -889,27 +1075,27 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 }
                 return;
             }
-            
+
             if (document.getElementById('sai-toolkit-small-profile-images-early')) {
                 return;
             }
-            
+
             const style = document.createElement('style');
             style.id = 'sai-toolkit-small-profile-images-early';
             style.textContent = getSmallProfileImagesCSSEarly();
-            
+
             if (document.head.firstChild) {
                 document.head.insertBefore(style, document.head.firstChild);
             } else {
                 document.head.appendChild(style);
             }
-            
-            debugLog('[Toolkit] Small Profile Images CSS injected EARLY');
+
+            debugLog('[Core] Small Profile Images CSS injected EARLY');
         };
-        
+
         injectSmallProfileImagesCSS();
     }
-    
+
     // Inject Rounded Profile Images CSS early if enabled
     if (roundedProfileImagesEnabled) {
         const injectRoundedProfileImagesCSS = () => {
@@ -936,7 +1122,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Rounded Profile Images CSS injected EARLY');
+            debugLog('[Core] Rounded Profile Images CSS injected EARLY');
         };
         
         injectRoundedProfileImagesCSS();
@@ -968,7 +1154,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 document.head.appendChild(style);
             }
             
-            debugLog('[Toolkit] Swap Checkbox Position CSS injected EARLY');
+            debugLog('[Core] Swap Checkbox Position CSS injected EARLY');
         };
         
         injectSwapCheckboxPositionCSS();
@@ -998,10 +1184,71 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
             // Append to END of head so it overrides Classic Layout's border-radius
             document.head.appendChild(style);
             
-            debugLog('[Toolkit] Square Message Edges CSS injected EARLY');
+            debugLog('[Core] Square Message Edges CSS injected EARLY');
         };
         
         injectSquareMessageEdgesCSS();
+    }
+
+    // Inject Memory Dot CSS early if customized
+    // PERFORMANCE: Use values from batched earlySettings read above
+    const memoryDotEnabled = earlySettings[MEMORY_DOT_ENABLED_KEY];
+    const memoryDotColor = earlySettings[MEMORY_DOT_COLOR_KEY];
+    
+    // Only inject CSS if user has customized the default settings
+    if (!memoryDotEnabled || memoryDotColor !== '#ff3b3b') {
+        const injectMemoryDotCSS = () => {
+            if (!document.head) {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', injectMemoryDotCSS, { once: true });
+                } else {
+                    setTimeout(injectMemoryDotCSS, TIMING.CSS_RETRY_SHORT);
+                }
+                return;
+            }
+            
+            if (document.getElementById('sai-toolkit-memory-dot-early')) {
+                return;
+            }
+            
+            const style = document.createElement('style');
+            style.id = 'sai-toolkit-memory-dot-early';
+            style.textContent = getMemoryDotCSSEarly(memoryDotEnabled, memoryDotColor);
+            
+            if (document.head.firstChild) {
+                document.head.insertBefore(style, document.head.firstChild);
+            } else {
+                document.head.appendChild(style);
+            }
+            
+            debugLog('[Core] Memory Dot CSS injected EARLY - Enabled:', memoryDotEnabled, 'Color:', memoryDotColor);
+        };
+        
+        injectMemoryDotCSS();
+    }
+
+    // -------------------------------------------------------------------------
+    // HIDE CREATOR NAME CSS INJECTION
+    // -------------------------------------------------------------------------
+    const hideCreatorEnabled = earlySettings[HIDE_CREATOR_KEY];
+    if (hideCreatorEnabled) {
+        const injectHideCreatorCSS = () => {
+            if (!document.head) {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', injectHideCreatorCSS, { once: true });
+                } else {
+                    setTimeout(injectHideCreatorCSS, TIMING.CSS_RETRY_SHORT);
+                }
+                return;
+            }
+            if (document.getElementById('sai-toolkit-hide-creator-early')) return;
+            const style = document.createElement('style');
+            style.id = 'sai-toolkit-hide-creator-early';
+            style.textContent = `/* SAI Toolkit - Hide Creator Name */\na[aria-label="creator-profile"], a[href^="/creator/"] { display: none !important; }`;
+            document.head.appendChild(style);
+            debugLog('[Core] Hide Creator CSS injected EARLY');
+        };
+        injectHideCreatorCSS();
     }
 
     // -------------------------------------------------------------------------
@@ -1066,7 +1313,7 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.
             document.head.appendChild(style);
         }
 
-        debugLog('[Toolkit] Mobile Responsive CSS injected EARLY');
+        debugLog('[Core] Mobile Responsive CSS injected EARLY');
     };
 
     injectMobileResponsiveCSS();
@@ -1296,30 +1543,31 @@ div.fixed.inset-0.z-\\[10000\\] > div.bg-white.dark\\:bg-gray-3.rounded-xl [clas
   overflow-y: auto !important;
 }
 
-/* Hide backdrop overlays for sidebar modals only */
-body:has(div.fixed.left-1\\/2.top-1\\/2:not(.size-full)):not(:has(div.fixed.left-1\\/2.top-1\\/2.size-full))
+/* NOTE: All body-state matchers below were originally chained body:has() rules.
+   They were replaced with body classes managed by startSidebarLayoutBodyClassObserver()
+   to avoid catastrophic forced reflows during typing on slower hardware. */
+
+/* Hide backdrop overlays for sidebar modals only (sidebar open, image NOT open) */
+body.sai-mm-sidebar-modal-open:not(.sai-mm-image-modal-open)
 div.fixed.inset-0:not(.z-\\[10000\\]):not(.toolkit-modal-backdrop),
-body:has(div.fixed.left-1\\/2.top-1\\/2:not(.size-full)):not(:has(div.fixed.left-1\\/2.top-1\\/2.size-full))
+body.sai-mm-sidebar-modal-open:not(.sai-mm-image-modal-open)
 [role="presentation"][aria-hidden="true"],
-body:has(div.fixed.left-1\\/2.top-1\\/2:not(.size-full)):not(:has(div.fixed.left-1\\/2.top-1\\/2.size-full))
+body.sai-mm-sidebar-modal-open:not(.sai-mm-image-modal-open)
 [data-overlay][aria-hidden="true"] {
   display: none !important;
 }
 
 /* Show backdrop overlays for image modals (.size-full) */
-body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
-div.fixed.inset-0,
-body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
-[role="presentation"][aria-hidden="true"],
-body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
-[data-overlay][aria-hidden="true"] {
+body.sai-mm-image-modal-open div.fixed.inset-0,
+body.sai-mm-image-modal-open [role="presentation"][aria-hidden="true"],
+body.sai-mm-image-modal-open [data-overlay][aria-hidden="true"] {
   display: block !important;
   backdrop-filter: blur(8px) !important;
   background-color: rgba(0, 0, 0, 0.5) !important;
 }
 
 /* Blur sidebar modals when image modal is open */
-body:has(div.fixed.left-1\\/2.top-1\\/2.size-full)
+body.sai-mm-image-modal-open
 div.fixed.left-1\\/2.top-1\\/2:not(.size-full) {
   filter: blur(4px) !important;
   opacity: 0.7 !important;
@@ -1327,7 +1575,7 @@ div.fixed.left-1\\/2.top-1\\/2:not(.size-full) {
 }
 
 /* Blur sidebar modals when toolkit settings modal is open */
-body:has(#toolkit-modal-root .backdrop)
+body.sai-mm-toolkit-modal-open
 div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container) {
   filter: blur(4px) !important;
   opacity: 0.7 !important;
@@ -1344,7 +1592,7 @@ div[style*="position: absolute"][style*="z-index: 10000000"] {
 
 /* Image modal: center between sidebars when sidebar is present */
 @media (min-width: 1000px) {
-  body:has(div.fixed.left-1\\/2.top-1\\/2:not(.size-full))
+  body.sai-mm-sidebar-modal-open
     div.fixed.left-1\\/2.top-1\\/2.size-full {
     left: 50% !important;
     top: 50% !important;
@@ -1354,7 +1602,7 @@ div[style*="position: absolute"][style*="z-index: 10000000"] {
     margin-right: var(--mm-gutter) !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2:not(.size-full))
+  body.sai-mm-sidebar-modal-open
     button.fixed.top-6.right-lg.z-\\[99999999999\\] {
     right: calc(var(--mm-gutter) + 1.5rem) !important;
   }
@@ -1376,12 +1624,10 @@ div.w-full.flex.mb-lg.bg-transparent.items-center div.relative {
 
 /* ===== Split the sidebar when BOTH modals are open ===== */
 
-/* GENERATION SETTINGS PANEL (TOP 40vh) */
-/* Match both max-h-[600px] and max-h-[700px] variants */
-/* Exclude modals with sai-placeholder-modal class */
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
+/* GENERATION SETTINGS PANEL (TOP 40vh) when BOTH modals open */
+body.sai-mm-gen-settings-open.sai-mm-memories-open
   div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full):not(.size-full):not(.sai-placeholder-modal),
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
+body.sai-mm-gen-settings-open.sai-mm-memories-open
   div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not(.size-full):not(.sai-placeholder-modal) {
   position: fixed !important;
   top: 0 !important;
@@ -1395,10 +1641,8 @@ body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.
   overflow: hidden !important;
 }
 
-/* MEMORY MANAGER PANEL (BOTTOM 60vh) */
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
-  div.fixed.left-1\\/2.top-1\\/2.h-full.max-h-\\[600px\\]:not(.size-full),
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
+/* MEMORY MANAGER PANEL (BOTTOM 60vh) when BOTH modals open */
+body.sai-mm-gen-settings-open.sai-mm-memories-open
   div.fixed.left-1\\/2.top-1\\/2.h-full.max-h-\\[600px\\]:not(.size-full) {
   position: fixed !important;
   top: auto !important;
@@ -1413,7 +1657,7 @@ body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.
 }
 
 /* When only Memory Manager is open */
-body:not(:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full))):not(:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)))
+body:not(.sai-mm-gen-settings-open)
   div.fixed.left-1\\/2.top-1\\/2.h-full.max-h-\\[600px\\]:not([hidden]):not(.hidden):not(.size-full) {
   top: 0 !important;
   bottom: 0 !important;
@@ -1423,9 +1667,9 @@ body:not(:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full))):no
 }
 
 /* When only Generation Settings is open */
-body:not(:has(div.fixed.left-1\\/2.top-1\\/2.h-full))
+body:not(.sai-mm-memories-open)
   div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full):not([hidden]):not(.hidden):not(.size-full),
-body:not(:has(div.fixed.left-1\\/2.top-1\\/2.h-full))
+body:not(.sai-mm-memories-open)
   div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not([hidden]):not(.hidden):not(.size-full) {
   top: 0 !important;
   bottom: 0 !important;
@@ -1462,9 +1706,8 @@ div.fixed.left-1\\/2.top-1\\/2:not(:has(.flex.flex-col.gap-sm.px-lg)) [class*="o
   overflow-y: auto !important;
 }
 
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
-  div.fixed.left-1\\/2.top-1\\/2:not(.size-full) [class*="overflow-y-auto"],
-body:has(div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full)):has(div.fixed.left-1\\/2.top-1\\/2.h-full)
+/* Inner scrollers fill split panels when BOTH modals are open */
+body.sai-mm-gen-settings-open.sai-mm-memories-open
   div.fixed.left-1\\/2.top-1\\/2:not(.size-full) [class*="overflow-y-auto"] {
   height: 100% !important;
   max-height: 100% !important;
@@ -1482,7 +1725,7 @@ div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not(.size-full) {
 /* ===== Chat container / gutter ===== */
 
 @media (min-width: 1000px) {
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     div.sticky.top-0[class*="z-[100]"] {
     width: calc(100vw - var(--mm-gutter) - 220px) !important;
     max-width: calc(100vw - var(--mm-gutter) - 220px) !important;
@@ -1508,22 +1751,22 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
 }
 
 @media (min-width: 1000px) {
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] {
     width: calc(100vw - var(--mm-gutter) - 220px) !important;
     margin-left: 0 !important;
     margin-right: 0 !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
     padding-right: 16px !important;
     max-height: calc(100vh - 56px) !important;
     flex: 1 1 auto !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
-    div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 
+  body.sai-mm-any-center-modal-open
+    div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2
     > div.flex.flex-col.justify-undefined.items-undefined.grow.relative.w-full {
     flex: 1 1 auto !important;
     min-height: 0 !important;
@@ -1532,8 +1775,8 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
     padding-top: 0.5rem !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
-    div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 
+  body.sai-mm-any-center-modal-open
+    div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2
     > div.flex.flex-col.justify-undefined.items-undefined.grow.relative.w-full
     > div.grow.flex.flex-col.w-full.left-0.items-center.absolute.h-full.overflow-auto {
     overflow-y: auto !important;
@@ -1541,30 +1784,30 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
   }
 
   /* OVERRIDE: When left sidebar is collapsed (54px instead of 220px) */
-  body:has(nav[style*="width: 54px"]):has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-nav-collapsed.sai-mm-any-center-modal-open
     div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] {
     width: calc(100vw - var(--mm-gutter) - 54px) !important;
   }
 
   /* OVERRIDE: Header bar when left sidebar is collapsed */
-  body:has(nav[style*="width: 54px"]):has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-nav-collapsed.sai-mm-any-center-modal-open
     div.sticky.top-0[class*="z-[100]"] {
     width: calc(100vw - var(--mm-gutter) - 54px) !important;
     max-width: calc(100vw - var(--mm-gutter) - 54px) !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     .py-md.rounded-\\[20px_4px_20px_20px\\],
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     .py-md.rounded-\\[4px_20px_20px_20px\\],
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     [class*="max-w-\\\\[800px\\\\]"] {
     width: 100% !important;
     max-width: var(--sai-message-max-width, 800px) !important;
     box-sizing: border-box !important;
   }
 
-  body:has(div.fixed.left-1\\/2.top-1\\/2)
+  body.sai-mm-any-center-modal-open
     [class*="max-w-\\\\[800px\\\\]"] {
     max-width: min(var(--sai-message-max-width, 800px), 100%) !important;
   }
@@ -1658,6 +1901,52 @@ span:has(.text-warning) .leading-6 {
     border-radius: 4px !important;
 }
 `;
+    }
+
+    // =============================================================================
+    // CSS GENERATION FUNCTIONS - Memory Dot Customization
+    // =============================================================================
+    // FUNCTION: getMemoryDotCSSEarly()
+    // PURPOSE: Customize the memory limit indicator dot (red dot in chat toolbar)
+    // FEATURE: "Memory Limit Indicator" settings in Style tab
+    // 
+    // WHAT IT DOES:
+    // - Hides the parent container (div.relative) if disabled
+    // - Changes the dot color if custom color is set
+    // 
+    // CSS SELECTORS:
+    // - div.relative[data-testid="ContextCapIndicator"] = Parent container (using data-testid)
+    // - button[data-testid="ContextCapIndicator-Button"] = Memory button (using data-testid)
+    // - Default classes: w-3 h-3 rounded-full cursor-pointer bg-gray-9 border border-gray-11
+    // 
+    // PARAMETERS:
+    // - enabled: boolean - true = show dot (default), false = hide container
+    // - color: string - CSS color value (default: #ff3b3b)
+    // =============================================================================
+    function getMemoryDotCSSEarly(enabled, color) {
+        if (!enabled) {
+            // Hide the parent container of the memory dot entirely
+            return `
+/* Hide Memory Limit Indicator Dot and Parent Container */
+div[data-testid="ContextCapIndicator"] {
+    display: none !important;
+}
+`;
+        }
+        
+        if (color && color !== '#ff3b3b') {
+            // Change the memory dot color
+            return `
+/* Custom Memory Limit Indicator Dot Color */
+button[data-testid="ContextCapIndicator-Button"] {
+    background-color: ${color} !important;
+    border-color: ${color} !important;
+    box-shadow: 0 4px 6px -1px ${color}70, 0 2px 4px -1px ${color}70 !important;
+}
+`;
+        }
+        
+        return ''; // No customization needed
     }
 
     // =============================================================================
@@ -1785,7 +2074,8 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
 div.p-0[style*="width: 100%"] span.leading-6,
 div.p-0[style*="width: 100%"] span.text-white,
 div.bg-gray-2 span.leading-6,
-div.bg-gray-2 span.text-white {
+div.bg-gray-2 span.text-white,
+span.leading-6.mb-\\[10px\\].last\\:mb-0.text-white {
   color: ${values.bodyColor} !important;
   font-size: ${values.fontSize} !important;
   ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.bodyFontWeight} !important;
@@ -1803,7 +2093,9 @@ div.bg-gray-2 span.text-white q.text-white,
 div.bg-gray-2 span.leading-6 q.text-colorQuote,
 div.bg-gray-2 span.leading-6 q.text-white,
 q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900,
-q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300 {
+q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300,
+span.leading-6.mb-\\[10px\\].last\\:mb-0.text-white q,
+span.leading-6.mb-\\[10px\\] q {
   color: ${values.spanQuoteColor} !important;
   ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.spanQuoteFontWeight} !important;
   font-style: ${values.spanQuoteFontStyle} !important;
@@ -1818,7 +2110,9 @@ div.p-0[style*="width: 100%"] .styled,
 div.bg-gray-2 em,
 div.bg-gray-2 i,
 div.bg-gray-2 .narration,
-div.bg-gray-2 .styled { 
+div.bg-gray-2 .styled,
+em.italic.leading-6.text-sky-6,
+em.italic.leading-6.dark\\:text-sky-7 { 
   color: ${values.narrationColor} !important;
   ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.narrationFontWeight} !important;
   font-style: ${values.narrationFontStyle} !important;
@@ -1827,7 +2121,9 @@ div.bg-gray-2 .styled {
 
 /* Highlight Color (blockquote.bg-colorHighlight) */
 div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight,
-div.bg-gray-2 blockquote.bg-colorHighlight {
+div.bg-gray-2 blockquote.bg-colorHighlight,
+blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md,
+blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md.text-black {
   background-color: ${values.highlightBgColor} !important;
   color: ${values.highlightTextColor} !important;
   ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.highlightFontWeight} !important;
@@ -1848,6 +2144,12 @@ div.bg-gray-2 blockquote.bg-colorHighlight {
 /* Button Hover Color */
 ${values.hoverButtonColor ? `button:hover {
   background-color: ${values.hoverButtonColor} !important;
+}` : ''}
+
+/* Creator Link Color */
+${values.creatorLinkColor ? `a[aria-label="creator-profile"] p,
+a[href^="/creator/"] p.text-link {
+  color: ${values.creatorLinkColor} !important;
 }` : ''}
 
 /* Custom Background Image */
@@ -2132,7 +2434,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // =============================================================================
     
     async function initializeMainCode() {
-        debugLog('[Toolkit] DOM ready, initializing main code...');
+        debugLog('[Core] DOM ready, initializing main code...');
         
         // =============================================================================
         // STORAGE CACHE - Reduce redundant storage reads (Issue #13)
@@ -2184,101 +2486,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // =============================================================================
     // ===              AUTH HEADER INTERCEPTOR FOR MEMORY REFRESH              ===
     // =============================================================================
-    
-    // Inject interceptors to capture auth token and headers
-    const authInterceptorScript = document.createElement('script');
-    authInterceptorScript.textContent = `
-        (function() {
-            // Store last seen auth token and headers
-            window.__lastAuthHeaders = {};
-            window.__kindeAccessToken = null;
-            
-            // Intercept XHR to capture Kinde token refresh and API headers
-            const originalXHROpen = XMLHttpRequest.prototype.open;
-            const originalXHRSend = XMLHttpRequest.prototype.send;
-            const originalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-            
-            XMLHttpRequest.prototype.open = function(method, url, ...args) {
-                this._url = url;
-                this._method = method;
-                this._requestHeaders = {};
-                return originalXHROpen.apply(this, [method, url, ...args]);
-            };
-            
-            XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
-                this._requestHeaders = this._requestHeaders || {};
-                this._requestHeaders[header] = value;
-                return originalXHRSetRequestHeader.apply(this, [header, value]);
-            };
-            
-            XMLHttpRequest.prototype.send = function(...args) {
-                // Capture headers from prod.nd-api.com requests
-                if (this._url && this._url.includes('prod.nd-api.com') && this._requestHeaders) {
-                    if (this._requestHeaders.Authorization) window.__lastAuthHeaders.Authorization = this._requestHeaders.Authorization;
-                    if (this._requestHeaders['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = this._requestHeaders['X-Guest-UserId'];
-                    if (this._requestHeaders['X-Country']) window.__lastAuthHeaders['X-Country'] = this._requestHeaders['X-Country'];
-                    if (this._requestHeaders['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = this._requestHeaders['X-App-Id'];
-                }
-                
-                // Listen for Kinde token refresh responses
-                // Use { once: true } to prevent listener accumulation (memory leak fix)
-                if (this._url && this._url.includes('gamma.kinde.com/oauth2/token')) {
-                    this.addEventListener('load', function() {
-                        if (this.status === 200) {
-                            try {
-                                const response = JSON.parse(this.responseText);
-                                if (response.access_token) {
-                                    window.__kindeAccessToken = response.access_token;
-                                    window.__lastAuthHeaders.Authorization = 'Bearer ' + response.access_token;
-                                    debugLog('[S.AI] Captured fresh Kinde access token');
-                                }
-                            } catch (e) {
-                                console.warn('[S.AI] Could not parse Kinde token response:', e);
-                            }
-                        }
-                    }, { once: true });
-                }
-                
-                return originalXHRSend.apply(this, args);
-            };
-            
-            // Also intercept fetch
-            const originalFetch = window.fetch;
-            window.fetch = function(...args) {
-                const [url, options] = args;
-                
-                // Capture auth headers from API calls
-                if (options && options.headers && url.includes('prod.nd-api.com')) {
-                    const headers = options.headers;
-                    if (headers.Authorization) window.__lastAuthHeaders.Authorization = headers.Authorization;
-                    if (headers['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = headers['X-Guest-UserId'];
-                    if (headers['X-Country']) window.__lastAuthHeaders['X-Country'] = headers['X-Country'];
-                    if (headers['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = headers['X-App-Id'];
-                }
-                
-                // Intercept Kinde token refresh
-                if (url.includes('gamma.kinde.com/oauth2/token')) {
-                    return originalFetch.apply(this, args).then(response => {
-                        const clonedResponse = response.clone();
-                        clonedResponse.json().then(data => {
-                            if (data.access_token) {
-                                window.__kindeAccessToken = data.access_token;
-                                window.__lastAuthHeaders.Authorization = 'Bearer ' + data.access_token;
-                                debugLog('[S.AI] Captured fresh Kinde access token (fetch)');
-                            }
-                        }).catch(() => {});
-                        return response;
-                    });
-                }
-                
-                return originalFetch.apply(this, args);
-            };
-            
-            console.log('[S.AI] Auth header interceptor installed (XHR + fetch)');
-        })();
-    `;
-    document.documentElement.appendChild(authInterceptorScript);
-    authInterceptorScript.remove();
+    // NOTE: The auth header interceptor has been moved to page-context.js
+    // It is injected as an external script (CSP-compliant) and runs in page context
+    // where it can intercept XHR/fetch calls to capture auth tokens and headers.
+    // The interceptor stores tokens in window.__kindeAccessToken and 
+    // window.__lastAuthHeaders for use by chat export and memory refresh features.
+    // =============================================================================
 
     // =============================================================================
     // =============================================================================
@@ -2322,10 +2535,43 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let pendingNewMessageCount = 0;
 
     // Helper function to detect if we're in Story Mode
+    // Supports localized URLs: /story/ or /{language}/story/
     function isStoryMode() {
-        return /\/story\//i.test(window.location.pathname);
+        return /\/(?:[a-z]{2}\/)?story\//i.test(window.location.pathname);
     }
     
+    // Build an SVG element from a tag + attribute map, with optional children.
+    // Children entries: ['tag', { attr: value, ... }]. Used for the lucide-style
+    // icons we previously assembled with innerHTML on Button elements.
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    function makeSVG(rootAttrs, children) {
+        const svg = document.createElementNS(SVG_NS, 'svg');
+        for (const [k, v] of Object.entries(rootAttrs)) svg.setAttribute(k, v);
+        if (children) {
+            for (const [tag, attrs] of children) {
+                const node = document.createElementNS(SVG_NS, tag);
+                for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+                svg.appendChild(node);
+            }
+        }
+        return svg;
+    }
+
+    // Parse a static HTML template string into a DocumentFragment, avoiding
+    // .innerHTML assignment (which Mozilla's addons-linter flags). Use this with
+    // element.replaceChildren(parseHTMLToFragment(template)) for static markup.
+    // DOMParser does not execute scripts and is the standard recommended path.
+    function parseHTMLToFragment(html) {
+        const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+        const frag = document.createDocumentFragment();
+        // Move children out of the parsed body into our fragment, adopting them
+        // into the live document so subsequent queries work as expected.
+        while (doc.body.firstChild) {
+            frag.appendChild(document.adoptNode(doc.body.firstChild));
+        }
+        return frag;
+    }
+
     // Helper function to safely set HTML content (sanitizes input)
     function safeSetHTML(element, content) {
         // For simple text content, use textContent
@@ -2346,6 +2592,264 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 element.appendChild(document.createElement('br'));
             }
         });
+    }
+
+    // =============================================================================
+    // ===              AUTO-REGENERATION LOGIC                                 ===
+    // =============================================================================
+    
+    // Track auto-regeneration attempts per message thread
+    // Key = prevId (the message being regenerated), Value = attempt count
+    const autoRegenAttempts = {};
+    
+    // Cached settings for synchronous access
+    window.__autoRegenOnMismatch = false;
+    window.__autoRegenOnShort = false;
+    window.__autoRegenMaxAttempts = 1;
+    
+    // When model override is active, suppress the first mismatch regen (model change is expected)
+    window.__suppressMismatchNext = false;
+    
+    // Track the last known engine to detect mismatches on new messages
+    window.__lastKnownEngine = null;
+    
+    // Flag to prevent re-entrancy during auto-regeneration
+    window.__autoRegenInProgress = false;
+    
+    /**
+     * Click the regenerate button on the last bot message.
+     * The button has aria-label="RefreshCcw-button" and is in the last message's controls.
+     */
+    function clickRegenerateButton() {
+        // Find all message wrappers with the regenerate button
+        const regenButtons = document.querySelectorAll('button[aria-label="RefreshCcw-button"]');
+        if (regenButtons.length === 0) {
+            debugLog('[AutoRegen] No regenerate button found');
+            return false;
+        }
+        // Click the LAST regenerate button (most recent message)
+        const lastRegenBtn = regenButtons[regenButtons.length - 1];
+        debugLog('[AutoRegen] Clicking regenerate button');
+        lastRegenBtn.click();
+        return true;
+    }
+    
+    /**
+     * Check if auto-regeneration should occur and trigger it.
+     * Called when a new bot message is received.
+     * @param {string} prevId - The previous message ID (used to track regen attempts)
+     * @param {string} responseEngine - The engine used for this response
+     * @param {number} responseContentLength - Length of the response content
+     */
+    function checkAndAutoRegenerate(prevId, responseEngine, responseContentLength) {
+        if (window.__autoRegenInProgress) {
+            debugLog('[AutoRegen] Already in progress, skipping');
+            return;
+        }
+        
+        const maxAttempts = window.__autoRegenMaxAttempts || 1;
+        const trackingKey = prevId || 'unknown';
+        const currentAttempts = autoRegenAttempts[trackingKey] || 0;
+        
+        if (currentAttempts >= maxAttempts) {
+            debugLog('[AutoRegen] Max attempts reached for', trackingKey.substring(0, 8), ':', currentAttempts, '/', maxAttempts);
+            // Reset tracking for this message thread
+            delete autoRegenAttempts[trackingKey];
+            window.__autoRegenInProgress = false;
+            return;
+        }
+        
+        let shouldRegen = false;
+        let reason = '';
+        
+        // Check for model mismatch
+        // Require both engines to be non-blank — a blank previous engine means we have no
+        // valid baseline to compare against (e.g. first message, or engine field missing
+        // from a prior response), so we must not regenerate.
+        const hasValidPrevEngine = typeof window.__lastKnownEngine === 'string' && window.__lastKnownEngine.trim() !== '';
+        const hasValidCurrEngine = typeof responseEngine === 'string' && responseEngine.trim() !== '';
+        if (window.__autoRegenOnMismatch && hasValidCurrEngine && hasValidPrevEngine) {
+            // Use the same core model extraction as applyModelChangeIndicators
+            const extractCoreModel = (engineString) => {
+                if (!engineString) return null;
+                const slashIndex = engineString.indexOf('/');
+                if (slashIndex === -1) return engineString.toLowerCase().trim();
+                const afterSlash = engineString.substring(slashIndex + 1);
+                const underscoreIndex = afterSlash.indexOf('_');
+                if (underscoreIndex === -1) return afterSlash.toLowerCase().trim();
+                return afterSlash.substring(0, underscoreIndex).toLowerCase().trim();
+            };
+            
+            const currentCore = extractCoreModel(responseEngine);
+            const previousCore = extractCoreModel(window.__lastKnownEngine);
+            
+            debugLog('[AutoRegen] Mismatch check - current:', currentCore, 'previous:', previousCore);
+            
+            if (currentCore && previousCore && currentCore !== previousCore) {
+                if (window.__suppressMismatchNext) {
+                    window.__suppressMismatchNext = false;
+                    debugLog('[AutoRegen] Mismatch suppressed for this message (model override: change was expected)');
+                } else {
+                    shouldRegen = true;
+                    reason = `model mismatch (${previousCore} → ${currentCore})`;
+                }
+            }
+        }
+        
+        // Check for short response
+        if (!shouldRegen && window.__autoRegenOnShort && responseContentLength !== undefined) {
+            if (responseContentLength < 50) {
+                shouldRegen = true;
+                reason = `short response (${responseContentLength} chars < 50)`;
+            }
+        }
+        
+        if (shouldRegen) {
+            autoRegenAttempts[trackingKey] = currentAttempts + 1;
+            debugLog('[AutoRegen] Triggering auto-regeneration - reason:', reason, '- attempt:', currentAttempts + 1, '/', maxAttempts);
+            
+            window.__autoRegenInProgress = true;
+            
+            // Delay slightly to let the DOM update with the new message before clicking regen
+            setTimeout(() => {
+                const clicked = clickRegenerateButton();
+                if (!clicked) {
+                    debugLog('[AutoRegen] Failed to click regenerate button');
+                    window.__autoRegenInProgress = false;
+                } else {
+                    // Reset the in-progress flag after a reasonable time for the regen to complete
+                    // The next SAI_NEW_MESSAGE will trigger another check if needed
+                    setTimeout(() => {
+                        window.__autoRegenInProgress = false;
+                    }, 2000);
+                }
+            }, 1500);
+        } else {
+            // Successful message (no regen needed) - reset attempt tracking for this thread
+            if (autoRegenAttempts[trackingKey]) {
+                debugLog('[AutoRegen] Message passed checks, resetting attempt counter for', trackingKey.substring(0, 8));
+                delete autoRegenAttempts[trackingKey];
+            }
+            // Update last known engine for future comparisons.
+            // Skip blank/whitespace values so we don't poison the baseline.
+            if (typeof responseEngine === 'string' && responseEngine.trim() !== '') {
+                window.__lastKnownEngine = responseEngine;
+                debugLog('[AutoRegen] Updated lastKnownEngine to:', responseEngine);
+            }
+        }
+    }
+
+    // Helper function to check if model changed from previous message and apply indicator
+    // This function should be called AFTER all stats are populated, as a final pass
+    function applyModelChangeIndicators() {
+        // Check if the feature is enabled
+        if (!window.__highlightModelChanges) {
+            // Feature disabled - remove any existing borders
+            document.querySelectorAll('.generation-stats').forEach(statsDiv => {
+                statsDiv.style.borderRight = '';
+                statsDiv.style.paddingRight = '';
+            });
+            return;
+        }
+        
+        debugLog('[Model Change] Applying model change indicators to all stats divs');
+        
+        // Get all generation-stats divs in document order (chronological)
+        const allStatsDivs = Array.from(document.querySelectorAll('.generation-stats'));
+        debugLog('[Model Change] Found', allStatsDivs.length, 'stats divs');
+        
+        // Extract core model identifier from full engine string
+        // Examples:
+        //   "zai-org/GLM-4.6" → "GLM-4.6"
+        //   "zai-org/GLM-4.6_friendli_dedicated" → "GLM-4.6"
+        //   "anthropic/claude-3-opus" → "claude-3-opus"
+        const extractCoreModel = (engineString) => {
+            if (!engineString) return null;
+            
+            // Find the part between "/" and first "_" (or end if no "_")
+            const slashIndex = engineString.indexOf('/');
+            if (slashIndex === -1) {
+                // No slash, return the whole string
+                return engineString.toLowerCase().trim();
+            }
+            
+            // Get everything after the slash
+            const afterSlash = engineString.substring(slashIndex + 1);
+            
+            // Find the first underscore (if any)
+            const underscoreIndex = afterSlash.indexOf('_');
+            if (underscoreIndex === -1) {
+                // No underscore, return everything after slash
+                return afterSlash.toLowerCase().trim();
+            }
+            
+            // Return the part between slash and underscore
+            return afterSlash.substring(0, underscoreIndex).toLowerCase().trim();
+        };
+        
+        // Extract engine from a stats div's HTML content
+        // The first line contains model info like "glm47-beta → zai-org/glm-4.7"
+        // We need to parse innerHTML since textContent doesn't preserve <br> as newlines
+        const extractEngine = (statsDiv) => {
+            // Get innerHTML and split by <br> to get the first line
+            const html = statsDiv.innerHTML || '';
+            const firstLine = html.split(/<br\s*\/?>/i)[0].trim();
+            
+            debugLog('[Model Change] First line from HTML:', firstLine);
+            
+            // Format is typically: "model → engine" or just timestamp/ID
+            if (firstLine.includes('→')) {
+                const engine = firstLine.split('→')[1].trim();
+                debugLog('[Model Change] Extracted engine:', engine);
+                return engine;
+            }
+            // If no arrow, this might be a timestamp-only stats div, skip it
+            debugLog('[Model Change] No arrow found, returning null');
+            return null;
+        };
+        
+        let prevCoreModel = null;
+        
+        for (let i = 0; i < allStatsDivs.length; i++) {
+            const statsDiv = allStatsDivs[i];
+            const currentEngine = extractEngine(statsDiv);
+            
+            // Skip divs that don't have model info (e.g., timestamp-only user messages)
+            if (!currentEngine) {
+                // Don't update prevCoreModel, just clear any existing border
+                statsDiv.style.borderRight = '';
+                statsDiv.style.paddingRight = '';
+                continue;
+            }
+            
+            // Extract core model identifier for comparison
+            const currentCoreModel = extractCoreModel(currentEngine);
+            
+            debugLog('[Model Change] Stats div', i, '- Engine:', currentEngine, '| Core Model:', currentCoreModel, '| Prev Core:', prevCoreModel);
+            
+            if (prevCoreModel && currentCoreModel !== prevCoreModel) {
+                // Model changed from previous - apply yellow border
+                statsDiv.style.borderRight = '4px solid #fbbf24';
+                statsDiv.style.paddingRight = '8px';
+                debugLog('[Model Change] Applied yellow border to stats div', i, '(', prevCoreModel, '→', currentCoreModel, ')');
+            } else {
+                // Same model or first message - remove border
+                statsDiv.style.borderRight = '';
+                statsDiv.style.paddingRight = '';
+            }
+            
+            // Update prevCoreModel for next iteration
+            prevCoreModel = currentCoreModel;
+            
+            // Track the last engine seen for auto-regeneration mismatch detection
+            window.__lastKnownEngine = currentEngine;
+        }
+    }
+    
+    // Wrapper function that can be called from multiple places
+    function checkAndApplyModelChangeIndicator(statsDiv, currentModel) {
+        // This is now just a stub - the actual work is done by applyModelChangeIndicators()
+        // which runs as a final pass after all stats are inserted
     }
 
     // Build index map from stored message stats (for imported/old messages)
@@ -2400,14 +2904,35 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }
 
     // Load message stats from storage
+    // PERFORMANCE: Cache parsed stats to avoid repeated JSON parsing during batch processing
+    let cachedMessageStats = null;
+    let cachedMessageStatsTime = 0;
+    const STATS_CACHE_TTL = 2000; // 2 seconds - short TTL since stats can change
+    
     async function loadMessageStats() {
+        const now = Date.now();
+        // Use cache if recent (within TTL)
+        if (cachedMessageStats && (now - cachedMessageStatsTime) < STATS_CACHE_TTL) {
+            return cachedMessageStats;
+        }
+        
         const stored = await storage.get(MESSAGE_STATS_KEY, '{}');
-        return JSON.parse(stored);
+        cachedMessageStats = JSON.parse(stored);
+        cachedMessageStatsTime = now;
+        return cachedMessageStats;
+    }
+    
+    // Invalidate stats cache (call after saving)
+    function invalidateStatsCache() {
+        cachedMessageStats = null;
+        cachedMessageStatsTime = 0;
     }
 
     // Save message stats to storage
     async function saveMessageStats(messageStats) {
         await storage.set(MESSAGE_STATS_KEY, JSON.stringify(messageStats));
+        // Invalidate cache after saving
+        invalidateStatsCache();
     }
 
     // Get stats for a specific message ID
@@ -2464,29 +2989,44 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         return null;
     }
     
+    // Helper: Check if current path is a chat page (supports localization: /chat/ or /{language}/chat/)
+    // Supports both formats: /chat/{charId} and /en/chat/{charId}, /fr/chat/{charId}, etc.
+    function isOnChatPage() {
+        const path = window.location.pathname.toLowerCase();
+        // Match both /chat/ and /{2-letter-lang}/chat/ patterns
+        return /^\/([a-z]{2}\/)?chat\//i.test(window.location.pathname) || path.startsWith('/chat/');
+    }
+    
+    // Helper: Get normalized chat URL pattern that supports localization
+    // Returns regex that matches both /chat/ and /{language}/chat/
+    function getChatUrlPattern() {
+        return /^\/([a-z]{2}\/)?chat\//i;
+    }
+    
     // Get current character ID from URL
     function getCurrentCharacterId() {
         // URL structure: 
         // - Chat mode: /chat/{character_id} or /chat/{character_id}/{conversation_id}
+        //             or /{language}/chat/{character_id} (with localization)
         // - Story mode: /story/{character_id}/{conversation_id}
         // Note: URL may have mixed case so use case-insensitive match
         
-        // Try /chat/ pattern first
-        const chatMatch = window.location.pathname.match(/\/chat\/([a-f0-9-]+)/i);
+        // Try /chat/ pattern first (supports optional language prefix: /en/chat/ or /chat/)
+        const chatMatch = window.location.pathname.match(/\/(?:[a-z]{2}\/)?chat\/([a-f0-9-]+)/i);
         if (chatMatch) {
             debugLog('[Stats] getCurrentCharacterId - from /chat/ URL:', chatMatch[1]);
             return chatMatch[1];
         }
         
-        // Try /story/ pattern (Story Mode)
-        const storyMatch = window.location.pathname.match(/\/story\/([a-f0-9-]+)/i);
+        // Try /story/ pattern (Story Mode) - supports optional language prefix
+        const storyMatch = window.location.pathname.match(/\/(?:[a-z]{2}\/)?story\/([a-f0-9-]+)/i);
         if (storyMatch) {
             debugLog('[Stats] getCurrentCharacterId - from /story/ URL:', storyMatch[1]);
             return storyMatch[1];
         }
 
-        // Fallback: Try /chatbot/ pattern if on character profile page
-        const chatbotMatch = window.location.pathname.match(/\/chatbot\/([a-f0-9-]+)/i);
+        // Fallback: Try /chatbot/ pattern if on character profile page - supports optional language prefix
+        const chatbotMatch = window.location.pathname.match(/\/(?:[a-z]{2}\/)?chatbot\/([a-f0-9-]+)/i);
         if (chatbotMatch) {
             debugLog('[Stats] getCurrentCharacterId - from /chatbot/ URL:', chatbotMatch[1]);
             return chatbotMatch[1];
@@ -2499,15 +3039,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Get current conversation ID from URL
     function getCurrentConversationId() {
         // URL structure: /chat/{character_id}/{conversation_id} or /story/{character_id}/{conversation_id}
+        //               or /{language}/chat/{character_id}/{conversation_id} (with localization)
         // If only /chat/{character_id}, conversation_id will be null (defaults to most recent)
         // Note: URL may have /Chat/ or /Story/ (capital letters) so use case-insensitive match
-        const chatMatch = window.location.pathname.match(/\/chat\/[a-f0-9-]+\/([a-f0-9-]+)/i);
+        const chatMatch = window.location.pathname.match(/\/(?:[a-z]{2}\/)?chat\/[a-f0-9-]+\/([a-f0-9-]+)/i);
         if (chatMatch) {
             debugLog('[Stats] getCurrentConversationId - from /chat/ URL:', chatMatch[1]);
             return chatMatch[1];
         }
         
-        const storyMatch = window.location.pathname.match(/\/story\/[a-f0-9-]+\/([a-f0-9-]+)/i);
+        const storyMatch = window.location.pathname.match(/\/(?:[a-z]{2}\/)?story\/[a-f0-9-]+\/([a-f0-9-]+)/i);
         if (storyMatch) {
             debugLog('[Stats] getCurrentConversationId - from /story/ URL:', storyMatch[1]);
             return storyMatch[1];
@@ -2664,8 +3205,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     async function formatDate(date) {
         // Get user preferences for timestamp format
-        const dateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
-        const use24Hour = await storage.get('timestamp24Hour', false); // false = 12-hour (default), true = 24-hour
+        // PERFORMANCE: Use cache if available to avoid storage reads during batch processing
+        const cache = window.__toolkitStorageCache;
+        const dateFirst = cache ? await cache.get('timestampDateFirst', true) : await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
+        const use24Hour = cache ? await cache.get('timestamp24Hour', false) : await storage.get('timestamp24Hour', false); // false = 12-hour (default), true = 24-hour
         
         // Use locale-aware formatting for date and time
         // This respects the browser's language/region settings
@@ -2758,7 +3301,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             const modal = findGenerationSettingsModal();
             
             if (!modal) {
-                debugLog('[Toolkit] Generation Settings modal not found in getCurrentSettings');
+                debugLog('[Core] Generation Settings modal not found in getCurrentSettings');
                 return null;
             }
 
@@ -2806,14 +3349,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     }
                 }
             } catch (modelError) {
-                console.error('[Toolkit] Error extracting model name:', modelError);
+                console.error('[Core] Error extracting model name:', modelError);
                 model = 'Unknown';
             }
 
             // Get slider values (excluding max tokens - not saved in profiles)
             const sliders = modal.querySelectorAll('input[type="range"]');
             if (!sliders || sliders.length < 4) {
-                console.error('[Toolkit] Expected 4 sliders, found:', sliders ? sliders.length : 0);
+                console.error('[Core] Expected 4 sliders, found:', sliders ? sliders.length : 0);
                 return null;
             }
             
@@ -2828,7 +3371,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
             return settings;
         } catch (error) {
-            console.error('[Toolkit] Error in getCurrentSettings:', error);
+            console.error('[Core] Error in getCurrentSettings:', error);
             return null;
         }
     }
@@ -2900,7 +3443,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     messageTimestamps[msg.id] = msg.createdAt;
                 }
             }
-            debugLog('[Toolkit] Built messageTimestamps map with', Object.keys(messageTimestamps).length, 'entries');
+            debugLog('[Core] Built messageTimestamps map with', Object.keys(messageTimestamps).length, 'entries');
             
             // =================================================================
             // BUILD PREV_ID TO MESSAGE_IDS MAP (For regeneration detection)
@@ -2917,7 +3460,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     }
                 }
             }
-            debugLog('[Toolkit] Built prevIdToMessageIds map with', Object.keys(prevIdToMessageIds).length, 'entries');
+            debugLog('[Core] Built prevIdToMessageIds map with', Object.keys(prevIdToMessageIds).length, 'entries');
             
             // =================================================================
             // BUILD ALTERNATIVE MESSAGE GROUPS FOR REGENERATION TRACKING
@@ -2928,7 +3471,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             alternativeMessageGroups = {};
             
             // DEBUG: Log raw message data to see if is_alternative is being captured
-            debugLog('[Toolkit] Raw bot messages for alternative check:', botMessages.map(m => ({
+            debugLog('[Core] Raw bot messages for alternative check:', botMessages.map(m => ({
                 id: m.id?.substring(0, 8),
                 is_alternative: m.is_alternative,
                 prev_id: m.prev_id?.substring(0, 8)
@@ -2936,7 +3479,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             // First, find all messages that are alternatives (regenerations)
             const alternativeMessages = botMessages.filter(msg => msg.is_alternative && msg.prev_id);
-            debugLog('[Toolkit] Found', alternativeMessages.length, 'messages with is_alternative=true');
+            debugLog('[Core] Found', alternativeMessages.length, 'messages with is_alternative=true');
             debugLog('[Stats] Found', alternativeMessages.length, 'alternative messages');
             
             // Group by prev_id and include ALL messages with that prev_id (including v1)
@@ -2960,15 +3503,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }
             
             // Always log alternative groups for debugging regeneration switching
-            debugLog('[Toolkit] Built', Object.keys(alternativeMessageGroups).length, 'alternative message groups');
+            debugLog('[Core] Built', Object.keys(alternativeMessageGroups).length, 'alternative message groups');
             for (const [prevId, alts] of Object.entries(alternativeMessageGroups)) {
-                debugLog('[Toolkit] Group prev_id=' + prevId.substring(0, 8) + ':', alts.map((m, i) => `v${i+1}=${m.id.substring(0, 8)} (${new Date(m.createdAt).toLocaleTimeString()})`));
+                debugLog('[Core] Group prev_id=' + prevId.substring(0, 8) + ':', alts.map((m, i) => `v${i+1}=${m.id.substring(0, 8)} (${new Date(m.createdAt).toLocaleTimeString()})`));
             }
             
             // Also log what timestamp the prev_id (parent) message has
             for (const prevId of Object.keys(alternativeMessageGroups)) {
                 const parentTimestamp = messageTimestamps[prevId];
-                debugLog('[Toolkit] Parent message', prevId.substring(0, 8), 'timestamp:', parentTimestamp, '→', parentTimestamp ? new Date(parentTimestamp).toLocaleTimeString() : 'not found');
+                debugLog('[Core] Parent message', prevId.substring(0, 8), 'timestamp:', parentTimestamp, '→', parentTimestamp ? new Date(parentTimestamp).toLocaleTimeString() : 'not found');
             }
             
             // =================================================================
@@ -3009,7 +3552,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         const group = alternativeMessageGroups[msg.prev_id];
                         if (group && group.length > 0) {
                             messageIdToIndexMap[combinedIndex] = group[0].id;
-                            debugLog('[Toolkit] Combined index', combinedIndex, '→', group[0].id.substring(0, 8), '(v1 of alternative group, bot)');
+                            debugLog('[Core] Combined index', combinedIndex, '→', group[0].id.substring(0, 8), '(v1 of alternative group, bot)');
                             combinedIndex++;
                             botOnlyIndex++;
                         }
@@ -3029,8 +3572,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }
             
-            debugLog('[Toolkit] Built combined index map with', Object.keys(messageIdToIndexMap).length, 'entries');
-            debugLog('[Toolkit] (Bot messages:', botOnlyIndex, ', User messages:', userOnlyIndex, ')');
+            debugLog('[Core] Built combined index map with', Object.keys(messageIdToIndexMap).length, 'entries');
+            debugLog('[Core] (Bot messages:', botOnlyIndex, ', User messages:', userOnlyIndex, ')');
             if (DEBUG_MODE) {
                 debugLog('[Stats MESSAGES_LOADED] First 5 combined mappings:', Object.keys(messageIdToIndexMap).slice(0, 5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
                 debugLog('[Stats MESSAGES_LOADED] Last 5 combined mappings:', Object.keys(messageIdToIndexMap).slice(-5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
@@ -3078,6 +3621,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         // Add role if missing (but don't overwrite model!)
                         existingStats.role = 'bot';
                         await storeStatsForMessage(msg.id, existingStats, conversationId);
+                    } else if (existingStats.role === 'user') {
+                        // Recovery for records corrupted by the prevId-write bug:
+                        // this message is in botMessages (we're inside the bot loop),
+                        // but the stored record claims role:'user'. That can only
+                        // happen via the old auto-regen prevId path. Reset to a clean
+                        // bot record. If the GET response carries inference data, we
+                        // get full repair; otherwise role-only repair, which still
+                        // routes the display through the correct code branches.
+                        debugLog('[Stats MESSAGES_LOADED] Repairing corrupted user-marker on bot message:', msg.id.substring(0, 8));
+                        const repaired = {
+                            role: 'bot',
+                            model: msg.inference_model || null,
+                            settings: msg.inference_settings || null
+                        };
+                        await storeStatsForMessage(msg.id, repaired, conversationId);
                     } else {
                         debugLog('[Stats MESSAGES_LOADED] Existing stats preserved - no update');
                         // Existing stats preserved - no update needed
@@ -3113,7 +3671,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         if (event.data.type === 'SAI_NEW_MESSAGE') {
             debugLog('[Stats] Received SAI_NEW_MESSAGE from page context');
-            const { messageId, conversationId, model, settings, createdAt, role, isAlternative, prevId } = event.data;
+            const { messageId, conversationId, model, settings, createdAt, role, isAlternative, isRegenerationRequested, altMessageId, prevId, responseContentLength, responseEngine } = event.data;
             
             debugLog('[Stats CONTENT] ========== RECEIVED SAI_NEW_MESSAGE ==========');
             debugLog('[Stats CONTENT] Message ID:', messageId);
@@ -3123,6 +3681,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Stats CONTENT] createdAt as Date:', createdAt ? new Date(createdAt).toISOString() : 'null');
             debugLog('[Stats CONTENT] Is alternative (from API):', isAlternative);
             debugLog('[Stats CONTENT] Previous message ID:', prevId);
+            debugLog('[Stats CONTENT] Response content length:', responseContentLength);
+            debugLog('[Stats CONTENT] Response engine:', responseEngine);
             debugLog('[Stats CONTENT] ==============================================');
             
             // Store/update the conversation ID
@@ -3136,17 +3696,26 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 debugLog('[Stats] Added to messageTimestamps:', messageId.substring(0, 8), '→', createdAt);
             }
             
-            // Track prevId → messageId relationships to detect regenerations
-            // A regeneration is when we see a new message with a prevId that already has messages
-            let isRegenerationDetected = false;
+            // Track prevId → messageId relationships to detect regenerations.
+            // The request-side signal `isRegenerationRequested` (continue_chat:true
+            // or alt_message_id present in the POST body) is authoritative — it
+            // catches regens on the very first one of a session, before the
+            // session-state heuristic below has any siblings to compare against.
+            // The heuristic still runs as a fallback for events that arrive
+            // without the request-side flag (e.g. older builds, non-XHR paths).
+            let isRegenerationDetected = isRegenerationRequested === true || !!altMessageId;
+            if (isRegenerationDetected) {
+                debugLog('[Stats] Regeneration flagged from request payload (continue_chat or alt_message_id)');
+            }
             if (prevId && messageId) {
                 if (!prevIdToMessageIds[prevId]) {
                     prevIdToMessageIds[prevId] = [];
                 }
-                // Check if we already have other messages with this prevId (meaning this is a regeneration)
-                if (prevIdToMessageIds[prevId].length > 0 && !prevIdToMessageIds[prevId].includes(messageId)) {
+                // Heuristic fallback: if we already have other messages with this
+                // prevId in this session, treat as regen even without the flag.
+                if (!isRegenerationDetected && prevIdToMessageIds[prevId].length > 0 && !prevIdToMessageIds[prevId].includes(messageId)) {
                     isRegenerationDetected = true;
-                    debugLog('[Stats] Detected regeneration: prevId', prevId.substring(0, 8), 'already has messages:', prevIdToMessageIds[prevId].map(id => id.substring(0, 8)));
+                    debugLog('[Stats] Detected regeneration via session heuristic: prevId', prevId.substring(0, 8), 'already has messages:', prevIdToMessageIds[prevId].map(id => id.substring(0, 8)));
                 }
                 // Add this message to the tracking
                 if (!prevIdToMessageIds[prevId].includes(messageId)) {
@@ -3158,27 +3727,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if ((isAlternative || isRegenerationDetected) && prevId && messageId) {
                 debugLog('[Stats] Updating alternativeMessageGroups for regenerated message');
                 if (!alternativeMessageGroups[prevId]) {
-                    // First time seeing this prev_id in this session
-                    // The original message (prev_id) should be v1
-                    // We may not have its createdAt, but we know it exists
+                    // First time seeing this prev_id in this session.
+                    //
+                    // BUGFIX: prev_id points at the user message that triggered this
+                    // turn — NOT at the v1 bot reply. The v1 bot's message ID is the
+                    // sibling that arrived earlier this session with the same prev_id.
+                    // We can recover it from prevIdToMessageIds[prevId], which holds
+                    // every messageId we've seen against that prev_id (including the
+                    // current regen we just pushed at line ~3572). v1 is anything in
+                    // that list other than the current messageId.
                     alternativeMessageGroups[prevId] = [];
-                    
-                    // Try to get the original message's timestamp from our map
-                    const originalTimestamp = messageTimestamps[prevId];
-                    if (originalTimestamp) {
+                    const siblingIds = (prevIdToMessageIds[prevId] || []).filter(id => id !== messageId);
+                    for (const siblingId of siblingIds) {
+                        const siblingTimestamp = messageTimestamps[siblingId];
                         alternativeMessageGroups[prevId].push({
-                            id: prevId,
-                            createdAt: typeof originalTimestamp === 'string' ? new Date(originalTimestamp).getTime() : originalTimestamp
+                            id: siblingId,
+                            createdAt: typeof siblingTimestamp === 'string'
+                                ? new Date(siblingTimestamp).getTime()
+                                : (siblingTimestamp || 0)
                         });
-                        debugLog('[Stats] Added original message (v1) to group:', prevId.substring(0, 8));
-                    } else {
-                        // We don't have the original's timestamp, but we know it's older
-                        // Use a timestamp of 0 to ensure it sorts first
-                        alternativeMessageGroups[prevId].push({
-                            id: prevId,
-                            createdAt: 0
-                        });
-                        debugLog('[Stats] Added original message (v1) with placeholder timestamp:', prevId.substring(0, 8));
+                        debugLog('[Stats] Seeded alternative group with sibling bot message:', siblingId.substring(0, 8));
+                    }
+                    if (siblingIds.length === 0) {
+                        // No siblings tracked yet (e.g. v1 came from a cold page load
+                        // before our interceptor was attached, or a build that didn't
+                        // record it). MESSAGES_LOADED will repair this on next reload;
+                        // for now leave the group with only the new alternative below.
+                        debugLog('[Stats] No prior bot siblings in prevIdToMessageIds for prev_id:', prevId.substring(0, 8), '— v1 will be filled by MESSAGES_LOADED');
                     }
                 }
                 // Add this message to the group if not already present
@@ -3230,7 +3805,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
                 // If this is a bot message and we have prevId, store the user message too
                 // The prevId is the user message ID, and we have its timestamp from SAI_USER_MESSAGE_SENT
-                if ((role === 'bot' || !role) && prevId && lastUserMessageTimestamp) {
+                //
+                // IMPORTANT: skip this when isRegenerationDetected. In a regeneration the
+                // prevId points at the *previous bot message*, not the user message before
+                // it — so writing { role: 'user' } here would overwrite that bot's stats
+                // record (model, settings, timestamp) with a user marker. Auto-regen flows
+                // can leave lastUserMessageTimestamp populated across the regen, which
+                // historically masked this distinction and corrupted records.
+                if ((role === 'bot' || !role) && prevId && lastUserMessageTimestamp && !isRegenerationDetected) {
                     debugLog('[Stats] Bot message has prevId - storing user message:', prevId.substring(0, 8));
 
                     // Store the user message timestamp in messageTimestamps
@@ -3281,6 +3863,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         const newIndex = currentMaxIndex + 1;
                         messageIdToIndexMap[newIndex] = messageId;
                         debugLog('[Stats SAVE] Added message to index map at index:', newIndex, 'messageId:', messageId);
+                    }
+                    
+                    // Check if auto-regeneration should be triggered
+                    if (window.__autoRegenOnMismatch || window.__autoRegenOnShort) {
+                        checkAndAutoRegenerate(prevId, responseEngine, responseContentLength);
+                    } else {
+                        // If auto-regen is off, still update lastKnownEngine for future use
+                        if (typeof responseEngine === 'string' && responseEngine.trim() !== '') {
+                            window.__lastKnownEngine = responseEngine;
+                        }
                     }
                 } else {
                     // User message - use processMessagesForStats
@@ -3416,10 +4008,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         titleUpdateRetries = 0;
         
         // Extract character name from existing title
-        // Format: "Chat with {name} on Spicychat" -> "{name}"
+        // Format: "Chat with {name} - AI Sex Chatbot | Spicychat" -> "{name}"
         // Also handle already-shortened format: just "{name}" or "{name} (label)"
         let characterName = null;
-        const fullTitleMatch = document.title.match(/^Chat with (.+) on Spicychat$/);
+        const fullTitleMatch = document.title.match(/^Chat with (.+) - AI Sex Chatbot \| Spicychat$/);
         const shortTitleMatch = document.title.match(/^([^(]+?)(?:\s*\([^)]+\))?$/);
         
         if (fullTitleMatch) {
@@ -3494,7 +4086,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         try {
             // Validate slider is still in DOM and value is a number
             if (!slider.isConnected || typeof value !== 'number') {
-                console.error('[Toolkit] Invalid slider state or value:', { connected: slider.isConnected, value });
+                console.error('[Core] Invalid slider state or value:', { connected: slider.isConnected, value });
                 return false;
             }
             
@@ -3515,7 +4107,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             return true;
         } catch (error) {
-            console.error('[Toolkit] Error updating slider:', error);
+            console.error('[Core] Error updating slider:', error);
             return false;
         }
     }
@@ -3543,7 +4135,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 return;
             }
             if (!callback || typeof callback !== 'function') {
-                console.error('[Toolkit] changeModel: Invalid callback provided');
+                console.error('[Core] changeModel: Invalid callback provided');
                 return;
             }
             
@@ -3570,16 +4162,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 return;
             }
         } catch (error) {
-            console.error('[Toolkit] Error in changeModel (initial checks):', error);
+            console.error('[Core] Error in changeModel (initial checks):', error);
             callback(false, `Error: ${error.message}`);
             return;
         }
         
+        // A model change is intentional — suppress the first mismatch regen for this message
+        window.__suppressMismatchNext = true;
+        debugLog('[Model] Model change initiated; suppressing next mismatch auto-regen');
+
         // Click the button
         try {
             changeModelBtn.click();
         } catch (error) {
-            console.error('[Toolkit] Error clicking Change Model button:', error);
+            console.error('[Core] Error clicking Change Model button:', error);
             callback(false, `Error clicking button: ${error.message}`);
             return;
         }
@@ -3617,7 +4213,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                         );
                         if (closeBtn) closeBtn.click();
                     } catch (closeError) {
-                        console.error('[Toolkit] Error closing modal:', closeError);
+                        console.error('[Core] Error closing modal:', closeError);
                     }
                     callback(false, `Model "${modelName}" not found in list`);
                     return;
@@ -3654,7 +4250,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                     callback(false, '"Set Model" button not found');
                                 }
                             } catch (error) {
-                                console.error('[Toolkit] Error clicking Set Model button:', error);
+                                console.error('[Core] Error clicking Set Model button:', error);
                                 callback(false, `Error confirming model: ${error.message}`);
                             }
                         }, TIMING.MODAL_CONFIRM_DELAY);
@@ -3665,12 +4261,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         }, 500);
                     }
                 } catch (clickError) {
-                    console.error('[Toolkit] Error clicking model option:', clickError);
+                    console.error('[Core] Error clicking model option:', clickError);
                     callback(false, `Error selecting model: ${clickError.message}`);
                     return;
                 }
             } catch (error) {
-                console.error('[Toolkit] Error in model selection modal handling:', error);
+                console.error('[Core] Error in model selection modal handling:', error);
                 callback(false, `Error: ${error.message}`);
                 return;
             }
@@ -3682,7 +4278,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         try {
             // Validate settings object
             if (!settings || typeof settings !== 'object') {
-                console.error('[Toolkit] Invalid settings object provided to applySettings');
+                console.error('[Core] Invalid settings object provided to applySettings');
                 return false;
             }
             
@@ -3690,13 +4286,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             const modal = findGenerationSettingsModal();
             
             if (!modal) {
-                debugLog('[Toolkit] Generation Settings modal not found in applySettings');
+                debugLog('[Core] Generation Settings modal not found in applySettings');
                 return false;
             }
 
             const sliders = modal.querySelectorAll('input[type="range"]');
             if (!sliders || sliders.length === 0) {
-                console.error('[Toolkit] No sliders found in Generation Settings modal');
+                console.error('[Core] No sliders found in Generation Settings modal');
                 return false;
             }
             
@@ -3720,6 +4316,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 try {
                     const currentSettings = await getCurrentSettings();
                     if (currentSettings && currentSettings.model !== settings.model) {
+                        // Model will change — suppress the first mismatch auto-regen
+                        window.__suppressMismatchNext = true;
                         changeModel(settings.model, (success, message) => {
                             if (success) {
                                 showNotification(`✓ Profile loaded with model: ${settings.model}`);
@@ -3730,14 +4328,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         return true;
                     }
                 } catch (modelError) {
-                    console.error('[Toolkit] Error changing model:', modelError);
+                    console.error('[Core] Error changing model:', modelError);
                     showNotification(`⚠️ Settings loaded but model change failed`, true);
                 }
             }
 
             return true;
         } catch (error) {
-            console.error('[Toolkit] Error in applySettings:', error);
+            console.error('[Core] Error in applySettings:', error);
             return false;
         }
     }
@@ -3969,8 +4567,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const profiles = await loadProfiles();
         
         // Clear and rebuild
-        select.innerHTML = '';
-        
+        select.replaceChildren();
+
         const defaultOption = document.createElement('option');
         defaultOption.value = '';
         defaultOption.textContent = '-- Select Profile --';
@@ -4103,10 +4701,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let sidebarUserEnabled = false; // Tracks user's actual preference (persisted to storage)
     
     // Check if current page should have sidebar layout disabled
+    // Supports localized URLs: /{language}/lorebook, /{language}/chatbot/edit, /{language}/group
     function isNonChatPageForSidebar() {
-        return window.location.pathname.startsWith('/lorebook') ||
-               window.location.pathname.startsWith('/chatbot/') ||
-               window.location.pathname.startsWith('/group');
+        return /^\/(([a-z]{2}\/)?)(lorebook|chatbot\/edit|create|group)/i.test(window.location.pathname);
     }
     
     // Apply or remove sidebar layout CSS
@@ -4134,15 +4731,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }
             sidebarStyleElement.disabled = false;
+            // Body-class observer drives the new class-based selectors; start it
+            // here in addition to the early-inject path so runtime toggles also
+            // light up the layout correctly.
+            if (typeof startSidebarLayoutBodyClassObserver === 'function') {
+                startSidebarLayoutBodyClassObserver();
+            }
         } else {
             if (!sidebarStyleElement) {
                 // Check if early-injected element exists
-                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') || 
+                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') ||
                                       document.getElementById('sai-toolkit-sidebar-layout');
             }
             if (sidebarStyleElement) {
                 // Don't remove the element, just disable it to avoid React re-render issues
                 sidebarStyleElement.disabled = true;
+            }
+            if (typeof stopSidebarLayoutBodyClassObserver === 'function') {
+                stopSidebarLayoutBodyClassObserver();
             }
         }
         if (saveToStorage) {
@@ -4159,13 +4765,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (sidebarUserEnabled) {
             if (shouldDisable && !sidebarAutoDisabled) {
                 // Page is too narrow - temporarily disable sidebar CSS
-                debugLog(`[Toolkit] Page width (${pageWidth}px) below ${sidebarMinWidth}px - auto-disabling sidebar layout`);
+                debugLog(`[Core] Page width (${pageWidth}px) below ${sidebarMinWidth}px - auto-disabling sidebar layout`);
                 sidebarAutoDisabled = true;
                 toggleSidebarLayout(false, false); // Don't save to storage
                 showNotification('Sidebar layout disabled (window too narrow)');
             } else if (!shouldDisable && sidebarAutoDisabled) {
                 // Page is wide enough again - re-enable sidebar CSS
-                debugLog(`[Toolkit] Page width (${pageWidth}px) above ${sidebarMinWidth}px - re-enabling sidebar layout`);
+                debugLog(`[Core] Page width (${pageWidth}px) above ${sidebarMinWidth}px - re-enabling sidebar layout`);
                 sidebarAutoDisabled = false;
                 toggleSidebarLayout(true, false); // Don't save to storage
                 showNotification('Sidebar layout restored');
@@ -4317,7 +4923,62 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     }
     
     let compactGenerationObserver = null;
-    
+
+    // Watch the Generation Settings modal for model name changes caused by SpicyChat's own
+    // presets/profiles. When the displayed model changes, suppress the next mismatch regen.
+    let _lastObservedModalModel = null;
+    let _modelNameObserver = null;
+
+    function checkGenerationSettingsModelChange() {
+        const modal = findGenerationSettingsModal();
+        if (!modal) {
+            _lastObservedModalModel = null;
+            return;
+        }
+        // Read current model name using the same logic as getCurrentSettings
+        let currentModel = null;
+        const labels = modal.querySelectorAll('p.text-label-lg');
+        const inferenceLabel = Array.from(labels).find(p => p.textContent && p.textContent.trim() === 'Inference Model');
+        if (inferenceLabel && inferenceLabel.parentElement) {
+            const nameEl = inferenceLabel.parentElement.querySelector('p.text-label-lg.font-regular.text-gray-12');
+            if (nameEl && nameEl.textContent) currentModel = nameEl.textContent.trim();
+        }
+        if (!currentModel) {
+            const el = modal.querySelector('.text-\\[14px\\].font-medium');
+            if (el && el.textContent) currentModel = el.textContent.trim();
+        }
+        if (!currentModel) return;
+
+        if (_lastObservedModalModel !== null && _lastObservedModalModel !== currentModel) {
+            window.__suppressMismatchNext = true;
+            debugLog('[Model] Generation Settings model name changed (', _lastObservedModalModel, '→', currentModel, ') — suppressing next mismatch auto-regen');
+        }
+        _lastObservedModalModel = currentModel;
+    }
+
+    function startGenerationSettingsModelWatcher() {
+        if (_modelNameObserver) return; // already running
+        // Perf: only re-run the model check when a fixed-position modal is added/removed
+        // anywhere in the tree. Subtree childList still fires, but characterData (which
+        // fires on every streaming-message text node update) is no longer observed.
+        _modelNameObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
+                const nodes = [...m.addedNodes, ...m.removedNodes];
+                for (const n of nodes) {
+                    if (n.nodeType !== 1) continue;
+                    if (n.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]') ||
+                        n.querySelector?.('p.text-heading-6')) {
+                        checkGenerationSettingsModelChange();
+                        return;
+                    }
+                }
+            }
+        });
+        _modelNameObserver.observe(document.body, { childList: true, subtree: true });
+        debugLog('[Model] Generation Settings model-name watcher started');
+    }
+
     // Function to mark Generation Settings modal with data attribute
     function markGenerationSettingsModal() {
         // Find all fixed modals
@@ -4363,8 +5024,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 markGenerationSettingsModal();
                 
                 // Observer to detect when modal appears
+                // Perf: only re-scan when a node is added/removed that could be a modal
                 compactGenerationObserver = new MutationObserver((mutations) => {
-                    markGenerationSettingsModal();
+                    for (const m of mutations) {
+                        if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
+                        const nodes = [...m.addedNodes, ...m.removedNodes];
+                        for (const n of nodes) {
+                            if (n.nodeType !== 1) continue;
+                            if (n.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]') ||
+                                n.querySelector?.('p.text-heading-6')) {
+                                markGenerationSettingsModal();
+                                return;
+                            }
+                        }
+                    }
                 });
                 
                 compactGenerationObserver.observe(document.body, {
@@ -4498,15 +5171,40 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             checkHideForYouPage();
             
             if (!hideForYouUrlObserver) {
+                // Perf: a MutationObserver on document.body fires constantly during
+                // streaming. URL changes are driven by history.pushState/popstate, so
+                // listen for those directly and skip scanning every DOM mutation.
                 let lastUrl = window.location.href;
-                hideForYouUrlObserver = new MutationObserver(() => {
+                const onUrlMaybeChanged = () => {
                     const currentUrl = window.location.href;
                     if (currentUrl !== lastUrl) {
                         lastUrl = currentUrl;
                         setTimeout(checkHideForYouPage, 100);
                     }
-                });
-                hideForYouUrlObserver.observe(document.body, { childList: true, subtree: true });
+                };
+                hideForYouUrlObserver = {
+                    _onPop: onUrlMaybeChanged,
+                    _origPush: history.pushState,
+                    _origReplace: history.replaceState,
+                    disconnect() {
+                        window.removeEventListener('popstate', this._onPop);
+                        if (history.pushState === this._patchedPush) history.pushState = this._origPush;
+                        if (history.replaceState === this._patchedReplace) history.replaceState = this._origReplace;
+                    }
+                };
+                window.addEventListener('popstate', onUrlMaybeChanged);
+                hideForYouUrlObserver._patchedPush = function(...args) {
+                    const r = hideForYouUrlObserver._origPush.apply(this, args);
+                    onUrlMaybeChanged();
+                    return r;
+                };
+                hideForYouUrlObserver._patchedReplace = function(...args) {
+                    const r = hideForYouUrlObserver._origReplace.apply(this, args);
+                    onUrlMaybeChanged();
+                    return r;
+                };
+                history.pushState = hideForYouUrlObserver._patchedPush;
+                history.replaceState = hideForYouUrlObserver._patchedReplace;
             }
         } else {
             stopHideForYou();
@@ -4873,6 +5571,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             color: rgb(156, 163, 175);
             pointer-events: none;
         }
+        
+        /* When WYSIWYG is active inside a grid container (message editing), */
+        /* hide the auto-sizing ghost span that creates blank space above/below */
+        .grid:has(.sai-wysiwyg-editor) > span.invisible {
+            display: none !important;
+        }
     `;
     
     let wysiwygStyleElement = null;
@@ -4908,10 +5612,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     function parseFormattedText(text) {
         if (!text) return '';
         
-        // All opening quote characters
-        const OPENING_QUOTES = ['"', '"', '„', '‟'];
-        // All closing quote characters  
-        const CLOSING_QUOTES = ['"', '"', '"'];
+        // All opening quote characters using explicit Unicode to avoid encoding issues
+        // \u201C = " (left double quotation mark) - iOS smart quote opening
+        // \u201E = „ (double low-9 quotation mark)
+        // \u201F = ‟ (double high-reversed-9 quotation mark)
+        // \u0022 = " (straight double quote)
+        const OPENING_QUOTES = ['\u201C', '\u201E', '\u201F', '\u0022'];
+        
+        // All closing quote characters using explicit Unicode
+        // \u201D = " (right double quotation mark) - iOS smart quote closing
+        // \u0022 = " (straight double quote)
+        const CLOSING_QUOTES = ['\u201D', '\u0022'];
+        
         // Check if char is any opening quote
         const isOpeningQuote = (char) => OPENING_QUOTES.includes(char);
         // Check if char is any closing quote
@@ -4987,6 +5699,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const result = [];
         let i = 0;
         const len = text.length;
+        
+        // Check if text contains any quote character
+        const hasQuotes = OPENING_QUOTES.some(q => text.includes(q)) || CLOSING_QUOTES.some(q => text.includes(q));
+        if (hasQuotes) {
+            debugLog('[WYSIWYG-Text] parseFormattedText - text contains quotes');
+            debugLog('[WYSIWYG-Text] Text:', text);
+            debugLog('[WYSIWYG-Text] Text char codes:', Array.from(text).map(c => c.charCodeAt(0)));
+            debugLog('[WYSIWYG-Text] Opening quotes:', OPENING_QUOTES);
+            debugLog('[WYSIWYG-Text] Opening quotes char codes:', OPENING_QUOTES.map(c => c.charCodeAt(0)));
+            debugLog('[WYSIWYG-Text] Closing quotes:', CLOSING_QUOTES);
+            debugLog('[WYSIWYG-Text] Closing quotes char codes:', CLOSING_QUOTES.map(c => c.charCodeAt(0)));
+        }
         
         while (i < len) {
             const char = text[i];
@@ -5064,10 +5788,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (isOpeningQuote(char)) {
                 const endIdx = findClosingQuote(text, i + 1);
                 
+                debugLog('[WYSIWYG-Text] Found opening quote:', char, 'at position', i);
+                debugLog('[WYSIWYG-Text] Looking for closing quote from position', i + 1);
+                debugLog('[WYSIWYG-Text] Found closing quote at:', endIdx);
+                
                 if (endIdx !== -1) {
                     // Found closing quote
                     const content = text.substring(i + 1, endIdx);
                     const actualCloseQuote = text[endIdx];
+                    
+                    debugLog('[WYSIWYG-Text] Creating dialogue span with content:', content);
+                    
                     result.push('<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + actualCloseQuote + '</span>');
                     i = endIdx + 1;
                     continue;
@@ -5102,8 +5833,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
      * to avoid breaking React's DOM reconciliation which causes crashes on hover/tooltips
      */
     function setupWysiwygOverlay(textarea) {
+        debugLog('[WYSIWYG] setupWysiwygOverlay called - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
         // Skip if already set up
-        if (textarea.dataset.wysiwygSetup === 'true') return;
+        if (textarea.dataset.wysiwygSetup === 'true') {
+            debugLog('[WYSIWYG] setupWysiwygOverlay SKIPPED - already setup');
+            return;
+        }
         
         // EXCLUDE textareas inside modals/dialogs - these should not get WYSIWYG
         // Modals typically have role="dialog" or are inside elements with certain classes
@@ -5183,6 +5918,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         textarea.dataset.wysiwygSetup = 'true';
+        debugLog('[WYSIWYG] Marked textarea as setup, creating editor element');
+        debugLog('[WYSIWYG] Textarea:', textarea);
+        debugLog('[WYSIWYG] isMessageEditor:', isMessageEditor, 'isGroupChatEdit:', isGroupChatEdit);
         
         // Create contenteditable div that will be the visible editor
         // This is inserted as a SIBLING before the textarea, not wrapping it
@@ -5300,7 +6038,34 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // IMPORTANT: Insert editor as a sibling BEFORE the textarea
         // Do NOT wrap/move the textarea - this would break React's DOM reconciliation
         // and cause crashes when React tries to show tooltips or update the UI
-        textarea.parentNode.insertBefore(editor, textarea);
+        debugLog('[WYSIWYG] *** CRITICAL: About to insert editor into DOM ***');
+        debugLog('[WYSIWYG] Timestamp:', Date.now());
+        debugLog('[WYSIWYG] Parent node:', textarea.parentNode);
+        debugLog('[WYSIWYG] Parent node class:', textarea.parentNode?.className);
+        debugLog('[WYSIWYG] Sibling count before insert:', textarea.parentNode?.childNodes.length);
+        
+        try {
+            textarea.parentNode.insertBefore(editor, textarea);
+            debugLog('[WYSIWYG] *** Editor successfully inserted into DOM ***');
+            debugLog('[WYSIWYG] Timestamp:', Date.now());
+            debugLog('[WYSIWYG] Sibling count after insert:', textarea.parentNode?.childNodes.length);
+        } catch (error) {
+            console.error('[WYSIWYG] ERROR inserting editor:', error);
+            debugLog('[WYSIWYG] ERROR inserting editor:', error.message, error.stack);
+            return; // Abort if insertion fails
+        }
+        
+        // CRITICAL: Check if window width is in React's danger zone (around 768px breakpoint)
+        // If so, remove editor immediately to prevent React Error 185
+        const windowWidth = window.innerWidth;
+        const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
+        
+        if (inDangerZone) {
+            debugLog('[WYSIWYG] Window width in danger zone (' + windowWidth + 'px), aborting editor setup');
+            editor.remove();
+            // Don't hide textarea - keep it visible
+            return;
+        }
         
         // Ensure parent container has position:relative for absolute positioning of hidden textarea
         const parentContainer = textarea.parentNode;
@@ -5514,6 +6279,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             const plainText = getPlainText();
             const formattedHtml = parseFormattedText(plainText);
             
+            debugLog('[WYSIWYG-Text] updateEditorDisplay called');
+            debugLog('[WYSIWYG-Text] Plain text:', plainText);
+            debugLog('[WYSIWYG-Text] Formatted HTML:', formattedHtml);
+            
             safeSetHTML(editor, formattedHtml);
             
             restoreCursorPosition(savedPos);
@@ -5573,18 +6342,56 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Track last known textarea value for change detection
         let lastKnownValue = textarea.value;
         
+        // Track IME composition state (critical for mobile keyboards and non-Latin input)
+        let isComposing = false;
+        
+        // Detect Android mobile for performance optimization (glitch prevention)
+        const isAndroidMobile = /Android/i.test(navigator.userAgent) && /Mobile/i.test(navigator.userAgent);
+        // Detect iOS for backspace fix (separate issue from Android glitching)
+        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const debounceDelay = isAndroidMobile ? 1000 : 150; // 1s for Android mobile, 150ms for desktop/iOS
+        
+        editor.addEventListener('compositionstart', () => {
+            isComposing = true;
+            editor._isComposing = true; // Also store on element for access from intervals
+            debugLog('[WYSIWYG] Composition started (IME/mobile keyboard)');
+        });
+        
+        editor.addEventListener('compositionend', () => {
+            isComposing = false;
+            editor._isComposing = false;
+            debugLog('[WYSIWYG] Composition ended (IME/mobile keyboard)');
+            // Sync after composition completes
+            syncToTextarea();
+            lastKnownValue = textarea.value;
+            // Update formatting after composition (critical for iOS smart quote formatting)
+            updateEditorDisplay();
+        });
+        
         // Handle input - update formatting and sync to textarea
         let inputDebounceTimer = null;
+        let lastInputTime = 0;
         editor.addEventListener('input', () => {
+            // Skip sync during IME composition to prevent cursor jumping on mobile
+            if (isComposing) {
+                debugLog('[WYSIWYG] Input during composition - skipping sync');
+                return;
+            }
+            
+            lastInputTime = Date.now();
+            
             // Sync to textarea immediately
             syncToTextarea();
             lastKnownValue = textarea.value;
             
-            // Debounce the visual update to avoid cursor jumping while typing
+            // Use adaptive debounce: longer for Android mobile to prevent glitches, shorter for desktop/iOS
             clearTimeout(inputDebounceTimer);
             inputDebounceTimer = setTimeout(() => {
-                updateEditorDisplay();
-            }, 300);
+                // Double-check we're not in composition when the timer fires
+                if (!isComposing) {
+                    updateEditorDisplay();
+                }
+            }, debounceDelay);
         });
         
         // Handle paste - strip formatting and paste as plain text
@@ -5596,6 +6403,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Handle keydown for special keys
         editor.addEventListener('keydown', (e) => {
+            // Skip during IME composition - let mobile keyboard handle everything
+            if (isComposing) {
+                return;
+            }
+            
+            // iOS FIX: Prevent backspace in empty editor from triggering React Error 185
+            // iOS Safari/WebKit seems to trigger React re-renders when backspace is pressed in empty contenteditable
+            if (e.key === 'Backspace' && isIOS) {
+                const plainText = editor.textContent || '';
+                if (plainText.trim() === '') {
+                    // Editor is empty, prevent the backspace from doing anything
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    return;
+                }
+            }
+            
             // ARROW KEY FIX: Stop propagation for arrow keys to prevent
             // switching between regenerations when editing messages
             if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
@@ -5621,6 +6446,53 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     
                     // Sync to textarea first
                     syncToTextarea();
+                    
+                    // CRITICAL: Remove WYSIWYG editor before sending to prevent React Error 185
+                    // On iOS: ALWAYS remove editor before send - iOS React is very sensitive to foreign DOM elements
+                    // On Desktop: Only remove in danger zone (700-850px around 768px breakpoint)
+                    const windowWidth = window.innerWidth;
+                    const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
+                    const shouldRemoveBeforeSend = isIOS || inDangerZone;
+                    
+                    if (shouldRemoveBeforeSend) {
+                        debugLog('[WYSIWYG] Removing editor before send - isIOS:', isIOS, 'inDangerZone:', inDangerZone, 'width:', windowWidth);
+                        
+                        // Clean up this specific editor's observers and intervals
+                        if (editor._wysiwygResizeObserver) {
+                            editor._wysiwygResizeObserver.disconnect();
+                            delete editor._wysiwygResizeObserver;
+                        }
+                        if (editor._wysiwygMutationObserver) {
+                            editor._wysiwygMutationObserver.disconnect();
+                            delete editor._wysiwygMutationObserver;
+                        }
+                        if (editor._wysiwygValueCheckInterval) {
+                            clearInterval(editor._wysiwygValueCheckInterval);
+                            delete editor._wysiwygValueCheckInterval;
+                        }
+                        
+                        // Make textarea visible again and restore its value
+                        textarea.style.display = '';
+                        textarea.style.visibility = '';
+                        textarea.style.position = '';
+                        textarea.style.left = '';
+                        textarea.style.top = '';
+                        textarea.style.width = '';
+                        textarea.style.height = '';
+                        textarea.style.opacity = '';
+                        textarea.style.pointerEvents = '';
+                        textarea.style.zIndex = '';
+                        textarea.style.minHeight = '';
+                        textarea.style.maxHeight = '';
+                        textarea.style.overflow = '';
+                        textarea.style.resize = '';
+                        
+                        // Remove editor from DOM
+                        editor.remove();
+                        
+                        // Clear wysiwygSetup flag so it can be recreated later
+                        textarea.wysiwygSetup = '';
+                    }
                     
                     // Find and click the send button - try multiple selectors for different layouts
                     // Old layout: button[aria-label="send-message"] in .flex.justify-between
@@ -5687,7 +6559,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         // Clear the editor after a short delay (after message is sent)
                         setTimeout(() => {
                             if (textarea.value === '' || textarea.value !== getPlainText()) {
-                                editor.innerHTML = '';
+                                editor.replaceChildren();
                                 lastKnownValue = '';
                             }
                         }, 50);
@@ -5709,15 +6581,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Focus handling - when editor is focused, ensure it's ready
         editor.addEventListener('focus', () => {
+            debugLog('[WYSIWYG] Editor focus event - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
+            // Skip during resize to prevent React 185 error
+            if (isResizing || sidebarWidthTransitionPending) {
+                debugLog('[WYSIWYG] Focus handler SKIPPED due to resize in progress');
+                return;
+            }
             // Trigger immediate update if content changed externally
             if (textarea.value !== getPlainText()) {
+                debugLog('[WYSIWYG] Focus handler calling initializeEditor due to content change');
                 initializeEditor();
             }
         });
         
         // Watch for external changes to textarea (e.g., from undo/redo or message send clearing)
+        const activeTypingThreshold = isAndroidMobile ? 1500 : 500; // Longer threshold for Android mobile only
         const textareaObserver = new MutationObserver(() => {
+            debugLog('[WYSIWYG] Textarea MutationObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending, 'isUpdating:', isUpdating);
+            // Skip during resize to prevent React 185 error
+            if (isResizing || sidebarWidthTransitionPending) {
+                debugLog('[WYSIWYG] Textarea MutationObserver SKIPPED due to resize in progress');
+                return;
+            }
+            
+            // Skip if user is actively typing to prevent constant re-initialization on mobile
+            const timeSinceInput = Date.now() - lastInputTime;
+            if (timeSinceInput < activeTypingThreshold) {
+                return;
+            }
+            
             if (!isUpdating) {
+                debugLog('[WYSIWYG] Textarea MutationObserver calling initializeEditor');
                 lastKnownValue = textarea.value;
                 initializeEditor();
             }
@@ -5726,15 +6620,35 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Watch for value property changes (polling as backup)
         const valueCheckInterval = setInterval(() => {
+            // Skip during resize to prevent React 185 error
+            if (isResizing || sidebarWidthTransitionPending) {
+                // Don't log every skip or it will flood the console
+                return;
+            }
+            
+            // Skip during IME composition to prevent cursor jumping on mobile
+            if (editor._isComposing) {
+                return;
+            }
+            
+            // Skip if user is actively typing - adaptive threshold based on platform
+            const timeSinceInput = Date.now() - lastInputTime;
+            if (timeSinceInput < activeTypingThreshold) {
+                return;
+            }
+            
             if (!document.body.contains(textarea)) {
+                debugLog('[WYSIWYG] Value check interval - textarea removed from DOM');
                 clearInterval(valueCheckInterval);
                 return;
             }
             // Always check, even when editor is focused - important for message send clearing
             if (textarea.value !== lastKnownValue) {
+                debugLog('[WYSIWYG] Value check interval detected change - old:', lastKnownValue?.substring(0, 50), 'new:', textarea.value?.substring(0, 50));
                 lastKnownValue = textarea.value;
                 // Only update display if textarea was cleared or changed externally
                 if (!isUpdating) {
+                    debugLog('[WYSIWYG] Value check interval calling initializeEditor');
                     initializeEditor();
                 }
             }
@@ -5742,12 +6656,28 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Handle resize - observe the editor since we don't have a container anymore
         // Debounced to avoid expensive getComputedStyle calls on every resize event
+        // CRITICAL: Skip during window resize to prevent React 185 error
         let resizeDebounceTimer = null;
         const resizeObserver = new ResizeObserver(() => {
+            debugLog('[WYSIWYG] ResizeObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
+            // Skip entirely during window resize to prevent React 185 error
+            if (isResizing || sidebarWidthTransitionPending) {
+                debugLog('[WYSIWYG] ResizeObserver SKIPPED due to resize in progress');
+                return;
+            }
+            
             clearTimeout(resizeDebounceTimer);
             resizeDebounceTimer = setTimeout(() => {
+                debugLog('[WYSIWYG] ResizeObserver debounce timer fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
+                // Double-check resize state when timer fires
+                if (isResizing || sidebarWidthTransitionPending) {
+                    debugLog('[WYSIWYG] ResizeObserver debounce SKIPPED due to resize in progress');
+                    return;
+                }
+                debugLog('[WYSIWYG] ResizeObserver updating editor minHeight');
                 const style = window.getComputedStyle(textarea);
                 editor.style.minHeight = style.height;
+                debugLog('[WYSIWYG] ResizeObserver minHeight updated to:', style.height);
             }, 16); // ~60fps max
         });
         // Observe the textarea's parent for layout changes
@@ -5839,6 +6769,34 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
      * Find and setup all relevant textareas
      */
     function findAndSetupWysiwygTextareas() {
+        const timestamp = Date.now();
+        debugLog('[WYSIWYG] ========================================');
+        debugLog('[WYSIWYG] findAndSetupWysiwygTextareas called at', timestamp);
+        debugLog('[WYSIWYG] - isResizing:', isResizing);
+        debugLog('[WYSIWYG] - sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
+        debugLog('[WYSIWYG] - document.readyState:', document.readyState);
+        debugLog('[WYSIWYG] - wysiwygActive:', wysiwygActive);
+        debugLog('[WYSIWYG] ========================================');
+
+        // BUGFIX: respect the user's setting. The resize handler and the body
+        // mutation observer both call this function unconditionally, so without
+        // this gate WYSIWYG editors get rebuilt on top of the textarea after a
+        // window resize / zoom even when the feature is disabled — which leaves
+        // the composer unusable until reload (the textarea is pinned invisible
+        // and the contenteditable that mounted on top isn't being maintained).
+        // If editors exist while the feature is off, tear them down to recover
+        // any user that's already in the broken state.
+        if (!wysiwygActive) {
+            const stale = document.querySelectorAll('.sai-wysiwyg-editor');
+            if (stale.length > 0) {
+                debugLog('[WYSIWYG] Feature disabled but', stale.length, 'editor(s) present — tearing down');
+                removeAllWysiwygOverlays();
+            } else {
+                debugLog('[WYSIWYG] Feature disabled, skipping setup');
+            }
+            return;
+        }
+
         // STORY MODE: Skip WYSIWYG setup as Story Mode has native WYSIWYG
         if (isStoryMode()) {
             debugLog('[WYSIWYG] Skipping setup - Story Mode has native WYSIWYG');
@@ -5847,24 +6805,46 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Find message editor textareas (in edit mode)
         const messageEditorTextareas = document.querySelectorAll('.flex.flex-col.gap-1\\.5 textarea');
-        messageEditorTextareas.forEach(setupWysiwygOverlay);
+        debugLog('[WYSIWYG] Found', messageEditorTextareas.length, 'message editor textareas');
+        messageEditorTextareas.forEach((ta, i) => {
+            debugLog('[WYSIWYG] Processing message editor textarea', i + 1, 'of', messageEditorTextareas.length);
+            setupWysiwygOverlay(ta);
+        });
         
         // Find chat input textareas
         const chatInputTextareas = document.querySelectorAll('.border-1.border-solid.rounded-\\[13px\\] textarea');
-        chatInputTextareas.forEach(setupWysiwygOverlay);
+        debugLog('[WYSIWYG] Found', chatInputTextareas.length, 'chat input textareas');
+        chatInputTextareas.forEach((ta, i) => {
+            debugLog('[WYSIWYG] Processing chat input textarea', i + 1, 'of', chatInputTextareas.length);
+            setupWysiwygOverlay(ta);
+        });
         
         // Alternative: find by placeholder
         const messageTextareas = document.querySelectorAll('textarea[placeholder="Message..."], textarea[placeholder="Enter something"]');
-        messageTextareas.forEach(setupWysiwygOverlay);
+        debugLog('[WYSIWYG] Found', messageTextareas.length, 'textareas by placeholder');
+        messageTextareas.forEach((ta, i) => {
+            debugLog('[WYSIWYG] Processing placeholder textarea', i + 1, 'of', messageTextareas.length);
+            setupWysiwygOverlay(ta);
+        });
+        
+        debugLog('[WYSIWYG] findAndSetupWysiwygTextareas COMPLETE at', Date.now());
     }
     
     /**
-     * Remove all WYSIWYG overlays
+     * Remove all WYSIWYG overlays.
+     * Selector note: setupWysiwygOverlay marks textareas with
+     * dataset.wysiwygSetup='true' and the .sai-wysiwyg-hidden class — there is
+     * no .sai-wysiwyg-active class anywhere, so the previous selector matched
+     * nothing and this helper was a silent no-op. Use the dataset attribute,
+     * which is the authoritative marker.
      */
     function removeAllWysiwygOverlays() {
-        const activeTextareas = document.querySelectorAll('textarea.sai-wysiwyg-active');
+        const activeTextareas = document.querySelectorAll('textarea[data-wysiwyg-setup="true"]');
         activeTextareas.forEach(removeWysiwygOverlay);
     }
+    
+    // Global send button interceptor reference (for cleanup)
+    let wysiwygSendInterceptor = null;
     
     /**
      * Toggle WYSIWYG editor feature
@@ -5881,12 +6861,137 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             wysiwygActive = true;
             injectWysiwygCSS();
             
+            // iOS FIX: Install global send button interceptor
+            // On iOS, users tap the send button directly (not Enter key)
+            // We need to sync WYSIWYG content to textarea before React processes the send
+            // But we DON'T remove the editor - that causes React Error 185
+            if (!wysiwygSendInterceptor) {
+                const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+                                    /iPhone|iPad|iPod/i.test(navigator.platform) ||
+                                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+                
+                wysiwygSendInterceptor = (e) => {
+                    // Check if this is a send button being clicked/tapped
+                    const clickedElement = e.target;
+                    if (!clickedElement || !clickedElement.closest) return;
+                    
+                    const target = clickedElement.closest('button[aria-label="send-message"], button[aria-label="send"]');
+                    if (!target) return;
+                    
+                    // Check if any WYSIWYG editor is active
+                    const activeEditors = document.querySelectorAll('.sai-wysiwyg-editor');
+                    if (activeEditors.length === 0) return;
+                    
+                    debugLog('[WYSIWYG] Send interceptor triggered - syncing content. isIOS:', isIOSDevice);
+                    
+                    // ALWAYS sync all editors to their textareas before send
+                    activeEditors.forEach(editor => {
+                        const textarea = editor.previousElementSibling;
+                        if (textarea && textarea.tagName === 'TEXTAREA') {
+                            // Get plain text from editor
+                            const plainText = editor.textContent || '';
+                            textarea.value = plainText;
+                            // Dispatch input event to notify React
+                            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    });
+                    
+                    // On desktop in danger zone, remove editors to prevent layout issues
+                    // On iOS/mobile, NEVER remove - let them stay in place
+                    const windowWidth = window.innerWidth;
+                    const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
+                    
+                    if (!isIOSDevice && inDangerZone) {
+                        debugLog('[WYSIWYG] Desktop danger zone - removing editors');
+                        // Remove all WYSIWYG overlays
+                        removeAllWysiwygOverlays();
+                        
+                        debugLog('[WYSIWYG] All editors removed before send');
+                    }
+                };
+                
+                // Use capture phase to intercept BEFORE React sees the event
+                // Wrap in try-catch for safety (iOS compatibility)
+                try {
+                    if (document && document.addEventListener) {
+                        document.addEventListener('click', wysiwygSendInterceptor, true);
+                        document.addEventListener('touchend', wysiwygSendInterceptor, true);
+                        debugLog('[WYSIWYG] Send button interceptor installed');
+                    } else {
+                        debugLog('[WYSIWYG] Warning: document not ready for event listeners');
+                    }
+                } catch (error) {
+                    console.error('[WYSIWYG] Error installing send interceptor:', error);
+                }
+            }
+            
             // Initial setup
-            setTimeout(findAndSetupWysiwygTextareas, 500);
+            // iOS/Mobile FIX: Much longer delay to ensure React fully finishes rendering
+            // React 185 crash happens when we inject DOM elements while React is still rendering
+            // The chat page has multiple render cycles on load, so we need to wait for them all
+            
+            debugLog('[WYSIWYG] ======== DEVICE DETECTION START ========');
+            debugLog('[WYSIWYG] navigator.userAgent:', navigator.userAgent);
+            debugLog('[WYSIWYG] navigator.platform:', navigator.platform);
+            debugLog('[WYSIWYG] navigator.maxTouchPoints:', navigator.maxTouchPoints);
+            debugLog('[WYSIWYG] window.innerWidth:', window.innerWidth);
+            debugLog('[WYSIWYG] ontouchstart in window:', 'ontouchstart' in window);
+            
+            // Robust mobile/iOS detection - Orion browser on iOS doesn't include standard iOS UA strings
+            const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent) || 
+                                /iPhone|iPad|iPod/i.test(navigator.platform) ||
+                                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPad with desktop UA
+            const isMobileDevice = isIOSDevice || 
+                                   /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+                                   (window.innerWidth < 768 && 'ontouchstart' in window);
+            
+            debugLog('[WYSIWYG] isIOSDevice:', isIOSDevice);
+            debugLog('[WYSIWYG] isMobileDevice:', isMobileDevice);
+            debugLog('[WYSIWYG] ======== DEVICE DETECTION END ========');
+            
+            // MOBILE COOLDOWN: Block ALL WYSIWYG setup (including from observer) during initial page load
+            // This prevents the MutationObserver from triggering setup while React is rendering
+            let wysiwygMobileCooldown = isMobileDevice;
+            if (isMobileDevice) {
+                const cooldownTime = Date.now();
+                debugLog('[WYSIWYG] ======== MOBILE COOLDOWN STARTING ========');
+                debugLog('[WYSIWYG] Cooldown started at:', cooldownTime);
+                debugLog('[WYSIWYG] Mobile detected - blocking observer triggers for 6 seconds');
+                setTimeout(() => {
+                    wysiwygMobileCooldown = false;
+                    debugLog('[WYSIWYG] ======== MOBILE COOLDOWN ENDED ========');
+                    debugLog('[WYSIWYG] Cooldown ended at:', Date.now());
+                    debugLog('[WYSIWYG] Observer can now trigger setup');
+                }, 6000);
+            } else {
+                debugLog('[WYSIWYG] Desktop detected - no cooldown needed');
+            }
+            
+            const setupDelay = isMobileDevice ? 6000 : 500; // 6s on mobile, 500ms on desktop
+            debugLog('[WYSIWYG] ======== SCHEDULING INITIAL SETUP ========');
+            debugLog('[WYSIWYG] Setup will run in', setupDelay, 'ms');
+            debugLog('[WYSIWYG] Setup scheduled at:', Date.now());
+            debugLog('[WYSIWYG] Setup will execute at approximately:', Date.now() + setupDelay);
+            setTimeout(findAndSetupWysiwygTextareas, setupDelay);
             
             // Watch for new textareas
             if (!wysiwygObserver) {
                 wysiwygObserver = new MutationObserver((mutations) => {
+                    debugLog('[WYSIWYG] Main observer fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending, 'mutations:', mutations.length);
+                    // Skip during resize to prevent React 185 error
+                    if (isResizing || sidebarWidthTransitionPending) {
+                        debugLog('[WYSIWYG] Main observer SKIPPED due to resize in progress');
+                        return;
+                    }
+                    
+                    // Mobile FIX: Skip during cooldown period after page load
+                    if (wysiwygMobileCooldown) {
+                        debugLog('[WYSIWYG] *** OBSERVER BLOCKED BY COOLDOWN ***');
+                        debugLog('[WYSIWYG] Timestamp:', Date.now());
+                        debugLog('[WYSIWYG] Observer saw', mutations.length, 'mutations but cooldown is active');
+                        return;
+                    }
+                    
                     let needsSetup = false;
                     for (const mutation of mutations) {
                         if (mutation.addedNodes.length > 0) {
@@ -5894,11 +6999,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                 if (node.nodeType === 1) {
                                     // Check if node is a textarea
                                     if (node.tagName === 'TEXTAREA') {
+                                        debugLog('[WYSIWYG] Main observer found new TEXTAREA');
                                         needsSetup = true;
                                         break;
                                     }
                                     // Check if node contains a textarea
                                     if (node.querySelector && node.querySelector('textarea')) {
+                                        debugLog('[WYSIWYG] Main observer found node containing textarea');
                                         needsSetup = true;
                                         break;
                                     }
@@ -5908,10 +7015,23 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (needsSetup) break;
                     }
                     if (needsSetup) {
-                        setTimeout(findAndSetupWysiwygTextareas, 100);
+                        // Double-check resize state before scheduling setup
+                        if (!isResizing && !sidebarWidthTransitionPending) {
+                            // Mobile FIX: Use longer delay on mobile to avoid React 185 crash
+                            const isMobile = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+                                             /iPhone|iPad|iPod/i.test(navigator.platform) ||
+                                             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+                                             (window.innerWidth < 768 && 'ontouchstart' in window);
+                            const observerDelay = isMobile ? 3000 : 100; // 3s on mobile, 100ms on desktop
+                            debugLog('[WYSIWYG] Main observer scheduling findAndSetupWysiwygTextareas with delay:', observerDelay, 'ms (isMobile:', isMobile, ')');
+                            setTimeout(findAndSetupWysiwygTextareas, observerDelay);
+                        } else {
+                            debugLog('[WYSIWYG] Main observer skipped scheduling due to resize state');
+                        }
                     }
                 });
                 wysiwygObserver.observe(document.body, { childList: true, subtree: true });
+                debugLog('[WYSIWYG] Main observer started watching document.body');
             }
         } else {
             debugLog('[WYSIWYG] Disabling WYSIWYG editor');
@@ -5921,6 +7041,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (wysiwygObserver) {
                 wysiwygObserver.disconnect();
                 wysiwygObserver = null;
+            }
+            
+            // Clean up send button interceptor
+            if (wysiwygSendInterceptor) {
+                document.removeEventListener('click', wysiwygSendInterceptor, true);
+                document.removeEventListener('touchend', wysiwygSendInterceptor, true);
+                wysiwygSendInterceptor = null;
+                debugLog('[WYSIWYG] Send button interceptor removed');
             }
             
             // Remove all overlays
@@ -5933,18 +7061,30 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Initialize features on page load
     async function initializeStyles() {
-        const sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-        const classicLayoutEnabled = await storage.get(CLASSIC_LAYOUT_KEY, false);
-        const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
-        const hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
-        const pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
-        const compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
-        const wysiwygEnabled = await storage.get(WYSIWYG_EDITOR_KEY, false);
+        // PERFORMANCE: Batch all feature settings into a single storage read
+        const featureSettings = await storage.getMultiple({
+            [SIDEBAR_LAYOUT_KEY]: false,
+            [CLASSIC_LAYOUT_KEY]: false,
+            [CLASSIC_STYLE_KEY]: false,
+            [HIDE_FOR_YOU_KEY]: false,
+            [PAGE_JUMP_KEY]: false,
+            [COMPACT_GENERATION_KEY]: false,
+            [WYSIWYG_EDITOR_KEY]: false,
+            [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH
+        });
+        
+        const sidebarEnabled = featureSettings[SIDEBAR_LAYOUT_KEY];
+        const classicLayoutEnabled = featureSettings[CLASSIC_LAYOUT_KEY];
+        const classicStyleEnabled = featureSettings[CLASSIC_STYLE_KEY];
+        const hideForYouEnabled = featureSettings[HIDE_FOR_YOU_KEY];
+        const pageJumpEnabled = featureSettings[PAGE_JUMP_KEY];
+        const compactGenerationEnabled = featureSettings[COMPACT_GENERATION_KEY];
+        const wysiwygEnabled = featureSettings[WYSIWYG_EDITOR_KEY];
         
         // Load sidebar minimum width setting
-        sidebarMinWidth = await storage.get(SIDEBAR_MIN_WIDTH_KEY, DEFAULT_SIDEBAR_MIN_WIDTH);
+        sidebarMinWidth = featureSettings[SIDEBAR_MIN_WIDTH_KEY];
         
-        debugLog('[Toolkit] Initializing with settings:', {
+        debugLog('[Core] Initializing with settings:', {
             sidebar: sidebarEnabled,
             sidebarMinWidth: sidebarMinWidth,
             classicLayout: classicLayoutEnabled,
@@ -5960,19 +7100,32 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Sidebar Layout CSS is already injected early if enabled
         // Just get a reference to the existing element
-        if (sidebarEnabled) {
+        // BUT: Ensure it's disabled on non-chat pages (lorebook, chatbot, group)
+        const shouldDisableSidebarLayout = isNonChatPageForSidebar();
+        
+        if (sidebarEnabled && !shouldDisableSidebarLayout) {
             sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early');
             if (sidebarStyleElement) {
-                debugLog('[Toolkit] Using early-injected Sidebar Layout CSS');
+                debugLog('[Core] Using early-injected Sidebar Layout CSS');
                 sidebarStyleElement.disabled = false;
             }
+            // Defensive: re-run sweep + ensure observer is attached. The early-inject
+            // path normally starts the observer, but if the page started on a
+            // non-chat URL (early-inject skipped) and then SPA-navigated to a chat
+            // page, the observer would never have been kicked off. This is idempotent.
+            if (typeof startSidebarLayoutBodyClassObserver === 'function') {
+                startSidebarLayoutBodyClassObserver();
+            }
+            if (typeof updateSidebarLayoutBodyClasses === 'function') {
+                updateSidebarLayoutBodyClasses();
+            }
         } else {
-            // If disabled but early CSS was injected, disable it
+            // If disabled or on non-chat page, ensure early CSS is disabled
             const earlyElement = document.getElementById('sai-toolkit-sidebar-layout-early');
             if (earlyElement) {
                 earlyElement.disabled = true;
                 sidebarStyleElement = earlyElement;
-                debugLog('[Toolkit] Disabled early-injected Sidebar Layout CSS');
+                debugLog('[Core] Disabled early-injected Sidebar Layout CSS' + (shouldDisableSidebarLayout ? ' (non-chat page)' : ''));
             }
         }
         
@@ -5984,7 +7137,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (classicLayoutEnabled) {
             classicLayoutStyleElement = document.getElementById('sai-toolkit-classic-layout-early');
             if (classicLayoutStyleElement) {
-                debugLog('[Toolkit] Using early-injected Classic Layout CSS');
+                debugLog('[Core] Using early-injected Classic Layout CSS');
                 classicLayoutStyleElement.disabled = false;
             }
         } else {
@@ -5993,7 +7146,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (earlyElement) {
                 earlyElement.disabled = true;
                 classicLayoutStyleElement = earlyElement;
-                debugLog('[Toolkit] Disabled early-injected Classic Layout CSS');
+                debugLog('[Core] Disabled early-injected Classic Layout CSS');
             }
         }
         
@@ -6002,7 +7155,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (classicStyleEnabled) {
             classicStyleStyleElement = document.getElementById('sai-toolkit-classic-style-early');
             if (classicStyleStyleElement) {
-                debugLog('[Toolkit] Using early-injected Classic Style CSS');
+                debugLog('[Core] Using early-injected Classic Style CSS');
                 classicStyleStyleElement.disabled = false;
             }
         } else {
@@ -6011,7 +7164,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (earlyElement) {
                 earlyElement.disabled = true;
                 classicStyleStyleElement = earlyElement;
-                debugLog('[Toolkit] Disabled early-injected Classic Style CSS');
+                debugLog('[Core] Disabled early-injected Classic Style CSS');
             }
         }
         
@@ -6031,7 +7184,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await togglePageJump(true);
         }
         if (wysiwygEnabled) {
-            await toggleWysiwygEditor(true);
+            // iOS FIX: Delay WYSIWYG initialization on iOS to prevent React 185 during page load
+            // On iOS, React is slower and we need to wait for the initial render cycle to fully complete
+            // before injecting any DOM elements near React-controlled textareas
+            const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (isIOSDevice) {
+                debugLog('[WYSIWYG] Delaying initialization on iOS by 4s to avoid React conflicts');
+                // Use 4s delay - this ensures React's initial render + any re-renders have completed
+                setTimeout(() => toggleWysiwygEditor(true), 4000);
+            } else {
+                await toggleWysiwygEditor(true);
+            }
         }
     }
 
@@ -6046,13 +7209,42 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Function to inject toolkit icon on header (left of notification bell)
     // Function to inject toolkit button into left sidebar
     function injectToolkitSidebarButton() {
+        // Skip injection on mobile - sidebar doesn't exist below 600px
+        if (window.innerWidth < 600) {
+            debugLog('[Core] Skipping sidebar injection - width < 600px');
+            return;
+        }
+        
+        // Check for sidebar width transition - React crashes if we inject during width change
+        const sidebar = document.querySelector('nav.flex.flex-col');
+        if (sidebar) {
+            const currentSidebarWidth = sidebar.style.width || sidebar.offsetWidth + 'px';
+            if (lastKnownSidebarWidth !== null && lastKnownSidebarWidth !== currentSidebarWidth) {
+                debugLog('[Core] Sidebar width changed from', lastKnownSidebarWidth, 'to', currentSidebarWidth, '- skipping injection');
+                sidebarWidthTransitionPending = true;
+                lastKnownSidebarWidth = currentSidebarWidth;
+                // Schedule re-injection after transition settles
+                setTimeout(() => {
+                    sidebarWidthTransitionPending = false;
+                    debugLog('[Core] Sidebar transition settled, ready for injection');
+                }, 400);
+                return;
+            }
+            lastKnownSidebarWidth = currentSidebarWidth;
+        }
+        
+        if (sidebarWidthTransitionPending) {
+            debugLog('[Core] Sidebar transition pending - skipping injection');
+            return;
+        }
+        
         // Check if already injected
         const existingButton = document.getElementById('sai-toolkit-sidebar-btn');
         if (existingButton) {
             return;
         }
         
-        debugLog('[Toolkit] Searching for Help button...');
+        debugLog('[Core] Searching for Help button...');
         
         // Find the Help button in the sidebar (last section with Subscribe and Help)
         // The Help button is now inside an <a> tag linking to docs.spicychat.ai/support
@@ -6063,19 +7255,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         helpLink = document.querySelector('a[href="https://docs.spicychat.ai/support"]');
         if (helpLink) {
             helpButton = helpLink.querySelector('button');
-            debugLog('[Toolkit] Found help button via link selector');
+            debugLog('[Core] Found help button via link selector');
         }
         
         // Fallback: try finding by icon and text content
         if (!helpButton) {
-            debugLog('[Toolkit] Link selector failed, trying icon+text method');
+            debugLog('[Core] Link selector failed, trying icon+text method');
             const buttons = document.querySelectorAll('button');
             for (const btn of buttons) {
                 const hasInfoIcon = btn.querySelector('svg.lucide-info');
                 const hasHelpText = btn.textContent?.trim().includes('Help');
                 if (hasInfoIcon && hasHelpText) {
                     helpButton = btn;
-                    debugLog('[Toolkit] Found help button via icon+text');
+                    debugLog('[Core] Found help button via icon+text');
                     break;
                 }
             }
@@ -6083,8 +7275,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Another fallback: find Subscribe button and get its sibling
         if (!helpButton) {
-            debugLog('[Toolkit] Trying Subscribe sibling method');
-            const subscribeLink = document.querySelector('a[href="/subscribe"]');
+            debugLog('[Core] Trying Subscribe sibling method');
+            const subscribeLink = document.querySelector('a[href$="/subscribe"]');
             if (subscribeLink) {
                 const subscribeWrapper = subscribeLink.closest('div.w-full');
                 if (subscribeWrapper && subscribeWrapper.nextElementSibling) {
@@ -6092,7 +7284,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     helpLink = helpWrapper.querySelector('a[href*="docs.spicychat.ai"]');
                     if (helpLink) {
                         helpButton = helpLink.querySelector('button');
-                        debugLog('[Toolkit] Found help button via Subscribe sibling');
+                        debugLog('[Core] Found help button via Subscribe sibling');
                     }
                 }
             }
@@ -6100,26 +7292,26 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Last fallback: just find by info icon alone
         if (!helpButton) {
-            debugLog('[Toolkit] Trying info icon only method');
+            debugLog('[Core] Trying info icon only method');
             const infoIcons = document.querySelectorAll('svg.lucide-info');
             for (const icon of infoIcons) {
                 const btn = icon.closest('button');
                 if (btn) {
                     helpButton = btn;
-                    debugLog('[Toolkit] Found help button via info icon');
+                    debugLog('[Core] Found help button via info icon');
                     break;
                 }
             }
         }
         
         if (!helpButton) {
-            debugLog('[Toolkit] Help button not found after all attempts');
-            debugLog('[Toolkit] Available links:', Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h.includes('spicychat')));
-            debugLog('[Toolkit] Info icons found:', document.querySelectorAll('svg.lucide-info').length);
+            debugLog('[Core] Help button not found after all attempts');
+            debugLog('[Core] Available links:', Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h.includes('spicychat')));
+            debugLog('[Core] Info icons found:', document.querySelectorAll('svg.lucide-info').length);
             return;
         }
         
-        debugLog('[Toolkit] Help button found, proceeding...');
+        debugLog('[Core] Help button found, proceeding...');
         
         // Get the parent container (the div.w-full that wraps the <a> tag)
         // The structure is now: div.w-full > a > button
@@ -6127,9 +7319,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const helpButtonWrapper = helpAnchor ? helpAnchor.closest('div.w-full') : helpButton.closest('div.w-full');
         
         if (!helpButtonWrapper) {
-            debugLog('[Toolkit] Help button wrapper not found');
-            debugLog('[Toolkit] Help button parent structure:', helpButton.parentElement?.className);
-            debugLog('[Toolkit] Help button parent element:', helpButton.parentElement);
+            debugLog('[Core] Help button wrapper not found');
+            debugLog('[Core] Help button parent structure:', helpButton.parentElement?.className);
+            debugLog('[Core] Help button parent element:', helpButton.parentElement);
             return;
         }
         
@@ -6154,7 +7346,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             el.removeAttribute('data-tooltip-id');
             el.removeAttribute('data-tooltip-content');
         });
-        debugLog('[Toolkit] Removed React tooltip attributes');
+        debugLog('[Core] Removed React tooltip attributes');
         
         // Replace the SVG icon with wrench icon and ensure text element exists
         const iconContainer = clonedButton.querySelector('.flex.items-center.gap-2');
@@ -6230,11 +7422,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Insert after the Help button wrapper
         helpButtonWrapper.parentNode.insertBefore(buttonWrapper, helpButtonWrapper.nextSibling);
         
-        debugLog('[Toolkit] Sidebar button injected successfully');
+        debugLog('[Core] Sidebar button injected successfully');
     }
     
     // Function to inject toolkit button in mobile header (next to Like button)
     function injectToolkitMobileButton() {
+        // Skip during resize/transition to prevent React 185 error
+        if (typeof isResizing !== 'undefined' && isResizing) {
+            return;
+        }
+        if (typeof sidebarWidthTransitionPending !== 'undefined' && sidebarWidthTransitionPending) {
+            return;
+        }
+        
         // Check if already injected
         const existingButton = document.getElementById('sai-toolkit-mobile-btn');
         if (existingButton) return;
@@ -6247,14 +7447,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         const referenceButton = likeButton || sparklesButton || chatDropdown;
         if (!referenceButton) {
-            debugLog('[Toolkit] No reference button found in chat header');
+            debugLog('[Core] No reference button found in chat header');
             return;
         }
         
         // Get the parent container (the flex container with gap-sm)
         const buttonContainer = referenceButton.closest('.flex.justify-end.items-center.gap-sm');
         if (!buttonContainer) {
-            debugLog('[Toolkit] Mobile button container not found');
+            debugLog('[Core] Mobile button container not found');
             return;
         }
         
@@ -6265,9 +7465,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         toolkitBtn.setAttribute('aria-label', 'SAI-Toolkit-button');
         toolkitBtn.setAttribute('type', 'button');
         
-        toolkitBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-wrench inline-flex items-center justify-center w-5 h-5">
-            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
-        </svg>`;
+        toolkitBtn.appendChild(makeSVG({
+            xmlns: SVG_NS, width: '20', height: '20', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+            class: 'lucide lucide-wrench inline-flex items-center justify-center w-5 h-5'
+        }, [
+            ['path', { d: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z' }]
+        ]));
         
         // Add click handler
         toolkitBtn.addEventListener('click', async function(e) {
@@ -6278,7 +7483,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Insert at the beginning of the container (leftmost position)
         buttonContainer.insertBefore(toolkitBtn, buttonContainer.firstChild);
-        debugLog('[Toolkit] Mobile button injected successfully');
+        debugLog('[Core] Mobile button injected successfully');
     }
     
     // ============================================================================
@@ -6287,8 +7492,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Function to inject chat export button in mobile header (to the left of toolkit settings button)
     function injectChatExportButton() {
-        // Only show on chat pages (case-insensitive check for /chat/ or /Chat/)
-        if (!window.location.pathname.toLowerCase().startsWith('/chat/')) {
+        // Skip during resize/transition to prevent React 185 error
+        if (typeof isResizing !== 'undefined' && isResizing) {
+            return;
+        }
+        if (typeof sidebarWidthTransitionPending !== 'undefined' && sidebarWidthTransitionPending) {
+            return;
+        }
+        
+        // Only show on chat pages (supports both /chat/ and /{language}/chat/)
+        if (!isOnChatPage()) {
             return;
         }
         
@@ -6323,11 +7536,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         exportBtn.setAttribute('type', 'button');
         
         // Download icon SVG
-        exportBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-download inline-flex items-center justify-center w-5 h-5">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="7 10 12 15 17 10"></polyline>
-            <line x1="12" y1="15" x2="12" y2="3"></line>
-        </svg>`;
+        exportBtn.appendChild(makeSVG({
+            xmlns: SVG_NS, width: '20', height: '20', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+            class: 'lucide lucide-download inline-flex items-center justify-center w-5 h-5'
+        }, [
+            ['path', { d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4' }],
+            ['polyline', { points: '7 10 12 15 17 10' }],
+            ['line', { x1: '12', y1: '15', x2: '12', y2: '3' }]
+        ]));
         
         // Add click handler to show export menu
         exportBtn.addEventListener('click', function(e) {
@@ -6350,8 +7568,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Function to inject NSFW mode toggle button in toolbar
     async function injectNSFWToggleButton() {
-        // Only show on chat pages (case-insensitive check for /chat/ or /Chat/)
-        if (!window.location.pathname.toLowerCase().startsWith('/chat/')) {
+        // Skip during resize/transition to prevent React 185 error
+        if (typeof isResizing !== 'undefined' && isResizing) {
+            return;
+        }
+        if (typeof sidebarWidthTransitionPending !== 'undefined' && sidebarWidthTransitionPending) {
+            return;
+        }
+        
+        // Only show on chat pages (supports both /chat/ and /{language}/chat/)
+        if (!isOnChatPage()) {
             return;
         }
         
@@ -6614,25 +7840,27 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         const observer = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
-                if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-                    for (const node of mutation.addedNodes) {
-                        if (node.nodeType === Node.ELEMENT_NODE) {
-                            // Check if the added node or any child contains text about "Conversation Image Settings"
-                            const textContent = node.textContent || '';
-                            if (textContent.includes('Conversation Image Settings')) {
-                                debugLog('[NSFW] Modal with "Conversation Image Settings" detected!');
-                                // Wait for React to finish rendering
-                                setTimeout(() => {
-                                    syncModalNSFWToggle();
-                                    watchModalNSFWToggle();
-                                }, 150);
-                            }
-                        }
+                if (mutation.type !== 'childList' || mutation.addedNodes.length === 0) continue;
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                    // Perf: gate on the modal selector first to avoid reading textContent
+                    // on every DOM addition (which is O(n) on the subtree).
+                    if (!node.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]') &&
+                        !node.querySelector?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]')) {
+                        continue;
+                    }
+                    if ((node.textContent || '').includes('Conversation Image Settings')) {
+                        debugLog('[NSFW] Modal with "Conversation Image Settings" detected!');
+                        setTimeout(() => {
+                            syncModalNSFWToggle();
+                            watchModalNSFWToggle();
+                        }, 150);
+                        return;
                     }
                 }
             }
         });
-        
+
         observer.observe(document.body, { childList: true, subtree: true });
         debugLog('[NSFW] Modal watcher active');
     }
@@ -6683,6 +7911,211 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }, 2000);
     }
     
+    // =========================================================================
+    // MESSAGE RECOVERY
+    // =========================================================================
+    //
+    // PROBLEM
+    //   When SpicyChat's chat backend is degraded — Cloudflare 502, CORS
+    //   preflight failures, request timeouts, or transient network drops —
+    //   the user's typed message is lost without warning. The UX is:
+    //
+    //     1. User types a long, carefully-considered message.
+    //     2. User presses Send. The textarea is cleared instantly.
+    //     3. Several seconds later a generic red "Oops! Something went
+    //        wrong. Please try again." banner appears with a Resubmit button.
+    //     4. The site keeps the message in memory only as long as that
+    //        banner is on screen for the most-recent failure. Reload the
+    //        page, navigate away, dismiss the banner, or trigger a different
+    //        error on top of this one, and the original text is gone.
+    //
+    //   For users who write multi-paragraph messages this is severely
+    //   frustrating: the work disappears between the moment they hit Send
+    //   and the moment they realize the request failed.
+    //
+    // WHAT THIS FEATURE DOES
+    //   When the user opts in via the "Message Recovery" checkbox in the
+    //   Features tab of the S.AI Settings modal:
+    //
+    //     - The page-context interceptor (xhr-intercept.js) snapshots the
+    //       outgoing message text at the moment of POST /chat. The
+    //       textarea has already been cleared by SpicyChat at this point,
+    //       so we read the message from the request body that we already
+    //       have visibility into for model-override and stats purposes.
+    //     - If the request fails (XHR error/timeout/abort/status>=400, or
+    //       fetch throws/returns !ok) we hand the snapshot to the content
+    //       script, which persists it to chrome.storage.local under the
+    //       'failedMessages' key. Successful sends never persist anything.
+    //     - When the "Oops!" banner appears, we inject a "Recover message"
+    //       button next to SpicyChat's "Resubmit" button. Clicking it
+    //       refills the chat textarea with the most-recent failed message
+    //       and removes that entry from the queue.
+    //
+    // WHY OPT-IN
+    //   Capturing message *content* is materially different from the rest
+    //   of the extension's network observation, which is metadata-only
+    //   (model name, settings, message IDs, timestamps). Even though no
+    //   data leaves the browser, persisting message text to local storage
+    //   warrants explicit informed consent. The default is OFF, the
+    //   privacy disclosure has been updated, and the toggle lives in the
+    //   Features tab next to other content-touching settings.
+    //
+    // STORAGE / EVICTION
+    //   - Key: 'failedMessages'  (chrome.storage.local)
+    //   - Cap: 50 entries, FIFO. Old entries are evicted when the cap is
+    //     hit so a long outage can't blow up storage.
+    //   - On recovery, the entry is removed from the queue.
+    //   - Disabling the feature does not auto-clear the queue (so the
+    //     user can recover anything that was already captured) but no
+    //     new entries are added until it is re-enabled.
+    //   - "Clear All Data" wipes everything including this queue.
+
+    let messageRecoveryActive = false;
+
+    async function initMessageRecovery() {
+        const enabled = await storage.get('messageRecoveryEnabled', false);
+        messageRecoveryActive = enabled;
+        debugLog('[MsgRecovery] Init, enabled:', enabled);
+        // Tell the page-context interceptor whether to capture message text.
+        // Sent regardless of the value so we explicitly disable on every
+        // page load (rather than relying on the page-context script's
+        // localStorage fallback, which could drift if the user disabled
+        // the feature in another tab).
+        window.postMessage({
+            type: 'SAI_SET_MESSAGE_RECOVERY',
+            enabled: !!enabled
+        }, '*');
+    }
+
+    // Find the "Oops! Something went wrong" error banner.
+    // The banner DOM (per the captured chat-page reference) contains a
+    // <p class="text-red-12"> with the literal "Oops!" text and is sibling
+    // to a Resubmit button. We match on the text rather than fragile
+    // utility-class chains so the selector survives Tailwind class shuffles.
+    function findOopsBanner() {
+        const candidates = document.querySelectorAll('p.text-red-12, p[class*="text-red"]');
+        for (const p of candidates) {
+            const txt = (p.textContent || '').trim();
+            if (txt.startsWith('Oops!') || txt.includes('Something went wrong')) {
+                // Walk up to the row that contains the Resubmit button so we
+                // can place our button as its sibling.
+                let row = p.closest('div');
+                for (let i = 0; i < 6 && row; i++) {
+                    if (row.querySelector('button')) return row;
+                    row = row.parentElement;
+                }
+                return p.parentElement;
+            }
+        }
+        return null;
+    }
+
+    // Inject the "Recover message" button next to Resubmit. Idempotent —
+    // safe to call repeatedly from the periodic mutation observer.
+    async function injectRecoverButtonIfNeeded() {
+        if (!messageRecoveryActive) return;
+        const banner = findOopsBanner();
+        if (!banner) return;
+        if (banner.querySelector('.sai-recover-btn')) return;
+
+        const failedMessages = await storage.get('failedMessages', []);
+        if (!Array.isArray(failedMessages) || failedMessages.length === 0) return;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'sai-recover-btn';
+        // Match SpicyChat's existing red Resubmit button styling so it
+        // looks like a first-class part of the banner.
+        btn.style.cssText = [
+            'display:inline-flex',
+            'align-items:center',
+            'justify-content:center',
+            'gap:6px',
+            'padding:0 8px',
+            'height:28px',
+            'margin-left:6px',
+            'border:1px solid rgba(255,255,255,0.25)',
+            'border-radius:6px',
+            'background:transparent',
+            'color:#fff',
+            'font:500 13px/1 -apple-system,system-ui,Segoe UI,Roboto,sans-serif',
+            'cursor:pointer',
+            'white-space:nowrap'
+        ].join(';');
+        btn.textContent = 'Recover message';
+        btn.title = 'Restore the message you tried to send before the error';
+        btn.addEventListener('click', onRecoverButtonClick);
+
+        // Try to place next to the Resubmit button; otherwise append.
+        const resubmit = Array.from(banner.querySelectorAll('button')).find(b =>
+            (b.textContent || '').trim().toLowerCase().includes('resubmit')
+        );
+        if (resubmit && resubmit.parentElement) {
+            resubmit.parentElement.appendChild(btn);
+        } else {
+            banner.appendChild(btn);
+        }
+        debugLog('[MsgRecovery] Recover button injected');
+    }
+
+    async function onRecoverButtonClick(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        const list = await storage.get('failedMessages', []);
+        if (!Array.isArray(list) || list.length === 0) {
+            showNotification('No saved message to recover');
+            return;
+        }
+        const entry = list[list.length - 1];
+
+        // Find the chat input textarea. The reference chat-page has a single
+        // <textarea placeholder="Message...">. We use that as the primary
+        // selector and fall back to the only visible textarea on the page.
+        let textarea = document.querySelector('textarea[placeholder="Message..."]');
+        if (!textarea) {
+            const all = Array.from(document.querySelectorAll('textarea'));
+            textarea = all.find(t => t.offsetParent !== null) || all[0] || null;
+        }
+
+        if (!textarea) {
+            // No input found — fall back to clipboard so the message isn't
+            // lost a second time.
+            try {
+                await navigator.clipboard.writeText(entry.message);
+                showNotification('Message copied to clipboard (no input field found)');
+            } catch (e) {
+                showNotification('Could not recover automatically — see extension storage');
+                return;
+            }
+        } else {
+            // React-controlled inputs need the native setter so React's
+            // synthetic event system picks up the change. setting .value
+            // directly is silently overwritten on next render.
+            const proto = Object.getPrototypeOf(textarea);
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) {
+                setter.call(textarea, entry.message);
+            } else {
+                textarea.value = entry.message;
+            }
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            textarea.dispatchEvent(new Event('change', { bubbles: true }));
+            textarea.focus();
+            showNotification('Message recovered');
+        }
+
+        // Drop the recovered entry from the queue.
+        const updated = list.slice(0, -1);
+        await storage.set('failedMessages', updated);
+
+        // Remove our button — the banner will go away on its own when
+        // the user types or the site clears it, but the button has done
+        // its job for this entry.
+        const btn = document.querySelector('.sai-recover-btn');
+        if (btn) btn.remove();
+    }
+
     // Show export dropdown menu
     function showExportMenu(anchorButton) {
         // Remove any existing menu
@@ -6784,18 +8217,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Fetch all messages from the API (without limit)
     async function fetchAllChatMessages() {
-        // URL format: /chat/{characterId}/{conversationId} (may be /Chat/ with capital C)
+        // URL format: /chat/{characterId}/{conversationId} or /{language}/chat/{characterId}/{conversationId}
         const pathParts = window.location.pathname.split('/').filter(p => p);
-        // pathParts should be: ['chat', characterId, conversationId] or ['Chat', ...]
+        // pathParts should be: ['chat', characterId, conversationId] or ['en', 'chat', ...] or ['Chat', ...]
 
         debugLog('[Export] Path parts:', pathParts);
 
-        if (pathParts.length < 2 || pathParts[0].toLowerCase() !== 'chat') {
-            throw new Error('Not on a chat page. URL should be /chat/{characterId}/{conversationId}');
+        // Handle both /chat/ and /{language}/chat/ formats
+        let chatIndexOffset = 0;
+        if (pathParts[0].match(/^[a-z]{2}$/i)) {
+            // Language prefix detected (e.g., 'en')
+            chatIndexOffset = 1;
+        }
+
+        if (pathParts.length < (chatIndexOffset + 2) || pathParts[chatIndexOffset].toLowerCase() !== 'chat') {
+            throw new Error('Not on a chat page. URL should be /chat/{characterId}/{conversationId} or /{language}/chat/{characterId}/{conversationId}');
         }
         
-        const characterId = pathParts[1];
-        const conversationId = pathParts.length > 2 ? pathParts[2] : null;
+        const characterId = pathParts[chatIndexOffset + 1];
+        const conversationId = pathParts.length > (chatIndexOffset + 2) ? pathParts[chatIndexOffset + 2] : null;
         
         if (!characterId) {
             throw new Error('Could not determine character ID from URL');
@@ -6805,131 +8245,35 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Export] Conversation ID:', conversationId);
         
         return new Promise((resolve, reject) => {
-            // Inject script into page context to access auth headers
-            const script = document.createElement('script');
-            script.textContent = `
-                (async function() {
-                    try {
-                        let authToken = null;
-                        let guestUserId = null;
-                        let country = null;
-                        
-                        // Get auth headers from intercepted data
-                        if (window.__kindeAccessToken) {
-                            authToken = window.__kindeAccessToken;
-                        }
-                        if (window.__lastAuthHeaders) {
-                            if (!authToken && window.__lastAuthHeaders.Authorization) {
-                                authToken = window.__lastAuthHeaders.Authorization.replace('Bearer ', '');
-                            }
-                            if (!guestUserId && window.__lastAuthHeaders['X-Guest-UserId']) {
-                                guestUserId = window.__lastAuthHeaders['X-Guest-UserId'];
-                            }
-                            if (!country && window.__lastAuthHeaders['X-Country']) {
-                                country = window.__lastAuthHeaders['X-Country'];
-                            }
-                        }
-                        
-                        // Fallback to localStorage
-                        if (!authToken) {
-                            for (const key of Object.keys(localStorage)) {
-                                try {
-                                    const value = localStorage.getItem(key);
-                                    if (!value) continue;
-                                    if (value.startsWith('{') || value.startsWith('[')) {
-                                        const parsed = JSON.parse(value);
-                                        if (parsed.access_token || parsed.accessToken || parsed.token) {
-                                            authToken = parsed.access_token || parsed.accessToken || parsed.token;
-                                            break;
-                                        }
-                                    } else if (value.startsWith('eyJ')) {
-                                        authToken = value;
-                                        break;
-                                    }
-                                } catch (e) {}
-                            }
-                        }
-                        
-                        const headers = {
-                            'Accept': 'application/json, text/plain, */*',
-                            'X-App-Id': 'spicychat'
-                        };
-                        
-                        if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
-                        if (guestUserId) headers['X-Guest-UserId'] = guestUserId;
-                        if (country) headers['X-Country'] = country;
-                        
-                        console.log('[Export] Fetching from API with character ID: ${characterId}, conversation ID: ${conversationId}');
-
-                        // Fetch messages for specific conversation
-                        // If conversation ID is not provided, use the character-level endpoint
-                        const apiUrl = '${conversationId}' && '${conversationId}' !== 'null'
-                            ? 'https://prod.nd-api.com/characters/${characterId}/messages/${conversationId}'
-                            : 'https://prod.nd-api.com/characters/${characterId}/messages';
-                        
-                        console.log('[Export] Fetching from:', apiUrl);
-                        
-                        const messagesResponse = await fetch(apiUrl, {
-                            method: 'GET',
-                            headers: headers,
-                            credentials: 'include'
-                        });
-                        
-                        console.log('[Export] Messages API response status:', messagesResponse.status);
-                        
-                        if (!messagesResponse.ok) {
-                            throw new Error('Failed to fetch messages: ' + messagesResponse.status);
-                        }
-                        
-                        const messagesData = await messagesResponse.json();
-                        console.log('[Export] Messages received:', messagesData.messages?.length || 0);
-                        
-                        // Also fetch character info
-                        const characterResponse = await fetch('https://prod.nd-api.com/v2/characters/${characterId}', {
-                            method: 'GET',
-                            headers: headers,
-                            credentials: 'include'
-                        });
-                        
-                        let characterData = null;
-                        if (characterResponse.ok) {
-                            characterData = await characterResponse.json();
-                        }
-                        
-                        // Send data back via custom event
-                        window.dispatchEvent(new CustomEvent('sai-export-data', {
-                            detail: {
-                                success: true,
-                                messages: messagesData,
-                                character: characterData
-                            }
-                        }));
-                    } catch (error) {
-                        window.dispatchEvent(new CustomEvent('sai-export-data', {
-                            detail: {
-                                success: false,
-                                error: error.message
-                            }
-                        }));
-                    }
-                })();
-            `;
-            
-            // Listen for the response
+            // Use postMessage to communicate with page-context.js instead of inline script
+            // This avoids CSP issues with inline script injection
             const handler = (event) => {
-                window.removeEventListener('sai-export-data', handler);
-                const data = event.detail;
-                if (data.success) {
-                    resolve({ messages: data.messages, character: data.character });
+                // Only handle our specific response
+                if (event.source !== window) return;
+                if (event.data.type !== 'SAI_EXPORT_CHAT_RESPONSE') return;
+                
+                window.removeEventListener('message', handler);
+                
+                if (event.data.success) {
+                    resolve({ messages: event.data.messages, character: event.data.character });
                 } else {
-                    reject(new Error(data.error || 'Failed to fetch chat data'));
+                    reject(new Error(event.data.error || 'Failed to fetch chat data'));
                 }
             };
-            window.addEventListener('sai-export-data', handler);
+            window.addEventListener('message', handler);
             
-            // Inject and run the script
-            document.head.appendChild(script);
-            script.remove();
+            // Send request to page-context.js
+            window.postMessage({
+                type: 'SAI_EXPORT_CHAT_REQUEST',
+                characterId: characterId,
+                conversationId: conversationId
+            }, '*');
+            
+            // Timeout after 30 seconds
+            setTimeout(() => {
+                window.removeEventListener('message', handler);
+                reject(new Error('Export request timed out after 30 seconds'));
+            }, 30000);
         });
     }
     
@@ -7171,6 +8515,48 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             highlightBgColor = '#ffdd6d', highlightTextColor = '#000000'
         } = data;
         
+        // =====================================================================
+        // IMAGE DEDUPLICATION
+        // =====================================================================
+        // Collect all unique images and assign them IDs for CSS classes
+        // This dramatically reduces HTML size for long chats with many messages
+        const imageRegistry = new Map(); // imageUrl -> { id: string, cssClass: string }
+        let imageIdCounter = 0;
+        
+        const registerImage = (imageUrl) => {
+            if (!imageUrl) return null;
+            if (imageRegistry.has(imageUrl)) {
+                return imageRegistry.get(imageUrl);
+            }
+            const id = `avatar-img-${imageIdCounter++}`;
+            const entry = { id, cssClass: id, imageUrl };
+            imageRegistry.set(imageUrl, entry);
+            return entry;
+        };
+        
+        // Register all avatar images
+        const botImageEntry = registerImage(botImageUrl);
+        const userImageEntry = registerImage(userImageUrl);
+        
+        // Register group chat sub-character images
+        const subCharImageEntries = {};
+        if (isGroupChat) {
+            for (const [charId, imgUrl] of Object.entries(subCharacterImageMap)) {
+                subCharImageEntries[charId] = registerImage(imgUrl);
+            }
+        }
+        
+        // Generate CSS for all registered images
+        let imageCSSRules = '';
+        for (const [imageUrl, entry] of imageRegistry) {
+            imageCSSRules += `
+        .${entry.cssClass} {
+            background-image: url("${imageUrl.replace(/"/g, '\\"')}");
+            background-size: cover;
+            background-position: center;
+        }`;
+        }
+        
         // Format timestamp
         const formatTime = (timestamp) => {
             if (!timestamp) return '';
@@ -7213,31 +8599,32 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             const roleClass = isBot ? 'bot' : 'user';
             const altIndicator = msg.is_alternative ? '<span class="alt-badge">ALT</span>' : '';
             
-            // Determine sender name and avatar
-            let senderName, imgUrl;
+            // Determine sender name and avatar image entry
+            let senderName, imageEntry;
             if (isBot) {
                 if (isGroupChat && isFirstBotMessage) {
                     // First bot message in group chat: use group name and avatar
                     senderName = botName;
-                    imgUrl = botImageUrl;
+                    imageEntry = botImageEntry;
                     isFirstBotMessage = false;
                 } else if (isGroupChat && msg.character_id && subCharacterMap[msg.character_id]) {
                     // Subsequent bot messages in group chat: use individual character info
                     senderName = subCharacterMap[msg.character_id].name;
-                    imgUrl = subCharacterImageMap[msg.character_id] || subCharacterMap[msg.character_id].avatarUrl;
+                    imageEntry = subCharImageEntries[msg.character_id];
                 } else {
                     // Standard single-character chat
                     senderName = botName;
-                    imgUrl = botImageUrl;
+                    imageEntry = botImageEntry;
                 }
             } else {
                 // User message
                 senderName = userName;
-                imgUrl = userImageUrl;
+                imageEntry = userImageEntry;
             }
             
-            const avatarHTML = imgUrl
-                ? `<img class="avatar" src="${escapeHTML(imgUrl)}" alt="${escapeHTML(senderName)}">`
+            // Use CSS class for avatar instead of inline data URL
+            const avatarHTML = imageEntry
+                ? `<div class="avatar ${imageEntry.cssClass}" role="img" aria-label="${escapeHTML(senderName)}"></div>`
                 : `<div class="avatar-placeholder">${escapeHTML(senderName.charAt(0).toUpperCase())}</div>`;
             
             messagesHTML += `
@@ -7256,6 +8643,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             </div>`;
         }
         
+        // Calculate size savings for debug info
+        const uniqueImages = imageRegistry.size;
+        const totalImageRefs = sortedMessages.length; // Each message has an avatar
+        
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7266,6 +8657,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         /* 
          * S.AI Toolkit Chat Export Stylesheet
          * Feel free to customize these styles!
+         * 
+         * Image Optimization: ${uniqueImages} unique avatar(s) defined once in CSS,
+         * referenced ${totalImageRefs} times throughout ${sortedMessages.length} messages.
          */
         
         :root {
@@ -7326,13 +8720,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         .message.bot { background: var(--bot-message-bg); }
         
         .avatar-container { flex-shrink: 0; }
-        .avatar { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; }
+        .avatar { width: 40px; height: 40px; border-radius: 50%; }
         .avatar-placeholder {
             width: 40px; height: 40px; border-radius: 50%;
             background: var(--accent-color); color: white;
             display: flex; align-items: center; justify-content: center;
             font-weight: bold; font-size: 1.2rem;
         }
+        
+        /* Deduplicated avatar images - each base64 image defined only once */
+        ${imageCSSRules}
         
         .message-content { flex: 1; min-width: 0; }
         .message-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
@@ -7709,14 +9106,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Function to show toolkit settings modal
     async function showToolkitSettingsModal() {
-    debugLog('[Toolkit] ===== OPENING SETTINGS MODAL =====');
-    debugLog('[Toolkit] Current Sidebar Layout enabled?', await storage.get(SIDEBAR_LAYOUT_KEY, false));
-    debugLog('[Toolkit] Current Classic Layout enabled?', await storage.get(CLASSIC_LAYOUT_KEY, false));
-    debugLog('[Toolkit] Current Classic Style enabled?', await storage.get(CLASSIC_STYLE_KEY, false));
+    debugLog('[Core] ===== OPENING SETTINGS MODAL =====');
+    debugLog('[Core] Current Sidebar Layout enabled?', await storage.get(SIDEBAR_LAYOUT_KEY, false));
+    debugLog('[Core] Current Classic Layout enabled?', await storage.get(CLASSIC_LAYOUT_KEY, false));
+    debugLog('[Core] Current Classic Style enabled?', await storage.get(CLASSIC_STYLE_KEY, false));
     // Create or get a dedicated container with SHADOW DOM for complete isolation
         let toolkitRoot = document.getElementById('toolkit-modal-root');
         if (!toolkitRoot) {
-            debugLog('[Toolkit] Creating new toolkit-modal-root with Shadow DOM');
+            debugLog('[Core] Creating new toolkit-modal-root with Shadow DOM');
             toolkitRoot = document.createElement('div');
             toolkitRoot.id = 'toolkit-modal-root';
             toolkitRoot.className = 'toolkit-modal-container';
@@ -7725,7 +9122,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             // Attach shadow DOM for complete isolation from React
             const shadow = toolkitRoot.attachShadow({ mode: 'open' });
-            debugLog('[Toolkit] Shadow DOM attached');
+            debugLog('[Core] Shadow DOM attached');
             
             // Add styles to shadow DOM
             const style = document.createElement('style');
@@ -7978,6 +9375,26 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 @media (prefers-color-scheme: dark) {
                     .version-text { color: #6b7280; }
                 }
+                .debug-filter-label {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.35rem;
+                    font-size: 11px;
+                    color: #9ca3af;
+                    cursor: pointer;
+                    padding: 0.25rem 0.4rem;
+                    border-radius: 4px;
+                    transition: background 0.15s;
+                }
+                .debug-filter-label:hover {
+                    background: rgba(255,255,255,0.05);
+                }
+                .debug-filter-label input[type="checkbox"] {
+                    width: 14px;
+                    height: 14px;
+                    accent-color: #4ade80;
+                    cursor: pointer;
+                }
                 .btn-data {
                     flex: 1;
                     min-width: 120px;
@@ -8204,7 +9621,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         const shadow = toolkitRoot.shadowRoot;
-        debugLog('[Toolkit] Got shadow root, clearing existing content');
+        debugLog('[Core] Got shadow root, clearing existing content');
         
         // Clear existing content
         const existingBackdrop = shadow.querySelector('.backdrop');
@@ -8214,43 +9631,88 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         
         // State tracking
-        let sidebarEnabled = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-        let sidebarMinWidthValue = await storage.get(SIDEBAR_MIN_WIDTH_KEY, DEFAULT_SIDEBAR_MIN_WIDTH);
-        let compactGenerationEnabled = await storage.get(COMPACT_GENERATION_KEY, false);
-        let classicLayoutEnabled = await storage.get(CLASSIC_LAYOUT_KEY, false);
-        let classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
-        let customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
-        let customStyleValues = JSON.parse(await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE)));
-        let hideForYouEnabled = await storage.get(HIDE_FOR_YOU_KEY, false);
-        let pageJumpEnabled = await storage.get(PAGE_JUMP_KEY, false);
-        let showStatsEnabled = await storage.get('showGenerationStats', false);
-        let showModelDetailsEnabled = await storage.get('showModelDetails', true); // true = show "model → engine", false = show only "model"
-        let showTimestampEnabled = await storage.get('showTimestamp', false);
-        let timestampDateFirst = await storage.get('timestampDateFirst', true); // true = date@time, false = time@date
-        let timestamp24Hour = await storage.get('timestamp24Hour', false);
-        let showMessageIdsEnabled = await storage.get(SHOW_MESSAGE_IDS_KEY, false); // false = 12-hour (default), true = 24-hour
-        let showChatNameInTitleEnabled = await storage.get('showChatNameInTitle', false);
-        let nsfwToggleEnabled = await storage.get('nsfwToggleEnabled', false);
-        let wysiwygEnabled = await storage.get(WYSIWYG_EDITOR_KEY, false);
-        let enableGenerationProfilesEnabled = await storage.get(ENABLE_GENERATION_PROFILES_KEY, false);
-        let smallProfileImagesEnabled = await storage.get(SMALL_PROFILE_IMAGES_KEY, false);
-        let roundedProfileImagesEnabled = await storage.get(ROUNDED_PROFILE_IMAGES_KEY, false);
-        let swapCheckboxPositionEnabled = await storage.get(SWAP_CHECKBOX_POSITION_KEY, false);
-        let squareMessageEdgesEnabled = await storage.get(SQUARE_MESSAGE_EDGES_KEY, false);
-        let messageContainerMaxWidth = await storage.get(MESSAGE_CONTAINER_MAX_WIDTH_KEY, '');
+        // PERFORMANCE: Batch all modal settings into a single storage read
+        const modalSettings = await storage.getMultiple({
+            [SIDEBAR_LAYOUT_KEY]: false,
+            [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH,
+            [COMPACT_GENERATION_KEY]: false,
+            [CLASSIC_LAYOUT_KEY]: false,
+            [CLASSIC_STYLE_KEY]: false,
+            [CUSTOM_STYLE_KEY]: false,
+            [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
+            [HIDE_FOR_YOU_KEY]: false,
+            [PAGE_JUMP_KEY]: false,
+            'showGenerationStats': false,
+            'showModelDetails': true,
+            'showTimestamp': false,
+            'highlightModelChanges': false,
+            'autoRegenOnMismatch': false,
+            'autoRegenOnShort': false,
+            'autoRegenMaxAttempts': 1,
+            'timestampDateFirst': true,
+            'timestamp24Hour': false,
+            [SHOW_MESSAGE_IDS_KEY]: false,
+            'showChatNameInTitle': false,
+            'nsfwToggleEnabled': false,
+            'messageRecoveryEnabled': false,
+            [WYSIWYG_EDITOR_KEY]: false,
+            [ENABLE_GENERATION_PROFILES_KEY]: false,
+            [SMALL_PROFILE_IMAGES_KEY]: false,
+            [ROUNDED_PROFILE_IMAGES_KEY]: false,
+            [SWAP_CHECKBOX_POSITION_KEY]: false,
+            [SQUARE_MESSAGE_EDGES_KEY]: false,
+            [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
+            [MEMORY_DOT_ENABLED_KEY]: true,
+            [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
+            [HIDE_CREATOR_KEY]: false
+        });
         
-        debugLog('[Toolkit] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth);
+        let sidebarEnabled = modalSettings[SIDEBAR_LAYOUT_KEY];
+        let sidebarMinWidthValue = modalSettings[SIDEBAR_MIN_WIDTH_KEY];
+        let compactGenerationEnabled = modalSettings[COMPACT_GENERATION_KEY];
+        let classicLayoutEnabled = modalSettings[CLASSIC_LAYOUT_KEY];
+        let classicStyleEnabled = modalSettings[CLASSIC_STYLE_KEY];
+        let customStyleEnabled = modalSettings[CUSTOM_STYLE_KEY];
+        let customStyleValues = JSON.parse(modalSettings[CUSTOM_STYLE_VALUES_KEY]);
+        let hideForYouEnabled = modalSettings[HIDE_FOR_YOU_KEY];
+        let pageJumpEnabled = modalSettings[PAGE_JUMP_KEY];
+        let showStatsEnabled = modalSettings['showGenerationStats'];
+        let showModelDetailsEnabled = modalSettings['showModelDetails']; // true = show "model → engine", false = show only "model"
+        let showTimestampEnabled = modalSettings['showTimestamp'];
+        let highlightModelChangesEnabled = modalSettings['highlightModelChanges'];
+        let autoRegenOnMismatchEnabled = modalSettings['autoRegenOnMismatch'];
+        let autoRegenOnShortEnabled = modalSettings['autoRegenOnShort'];
+        let autoRegenMaxAttempts = modalSettings['autoRegenMaxAttempts'];
+        let timestampDateFirst = modalSettings['timestampDateFirst']; // true = date@time, false = time@date
+        let timestamp24Hour = modalSettings['timestamp24Hour'];
+        let showMessageIdsEnabled = modalSettings[SHOW_MESSAGE_IDS_KEY]; // false = 12-hour (default), true = 24-hour
+        let showChatNameInTitleEnabled = modalSettings['showChatNameInTitle'];
+        let nsfwToggleEnabled = modalSettings['nsfwToggleEnabled'];
+        let messageRecoveryEnabled = modalSettings['messageRecoveryEnabled'];
+        let wysiwygEnabled = modalSettings[WYSIWYG_EDITOR_KEY];
+        let enableGenerationProfilesEnabled = modalSettings[ENABLE_GENERATION_PROFILES_KEY];
+        let smallProfileImagesEnabled = modalSettings[SMALL_PROFILE_IMAGES_KEY];
+        let roundedProfileImagesEnabled = modalSettings[ROUNDED_PROFILE_IMAGES_KEY];
+        let swapCheckboxPositionEnabled = modalSettings[SWAP_CHECKBOX_POSITION_KEY];
+        let squareMessageEdgesEnabled = modalSettings[SQUARE_MESSAGE_EDGES_KEY];
+        let messageContainerMaxWidth = modalSettings[MESSAGE_CONTAINER_MAX_WIDTH_KEY];
+        let memoryDotEnabled = modalSettings[MEMORY_DOT_ENABLED_KEY];
+        let memoryDotColor = modalSettings[MEMORY_DOT_COLOR_KEY];
+        let hideCreatorEnabled = modalSettings[HIDE_CREATOR_KEY];
+
+        debugLog('[Core] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
         
         // Create backdrop
-        debugLog('[Toolkit] Creating backdrop and modal elements');
+        debugLog('[Core] Creating backdrop and modal elements');
         const backdrop = document.createElement('div');
         backdrop.className = 'backdrop';
         
         // Create modal with safe HTML (no dynamic content in innerHTML)
         const modal = document.createElement('div');
         modal.className = 'modal';
-        // Using static HTML template - checkboxes will be set programmatically below
-        modal.innerHTML = `
+        // Using static HTML template - checkboxes will be set programmatically below.
+        // Built via DOMParser to avoid the .innerHTML setter (Mozilla addons-linter).
+        const SETTINGS_MODAL_TEMPLATE = `
             <div class="modal-header">S.AI Toolkit Settings</div>
             
             <!-- Tab Navigation -->
@@ -8582,7 +10044,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <input type="text" id="custom-hover-button-color" class="style-input" placeholder="#292929">
                             <div class="color-preview"><div class="color-preview-inner" id="preview-hover-button"></div></div>
                         </div>
-                        
+                        <div class="style-input-row">
+                            <label class="style-label">Creator Link:</label>
+                            <input type="text" id="custom-creator-link-color" class="style-input" placeholder="e.g. #6b7280">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-creator-link-color"></div></div>
+                        </div>
+
                         <!-- Background Image Section -->
                         <div class="text-type-section">
                             <div class="style-input-row" style="margin-bottom: 0;">
@@ -8604,11 +10071,36 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     <!-- Message Container Section -->
                     <div class="custom-style-section">
                         <div class="section-title">Message Container</div>
-                        <div class="style-input-row">
+                        <div class="style-input-row" style="align-items: center;">
                             <label class="style-label">Max Width:</label>
-                            <input type="text" id="message-container-max-width" class="style-input" placeholder="e.g. 1200px, 90%">
+                            <input type="text" id="message-container-max-width" class="style-input" placeholder="e.g. 1200px, 90%" style="flex: 1; min-width: 0;">
                         </div>
-                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Set max width for message containers (leave empty for default 800px)</div>
+                        <div id="message-container-max-width-preview" style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:#6b7280;">
+                            <span>Preview:</span>
+                            <span id="message-container-max-width-preview-value">—</span>
+                            <div id="message-container-max-width-preview-box" style="flex:1;background:#f3f4f6;height:8px;border-radius:4px;overflow:hidden;border:1px solid rgba(0,0,0,0.06);max-width:240px;">
+                                <div id="message-container-max-width-preview-inner" style="background:#3b82f6;height:100%;width:100%;transition:width 0.12s ease;"></div>
+                            </div>
+                        </div>
+                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Max width for message containers — leave empty for default 800px.</div>
+                    </div>
+                    
+                    <!-- Memory Limit Indicator Section -->
+                    <div class="custom-style-section">
+                        <div class="section-title">Memory Limit Indicator</div>
+                        <label class="setting-row" style="margin-bottom: 12px;">
+                            <input type="checkbox" class="setting-checkbox" id="memory-dot-enabled-checkbox" autocomplete="off">
+                            <div class="setting-text">
+                                <div class="setting-title">Show Memory Dot</div>
+                                <div class="setting-desc">Display red dot when chat reaches memory limit</div>
+                            </div>
+                        </label>
+                        <div class="style-input-row">
+                            <label class="style-label">Dot Color:</label>
+                            <input type="text" id="memory-dot-color" class="style-input" placeholder="#ff3b3b">
+                            <div class="color-preview"><div class="color-preview-inner" id="preview-memory-dot-color"></div></div>
+                        </div>
+                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Customize the memory limit indicator color (default: red)</div>
                     </div>
                 </div>
                 
@@ -8674,6 +10166,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </label>
                     <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="highlight-model-changes-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Highlight Model Changes</div>
+                            <div class="setting-desc">Show yellow border when model changes between messages</div>
+                        </div>
+                    </label>
+                    <label class="sub-setting-row hidden" id="auto-regen-mismatch-row">
+                        <input type="checkbox" class="setting-checkbox" id="auto-regen-mismatch-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Auto-Regenerate on Mismatch</div>
+                            <div class="setting-desc">Automatically regenerate if model engine changes</div>
+                        </div>
+                    </label>
+                    <label class="sub-setting-row hidden" id="auto-regen-short-row">
+                        <input type="checkbox" class="setting-checkbox" id="auto-regen-short-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Auto-Regenerate on Short Response</div>
+                            <div class="setting-desc">Automatically regenerate if response is under 50 characters</div>
+                        </div>
+                    </label>
+                    <div class="sub-setting-row hidden" id="auto-regen-max-row">
+                        <div class="sub-setting-text" style="display: flex; align-items: center; gap: 8px;">
+                            <div class="sub-setting-title" style="white-space: nowrap;">Max Auto-Regenerations</div>
+                            <select id="auto-regen-max-select" style="background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 6px; font-size: 12px;">
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                            </select>
+                        </div>
+                    </div>
+                    <label class="setting-row">
                         <input type="checkbox" class="setting-checkbox" id="showchatnametitle-checkbox" autocomplete="off">
                         <div class="setting-text">
                             <div class="setting-title">Chat Name in Title</div>
@@ -8694,20 +10217,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="setting-desc">WYSIWYG preview in message editor and chat input</div>
                         </div>
                     </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="message-recovery-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Message Recovery</div>
+                            <div class="setting-desc">Save messages locally when SpicyChat fails to send them, and offer one-click recovery</div>
+                        </div>
+                    </label>
+                    <label class="setting-row">
+                        <input type="checkbox" class="setting-checkbox" id="hide-creator-checkbox" autocomplete="off">
+                        <div class="setting-text">
+                            <div class="setting-title">Hide Creator Name</div>
+                            <div class="setting-desc">Hide the @username creator link under bot messages</div>
+                        </div>
+                    </label>
                     <label class="setting-row hidden" id="generation-profiles-row">
                         <input type="checkbox" class="setting-checkbox" id="generation-profiles-checkbox" autocomplete="off">
                         <div class="setting-text">
                             <div class="setting-title">Generation Profiles (Legacy)</div>
                             <div class="setting-desc">Re-enable generation profile selector</div>
-                        </div>
-                    </label>
-                    
-                    <div class="section-title">Memories</div>
-                    <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="memories-auto-injection-checkbox" autocomplete="off" disabled>
-                        <div class="setting-text">
-                            <div class="setting-title">Memories Auto-Injection</div>
-                            <div class="setting-desc">Coming soon...</div>
                         </div>
                     </label>
                 </div>
@@ -8741,7 +10269,65 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <button class="btn-data" id="clear-all-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Clear All Data</button>
                     </div>
                     
-                    <div class="version-text" id="version-text">v1.0.42</div>
+                    <div class="version-text" id="version-text">v1.0.65</div>
+                    
+                    <!-- Debug Log Filters (only visible in debug mode) -->
+                    <div id="debug-filters-section" class="hidden" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <div class="section-title" style="color: #4ade80;">🐛 Debug Log Filters</div>
+                        <div class="section-desc">Toggle which log categories appear in console</div>
+                        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-top: 0.75rem;">
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-core" checked> Core
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-stats" checked> Stats
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-memories" checked> Memories
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-export" checked> Export
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-nsfw" checked> NSFW
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-chattitle" checked> ChatTitle
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-wysiwyg" checked> WYSIWYG
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-wysiwyg-text"> WYSIWYG-Text
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-profile" checked> Profile
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-model" checked> Model
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-cache" checked> Cache
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-migration" checked> Migration
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-custom" checked> Custom
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-compact" checked> Compact
+                            </label>
+                        </div>
+                        <div class="data-buttons" style="margin-top: 0.75rem;">
+                            <button class="btn-data" id="debug-filter-all-btn">Enable All</button>
+                            <button class="btn-data" id="debug-filter-none-btn">Disable All</button>
+                        </div>
+                        <div id="model-override-section" style="display: none; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(255,140,0,0.3);">
+                            <div style="font-size: 0.75rem; font-weight: 600; color: #ff8c00; margin-bottom: 0.4rem;">Model Override <span style="color: #9ca3af; font-weight: 400; font-size: 0.7rem;">(quad-click "Model" to toggle)</span></div>
+                            <input type="text" id="model-override-input" placeholder="e.g. glm5-beta" autocomplete="off" style="width: 100%; box-sizing: border-box; padding: 0.4rem 0.5rem; background: rgba(255,140,0,0.08); border: 1px solid rgba(255,140,0,0.5); border-radius: 4px; color: #ff8c00; font-size: 0.75rem; outline: none; font-family: monospace;">
+                        </div>
+                    </div>
                 </div>
             </div>
             
@@ -8750,12 +10336,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 <button class="btn-save" id="save-btn">Save & Refresh</button>
             </div>
         `;
-        
+        modal.replaceChildren(parseHTMLToFragment(SETTINGS_MODAL_TEMPLATE));
+
         // Append to shadow DOM
         shadow.appendChild(backdrop);
         shadow.appendChild(modal);
         
-        debugLog('[Toolkit] Modal and backdrop appended to shadow DOM');
+        debugLog('[Core] Modal and backdrop appended to shadow DOM');
         
         // Get checkbox elements within shadow DOM
         const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
@@ -8797,8 +10384,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
         const timestampHourFormatCheckbox = shadow.querySelector('#timestamp-hour-format-checkbox');
         const showMessageIdsCheckbox = shadow.querySelector('#show-message-ids-checkbox');
+        const highlightModelChangesCheckbox = shadow.querySelector('#highlight-model-changes-checkbox');
+        const autoRegenMismatchCheckbox = shadow.querySelector('#auto-regen-mismatch-checkbox');
+        const autoRegenShortCheckbox = shadow.querySelector('#auto-regen-short-checkbox');
+        const autoRegenMaxSelect = shadow.querySelector('#auto-regen-max-select');
+        const autoRegenMismatchRow = shadow.querySelector('#auto-regen-mismatch-row');
+        const autoRegenShortRow = shadow.querySelector('#auto-regen-short-row');
+        const autoRegenMaxRow = shadow.querySelector('#auto-regen-max-row');
         const showChatNameInTitleCheckbox = shadow.querySelector('#showchatnametitle-checkbox');
         const nsfwToggleCheckbox = shadow.querySelector('#nsfwtoggle-checkbox');
+        const messageRecoveryCheckbox = shadow.querySelector('#message-recovery-checkbox');
+        const hideCreatorCheckbox = shadow.querySelector('#hide-creator-checkbox');
         const wysiwygCheckbox = shadow.querySelector('#wysiwyg-checkbox');
         const enableGenerationProfilesCheckbox = shadow.querySelector('#generation-profiles-checkbox');
         const generationProfilesRow = shadow.querySelector('#generation-profiles-row');
@@ -8809,13 +10405,207 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const sidebarMinWidthRow = shadow.querySelector('#sidebar-min-width-row');
         const sidebarMinWidthInput = shadow.querySelector('#sidebar-min-width-input');
         const customHoverButtonColorInput = shadow.querySelector('#custom-hover-button-color');
+        const customCreatorLinkColorInput = shadow.querySelector('#custom-creator-link-color');
         const customBackgroundImageInput = shadow.querySelector('#custom-background-image');
         const clearBackgroundImageBtn = shadow.querySelector('#clear-background-image-btn');
         const messageContainerMaxWidthInput = shadow.querySelector('#message-container-max-width');
+        // Help/tooltip element for units and validation feedback (inserted after input if not present)
+        let messageContainerMaxWidthHelp = shadow.querySelector('#message-container-max-width-help');
+        if (!messageContainerMaxWidthHelp) {
+            messageContainerMaxWidthHelp = document.createElement('div');
+            messageContainerMaxWidthHelp.id = 'message-container-max-width-help';
+            messageContainerMaxWidthHelp.style.fontSize = '12px';
+            messageContainerMaxWidthHelp.style.color = '#6b7280';
+            messageContainerMaxWidthHelp.style.marginTop = '8px';
+            messageContainerMaxWidthHelp.style.padding = '8px 10px';
+            messageContainerMaxWidthHelp.style.background = 'rgba(59, 130, 246, 0.06)';
+            messageContainerMaxWidthHelp.style.border = '1px solid rgba(59, 130, 246, 0.2)';
+            messageContainerMaxWidthHelp.style.borderRadius = '6px';
+            messageContainerMaxWidthHelp.style.lineHeight = '1.5';
+            messageContainerMaxWidthHelp.style.display = 'none';
+            messageContainerMaxWidthHelp.setAttribute('aria-hidden', 'true');
+            // Insert after the input's row so it appears directly below the input
+            const inputRow = messageContainerMaxWidthInput ? messageContainerMaxWidthInput.closest('.style-input-row') : null;
+            if (inputRow && inputRow.parentNode) {
+                inputRow.parentNode.insertBefore(messageContainerMaxWidthHelp, inputRow.nextSibling);
+            } else if (messageContainerMaxWidthInput && messageContainerMaxWidthInput.parentNode) {
+                messageContainerMaxWidthInput.parentNode.insertBefore(messageContainerMaxWidthHelp, messageContainerMaxWidthInput.nextSibling);
+            } else if (shadow) {
+                shadow.appendChild(messageContainerMaxWidthHelp);
+            }
+        }
+
+        // Structured units help — shown when input is focused
+        const MESSAGE_MAX_WIDTH_HELP_HTML = `
+            <div style="font-weight:600;color:#374151;margin-bottom:6px;">Supported units</div>
+            <ul style="margin:0;padding-left:18px;list-style:disc;">
+                <li><strong>px</strong> — pixels (e.g. <code>800px</code>)</li>
+                <li><strong>%</strong> — percent of parent container (e.g. <code>90%</code>)</li>
+                <li><strong>vw</strong> — viewport width (e.g. <code>50vw</code>)</li>
+                <li><strong>rem</strong> / <strong>em</strong> — relative to font-size</li>
+                <li><strong>vmin</strong> / <strong>vmax</strong> — min/max of viewport dimensions</li>
+                <li><strong>ch</strong> — width of the "0" character</li>
+                <li><strong>cm</strong>, <strong>mm</strong>, <strong>in</strong>, <strong>pt</strong>, <strong>pc</strong> — absolute units</li>
+            </ul>
+            <div style="margin-top:6px;font-style:italic;color:#6b7280;">Unitless numbers are treated as px.</div>
+        `;
+
+        // Preview elements (created in template); query them
+        const messageContainerMaxWidthPreview = shadow.querySelector('#message-container-max-width-preview');
+        const messageContainerMaxWidthPreviewValue = shadow.querySelector('#message-container-max-width-preview-value');
+        const messageContainerMaxWidthPreviewInner = shadow.querySelector('#message-container-max-width-preview-inner');
+        const memoryDotEnabledCheckbox = shadow.querySelector('#memory-dot-enabled-checkbox');
+        const memoryDotColorInput = shadow.querySelector('#memory-dot-color');
+        const previewMemoryDotColor = shadow.querySelector('#preview-memory-dot-color');
         const previewHoverButton = shadow.querySelector('#preview-hover-button');
+        const previewCreatorLinkColor = shadow.querySelector('#preview-creator-link-color');
         const versionText = shadow.querySelector('#version-text');
+        const debugFiltersSection = shadow.querySelector('#debug-filters-section');
         
-        // Easter egg: Shift+click on version text toggles DEBUG_MODE
+        // Debug filter checkboxes
+        const debugFilterCheckboxes = {
+            Core: shadow.querySelector('#debug-filter-core'),
+            Stats: shadow.querySelector('#debug-filter-stats'),
+            Memories: shadow.querySelector('#debug-filter-memories'),
+            Export: shadow.querySelector('#debug-filter-export'),
+            NSFW: shadow.querySelector('#debug-filter-nsfw'),
+            ChatTitle: shadow.querySelector('#debug-filter-chattitle'),
+            WYSIWYG: shadow.querySelector('#debug-filter-wysiwyg'),
+            'WYSIWYG-Text': shadow.querySelector('#debug-filter-wysiwyg-text'),
+            Profile: shadow.querySelector('#debug-filter-profile'),
+            Model: shadow.querySelector('#debug-filter-model'),
+            Cache: shadow.querySelector('#debug-filter-cache'),
+            Migration: shadow.querySelector('#debug-filter-migration'),
+            Custom: shadow.querySelector('#debug-filter-custom'),
+            Compact: shadow.querySelector('#debug-filter-compact')
+        };
+        
+        // Initialize debug filter checkboxes from current state
+        for (const [category, checkbox] of Object.entries(debugFilterCheckboxes)) {
+            if (checkbox) {
+                checkbox.checked = debugLogFilters[category] !== false;
+                checkbox.addEventListener('change', async () => {
+                    debugLogFilters[category] = checkbox.checked;
+                    await storage.set('debugLogFilters', debugLogFilters);
+                    console.log(`[Core] Debug filter "${category}" ${checkbox.checked ? 'enabled' : 'disabled'}`);
+                });
+            }
+        }
+        
+        // Secret model override: Quad-click (4 times within 2s) on the "Model" debug filter label
+        // Forces inference_model to user-specified value for all chat/story POST requests
+        // Section with textbox is only visible while override is active (orange text)
+        const modelCheckbox = debugFilterCheckboxes.Model;
+        const modelLabel = modelCheckbox ? modelCheckbox.closest('label') : null;
+        const modelOverrideSection = shadow.querySelector('#model-override-section');
+        const modelOverrideInput = shadow.querySelector('#model-override-input');
+        if (modelCheckbox && modelLabel && modelOverrideSection && modelOverrideInput) {
+            // Load initial state from storage and sync to interceptor
+            Promise.all([
+                storage.get('modelOverrideEnabled', false),
+                storage.get('modelOverrideName', '')
+            ]).then(([enabled, modelName]) => {
+                if (modelName) modelOverrideInput.value = modelName;
+                if (enabled) {
+                    modelLabel.style.color = '#ff8c00';
+                    modelOverrideSection.style.display = '';
+                    window.postMessage({ type: 'SAI_SET_MODEL_OVERRIDE', model: modelName || null }, '*');
+                }
+            });
+
+            // Live-update interceptor as user types the model name
+            modelOverrideInput.addEventListener('input', async (e) => {
+                const name = e.target.value.trim();
+                await storage.set('modelOverrideName', e.target.value);
+                const isEnabled = await storage.get('modelOverrideEnabled', false);
+                if (isEnabled) {
+                    window.postMessage({ type: 'SAI_SET_MODEL_OVERRIDE', model: name || null }, '*');
+                }
+            });
+
+            // Quad-click on Model label to toggle override
+            let overrideTapCount = 0;
+            let overrideTapTimer = null;
+            modelLabel.addEventListener('click', async (e) => {
+                if (!e.isTrusted) return;
+                overrideTapCount++;
+                clearTimeout(overrideTapTimer);
+                overrideTapTimer = setTimeout(() => { overrideTapCount = 0; }, 2000);
+
+                if (overrideTapCount === 4) {
+                    overrideTapCount = 0;
+                    clearTimeout(overrideTapTimer);
+
+                    const currentlyEnabled = await storage.get('modelOverrideEnabled', false);
+                    const newState = !currentlyEnabled;
+                    const modelName = modelOverrideInput.value.trim() ||
+                                      await storage.get('modelOverrideName', '');
+
+                    await storage.set('modelOverrideEnabled', newState);
+                    if (modelName) await storage.set('modelOverrideName', modelName);
+
+                    if (newState) {
+                        modelLabel.style.color = '#ff8c00';
+                        modelOverrideSection.style.display = '';
+                        if (modelName) modelOverrideInput.value = modelName;
+                        window.postMessage({ type: 'SAI_SET_MODEL_OVERRIDE', model: modelName || null }, '*');
+                        // Suppress mismatch auto-regen for the first response (model change is expected)
+                        window.__suppressMismatchNext = true;
+                        debugLog('[Model] Model override ENABLED:', modelName);
+                    } else {
+                        modelLabel.style.color = '';
+                        modelOverrideSection.style.display = 'none';
+                        window.postMessage({ type: 'SAI_SET_MODEL_OVERRIDE', model: null }, '*');
+                        window.__suppressMismatchNext = false;
+                        debugLog('[Model] Model override DISABLED');
+                    }
+                }
+            });
+        }
+        
+        // Debug filter "Enable All" button
+        const debugFilterAllBtn = shadow.querySelector('#debug-filter-all-btn');
+        if (debugFilterAllBtn) {
+            debugFilterAllBtn.addEventListener('click', async () => {
+                for (const [category, checkbox] of Object.entries(debugFilterCheckboxes)) {
+                    if (checkbox) {
+                        checkbox.checked = true;
+                        debugLogFilters[category] = true;
+                    }
+                }
+                await storage.set('debugLogFilters', debugLogFilters);
+                console.log('[Core] All debug filters enabled');
+            });
+        }
+        
+        // Debug filter "Disable All" button
+        const debugFilterNoneBtn = shadow.querySelector('#debug-filter-none-btn');
+        if (debugFilterNoneBtn) {
+            debugFilterNoneBtn.addEventListener('click', async () => {
+                for (const [category, checkbox] of Object.entries(debugFilterCheckboxes)) {
+                    if (checkbox) {
+                        checkbox.checked = false;
+                        debugLogFilters[category] = false;
+                    }
+                }
+                await storage.set('debugLogFilters', debugLogFilters);
+                console.log('[Core] All debug filters disabled');
+            });
+        }
+        
+        // Show/hide debug filters section based on DEBUG_MODE
+        function updateDebugFiltersVisibility() {
+            if (debugFiltersSection) {
+                if (DEBUG_MODE) {
+                    debugFiltersSection.classList.remove('hidden');
+                } else {
+                    debugFiltersSection.classList.add('hidden');
+                }
+            }
+        }
+        updateDebugFiltersVisibility();
+        
+        // Easter egg: Shift+click or 4 quick taps on version text toggles DEBUG_MODE
         if (versionText) {
             // Set initial color based on current DEBUG_MODE state
             if (DEBUG_MODE) {
@@ -8823,23 +10613,67 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }
             
             versionText.style.cursor = 'pointer';
+            
+            // Multi-tap detection
+            let tapCount = 0;
+            let tapTimer = null;
+            
             versionText.addEventListener('click', async (e) => {
+                // Shift+click immediately toggles debug mode
                 if (e.shiftKey) {
+                    tapCount = 0; // Reset tap counter
+                    clearTimeout(tapTimer);
+                    
                     DEBUG_MODE = !DEBUG_MODE;
                     // Persist to storage
                     await storage.set('debugMode', DEBUG_MODE);
                     window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
                     if (DEBUG_MODE) {
                         versionText.style.color = '#4ade80'; // light green
-                        console.log('[Toolkit] 🐛 Debug mode ENABLED (saved)');
+                        console.log('[Core] 🐛 Debug mode ENABLED (saved)');
                         generationProfilesRow.classList.remove('hidden');
                     } else {
                         versionText.style.color = ''; // reset to default
-                        console.log('[Toolkit] Debug mode disabled (saved)');
+                        console.log('[Core] Debug mode disabled (saved)');
                         generationProfilesRow.classList.add('hidden');
                     }
                     // Update generation profiles section visibility
                     await updateGenerationProfilesVisibility();
+                    // Update debug filters visibility
+                    updateDebugFiltersVisibility();
+                } else {
+                    // Regular click - count taps
+                    tapCount++;
+                    
+                    // Reset tap counter after 2 seconds of inactivity
+                    clearTimeout(tapTimer);
+                    tapTimer = setTimeout(() => {
+                        tapCount = 0;
+                    }, 2000);
+                    
+                    // Toggle debug mode on 4th tap
+                    if (tapCount === 4) {
+                        tapCount = 0;
+                        clearTimeout(tapTimer);
+                        
+                        DEBUG_MODE = !DEBUG_MODE;
+                        // Persist to storage
+                        await storage.set('debugMode', DEBUG_MODE);
+                        window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
+                        if (DEBUG_MODE) {
+                            versionText.style.color = '#4ade80'; // light green
+                            console.log('[Core] 🐛 Debug mode ENABLED (saved)');
+                            generationProfilesRow.classList.remove('hidden');
+                        } else {
+                            versionText.style.color = ''; // reset to default
+                            console.log('[Core] Debug mode disabled (saved)');
+                            generationProfilesRow.classList.add('hidden');
+                        }
+                        // Update generation profiles section visibility
+                        await updateGenerationProfilesVisibility();
+                        // Update debug filters visibility
+                        updateDebugFiltersVisibility();
+                    }
                 }
             });
         }
@@ -8876,17 +10710,51 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         customFontSizeInput.value = customStyleValues.fontSize;
         customFontFamilyInput.value = customStyleValues.fontFamily || '';
         customHoverButtonColorInput.value = customStyleValues.hoverButtonColor || '#292929';
+        customCreatorLinkColorInput.value = customStyleValues.creatorLinkColor || '';
         messageContainerMaxWidthInput.value = messageContainerMaxWidth || '';
+        // Initialize preview display with current value (normalized)
+        try {
+            const previewNorm = (val) => {
+                let s = String(val || '').trim();
+                if (/^\d+(?:\.\d+)?$/.test(s)) s = `${s}px`;
+                return s;
+            };
+            const initNorm = previewNorm(messageContainerMaxWidth);
+            if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = initNorm || '—';
+            if (messageContainerMaxWidthPreviewInner && initNorm) {
+                messageContainerMaxWidthPreviewInner.style.width = initNorm;
+            }
+        } catch (err) {
+            // ignore preview init errors
+        }
+        memoryDotEnabledCheckbox.checked = memoryDotEnabled;
+        memoryDotColorInput.value = memoryDotColor || '#ff3b3b';
         hideForYouCheckbox.checked = hideForYouEnabled;
         pageJumpCheckbox.checked = pageJumpEnabled;
         showStatsCheckbox.checked = showStatsEnabled;
         modelDetailsCheckbox.checked = showModelDetailsEnabled;
         showTimestampCheckbox.checked = showTimestampEnabled;
+        highlightModelChangesCheckbox.checked = highlightModelChangesEnabled;
+        autoRegenMismatchCheckbox.checked = autoRegenOnMismatchEnabled;
+        autoRegenShortCheckbox.checked = autoRegenOnShortEnabled;
+        autoRegenMaxSelect.value = String(autoRegenMaxAttempts || 1);
+        // Show/hide sub-options based on highlight model changes state
+        const updateAutoRegenVisibility = () => {
+            const showSubs = highlightModelChangesCheckbox.checked;
+            autoRegenMismatchRow.classList.toggle('hidden', !showSubs);
+            autoRegenShortRow.classList.toggle('hidden', !showSubs);
+            // Show max attempts only if either auto-regen option is checked
+            const showMax = showSubs && (autoRegenMismatchCheckbox.checked || autoRegenShortCheckbox.checked);
+            autoRegenMaxRow.classList.toggle('hidden', !showMax);
+        };
+        updateAutoRegenVisibility();
         timestampFormatCheckbox.checked = timestampDateFirst;
         timestampHourFormatCheckbox.checked = timestamp24Hour;
         showMessageIdsCheckbox.checked = showMessageIdsEnabled;
         showChatNameInTitleCheckbox.checked = showChatNameInTitleEnabled;
         nsfwToggleCheckbox.checked = nsfwToggleEnabled;
+        messageRecoveryCheckbox.checked = messageRecoveryEnabled;
+        hideCreatorCheckbox.checked = hideCreatorEnabled;
         wysiwygCheckbox.checked = wysiwygEnabled;
         enableGenerationProfilesCheckbox.checked = enableGenerationProfilesEnabled;
         
@@ -8939,20 +10807,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             customStyleOptions.classList.add('hidden');
         }
         
-        debugLog('[Toolkit] Checkbox states set programmatically');
+        debugLog('[Core] Checkbox states set programmatically');
         
         // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
         // Use BUBBLE phase (false) so events reach our handlers first, THEN get stopped from escaping
-        debugLog('[Toolkit] Installing comprehensive event barrier at shadow root (bubble phase)');
+        debugLog('[Core] Installing comprehensive event barrier at shadow root (bubble phase)');
         const eventTypes = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 
                            'touchstart', 'touchend', 'keydown', 'keyup', 'input', 'change'];
         eventTypes.forEach(async eventType => {
             shadow.addEventListener(eventType, (e) => {
-                debugLog('[Toolkit] Event barrier stopping propagation:', eventType, 'target:', e.target.id || e.target.className);
+                debugLog('[Core] Event barrier stopping propagation:', eventType, 'target:', e.target.id || e.target.className);
                 e.stopPropagation();  // Prevent event from escaping shadow DOM
             }, false); // Bubble phase - runs AFTER our handlers, stops events from leaving shadow DOM
         });
-        debugLog('[Toolkit] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
+        debugLog('[Core] Event barrier installed (bubble phase) for:', eventTypes.join(', '));
         
         // Tab switching logic
         const tabBtns = shadow.querySelectorAll('.tab-btn');
@@ -8960,7 +10828,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         tabBtns.forEach(btn => {
             btn.addEventListener('click', () => {
                 const targetTab = btn.dataset.tab;
-                debugLog('[Toolkit] Tab switched to:', targetTab);
+                debugLog('[Core] Tab switched to:', targetTab);
                 
                 // Update active states
                 tabBtns.forEach(b => b.classList.remove('active'));
@@ -8973,7 +10841,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             });
         });
-        debugLog('[Toolkit] Tab switching initialized');
+        debugLog('[Core] Tab switching initialized');
         
         // Collapsible text type sections
         const textTypeHeaders = shadow.querySelectorAll('.text-type-header');
@@ -9000,7 +10868,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             });
         });
-        debugLog('[Toolkit] Collapsible text type sections initialized');
+        debugLog('[Core] Collapsible text type sections initialized');
         
         // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
@@ -9019,24 +10887,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Check if this is first run (onboarding) - disable cancel if so
         const hasSeenOnboarding = await storage.get('hasSeenOnboarding', false);
         if (!hasSeenOnboarding) {
-            debugLog('[Toolkit] First run - disabling Cancel button');
+            debugLog('[Core] First run - disabling Cancel button');
             cancelBtn.disabled = true;
             cancelBtn.style.opacity = '0.5';
             cancelBtn.style.cursor = 'not-allowed';
             cancelBtn.title = 'Please save your settings or refresh the page manually';
         }
         
-        debugLog('[Toolkit] Button query results:');
-        debugLog('[Toolkit]   cancelBtn:', cancelBtn);
-        debugLog('[Toolkit]   saveBtn:', saveBtn);
-        debugLog('[Toolkit]   exportAllBtn:', exportAllBtn);
-        debugLog('[Toolkit]   importAllBtn:', importAllBtn);
+        debugLog('[Core] Button query results:');
+        debugLog('[Core]   cancelBtn:', cancelBtn);
+        debugLog('[Core]   saveBtn:', saveBtn);
+        debugLog('[Core]   exportAllBtn:', exportAllBtn);
+        debugLog('[Core]   importAllBtn:', importAllBtn);
         
         if (!exportAllBtn) {
-            console.error('[Toolkit] ERROR: exportAllBtn not found in shadow DOM!');
+            console.error('[Core] ERROR: exportAllBtn not found in shadow DOM!');
         }
         if (!importAllBtn) {
-            console.error('[Toolkit] ERROR: importAllBtn not found in shadow DOM!');
+            console.error('[Core] ERROR: importAllBtn not found in shadow DOM!');
         }
         
         // Helper function to update generation profiles visibility
@@ -9071,9 +10939,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Checkbox change handlers track state
         sidebarCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SIDEBAR CHECKBOX CHANGED');
+            debugLog('[Core] SIDEBAR CHECKBOX CHANGED');
             sidebarEnabled = e.target.checked;
-            debugLog('[Toolkit] Sidebar:', sidebarEnabled);
+            debugLog('[Core] Sidebar:', sidebarEnabled);
             
             // Toggle compact generation and min width sub-settings visibility
             if (sidebarEnabled) {
@@ -9090,55 +10958,55 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Sidebar minimum width input handler
         sidebarMinWidthInput.oninput = (e) => {
-            debugLog('[Toolkit] SIDEBAR MIN WIDTH INPUT CHANGED');
+            debugLog('[Core] SIDEBAR MIN WIDTH INPUT CHANGED');
             const value = parseInt(e.target.value, 10);
             // If empty or invalid, will be set to default on save
             if (!isNaN(value) && value >= 600 && value <= 2000) {
                 sidebarMinWidthValue = value;
             }
-            debugLog('[Toolkit] Sidebar Min Width:', sidebarMinWidthValue);
+            debugLog('[Core] Sidebar Min Width:', sidebarMinWidthValue);
         };
         
         compactGenerationCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] COMPACT GENERATION CHECKBOX CHANGED');
+            debugLog('[Core] COMPACT GENERATION CHECKBOX CHANGED');
             compactGenerationEnabled = e.target.checked;
-            debugLog('[Toolkit] Compact Generation:', compactGenerationEnabled);
+            debugLog('[Core] Compact Generation:', compactGenerationEnabled);
         };
         
         classicLayoutCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] CLASSIC LAYOUT CHECKBOX CHANGED');
+            debugLog('[Core] CLASSIC LAYOUT CHECKBOX CHANGED');
             classicLayoutEnabled = e.target.checked;
-            debugLog('[Toolkit] Classic Layout:', classicLayoutEnabled);
+            debugLog('[Core] Classic Layout:', classicLayoutEnabled);
         };
         
         smallProfileImagesCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SMALL PROFILE IMAGES CHECKBOX CHANGED');
+            debugLog('[Core] SMALL PROFILE IMAGES CHECKBOX CHANGED');
             smallProfileImagesEnabled = e.target.checked;
-            debugLog('[Toolkit] Small Profile Images:', smallProfileImagesEnabled);
+            debugLog('[Core] Small Profile Images:', smallProfileImagesEnabled);
         };
         
         roundedProfileImagesCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] ROUNDED PROFILE IMAGES CHECKBOX CHANGED');
+            debugLog('[Core] ROUNDED PROFILE IMAGES CHECKBOX CHANGED');
             roundedProfileImagesEnabled = e.target.checked;
-            debugLog('[Toolkit] Rounded Profile Images:', roundedProfileImagesEnabled);
+            debugLog('[Core] Rounded Profile Images:', roundedProfileImagesEnabled);
         };
         
         swapCheckboxPositionCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SWAP CHECKBOX POSITION CHECKBOX CHANGED');
+            debugLog('[Core] SWAP CHECKBOX POSITION CHECKBOX CHANGED');
             swapCheckboxPositionEnabled = e.target.checked;
-            debugLog('[Toolkit] Swap Checkbox Position:', swapCheckboxPositionEnabled);
+            debugLog('[Core] Swap Checkbox Position:', swapCheckboxPositionEnabled);
         };
         
         squareMessageEdgesCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SQUARE MESSAGE EDGES CHECKBOX CHANGED');
+            debugLog('[Core] SQUARE MESSAGE EDGES CHECKBOX CHANGED');
             squareMessageEdgesEnabled = e.target.checked;
-            debugLog('[Toolkit] Square Message Edges:', squareMessageEdgesEnabled);
+            debugLog('[Core] Square Message Edges:', squareMessageEdgesEnabled);
         };
         
         classicStyleCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] CLASSIC STYLE CHECKBOX CHANGED');
+            debugLog('[Core] CLASSIC STYLE CHECKBOX CHANGED');
             classicStyleEnabled = e.target.checked;
-            debugLog('[Toolkit] Classic Style:', classicStyleEnabled);
+            debugLog('[Core] Classic Style:', classicStyleEnabled);
             
             // Mutual exclusivity: Disable Custom Style if Classic Style is enabled
             if (classicStyleEnabled && customStyleEnabled) {
@@ -9149,9 +11017,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         };
         
         customStyleCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] CUSTOM STYLE CHECKBOX CHANGED');
+            debugLog('[Core] CUSTOM STYLE CHECKBOX CHANGED');
             customStyleEnabled = e.target.checked;
-            debugLog('[Toolkit] Custom Style:', customStyleEnabled);
+            debugLog('[Core] Custom Style:', customStyleEnabled);
             
             // Mutual exclusivity: Disable Classic Style if Custom Style is enabled
             if (customStyleEnabled && classicStyleEnabled) {
@@ -9222,6 +11090,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (previewHighlightBg) previewHighlightBg.style.background = customStyleValues.highlightBgColor || 'transparent';
         if (previewHighlightText) previewHighlightText.style.background = customStyleValues.highlightTextColor || 'transparent';
         if (previewHoverButton) previewHoverButton.style.background = customStyleValues.hoverButtonColor || '#292929';
+        if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = customStyleValues.creatorLinkColor || 'transparent';
+        if (previewMemoryDotColor) previewMemoryDotColor.style.background = memoryDotColor || '#ff3b3b';
         updateFontPreview();
         
         // Update custom style values when inputs change (with preview updates)
@@ -9272,9 +11142,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         customHighlightTextDecorationSelect.onchange = (e) => { customStyleValues.highlightTextDecoration = e.target.value; updateFontPreview(); };
         customFontSizeInput.oninput = (e) => { customStyleValues.fontSize = e.target.value; updateFontPreview(); };
         customFontFamilyInput.oninput = (e) => { customStyleValues.fontFamily = e.target.value; updateFontPreview(); };
-        customHoverButtonColorInput.oninput = (e) => { 
+        customHoverButtonColorInput.oninput = (e) => {
             customStyleValues.hoverButtonColor = e.target.value;
             if (previewHoverButton) previewHoverButton.style.background = e.target.value || 'transparent';
+        };
+        customCreatorLinkColorInput.oninput = (e) => {
+            customStyleValues.creatorLinkColor = e.target.value;
+            if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = e.target.value || 'transparent';
+        };
+
+        // Memory dot color input handler
+        memoryDotColorInput.oninput = (e) => {
+            memoryDotColor = e.target.value;
+            if (previewMemoryDotColor) previewMemoryDotColor.style.background = e.target.value || '#ff3b3b';
         };
         
         // Background image upload handler
@@ -9293,7 +11173,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             const reader = new FileReader();
             reader.onload = (event) => {
                 customStyleValues.backgroundImage = event.target.result;
-                debugLog('[Toolkit] Background image loaded:', customStyleValues.backgroundImage.substring(0, 50) + '...');
+                debugLog('[Core] Background image loaded:', customStyleValues.backgroundImage.substring(0, 50) + '...');
             };
             reader.onerror = () => {
                 alert('Error reading image file');
@@ -9307,29 +11187,116 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             e.stopPropagation();
             customStyleValues.backgroundImage = '';
             customBackgroundImageInput.value = '';
-            debugLog('[Toolkit] Background image cleared');
+            debugLog('[Core] Background image cleared');
         };
         
-        messageContainerMaxWidthInput.oninput = (e) => { 
-            messageContainerMaxWidth = e.target.value;
+        const validateMaxWidth = (raw) => {
+            const validPattern = /^\d+(?:\.\d+)?(?:px|%|vw|rem|em|ch|vmin|vmax|cm|mm|in|pt|pc)$/i;
+            const numericOnly = /^\d+(?:\.\d+)?$/;
+            if (numericOnly.test(raw)) return { valid: true, normalized: `${raw}px` };
+            if (validPattern.test(raw)) return { valid: true, normalized: raw };
+            return { valid: false, normalized: raw };
         };
-        
+
+        const showMaxWidthUnitsHelp = () => {
+            messageContainerMaxWidthHelp.replaceChildren(parseHTMLToFragment(MESSAGE_MAX_WIDTH_HELP_HTML));
+            messageContainerMaxWidthHelp.style.display = 'block';
+            messageContainerMaxWidthHelp.style.color = '#374151';
+            messageContainerMaxWidthHelp.style.background = 'rgba(59, 130, 246, 0.06)';
+            messageContainerMaxWidthHelp.style.borderColor = 'rgba(59, 130, 246, 0.2)';
+        };
+
+        const showMaxWidthError = () => {
+            messageContainerMaxWidthHelp.textContent = 'Invalid value. Use a number with a supported unit (e.g. 800px, 90%, 50vw) or a plain number (treated as px).';
+            messageContainerMaxWidthHelp.style.display = 'block';
+            messageContainerMaxWidthHelp.style.color = '#ef4444';
+            messageContainerMaxWidthHelp.style.background = 'rgba(239, 68, 68, 0.06)';
+            messageContainerMaxWidthHelp.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+        };
+
+        const hideMaxWidthHelp = () => {
+            messageContainerMaxWidthHelp.style.display = 'none';
+        };
+
+        messageContainerMaxWidthInput.oninput = (e) => {
+            const raw = String(e.target.value || '').trim();
+
+            if (!raw) {
+                messageContainerMaxWidth = '';
+                e.target.style.borderColor = '';
+                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = '—';
+                if (messageContainerMaxWidthPreviewInner) messageContainerMaxWidthPreviewInner.style.width = '100%';
+                // Keep units help visible while focused
+                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
+                return;
+            }
+
+            const { valid, normalized } = validateMaxWidth(raw);
+            if (valid) {
+                messageContainerMaxWidth = normalized;
+                e.target.style.borderColor = '';
+                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = normalized;
+                if (messageContainerMaxWidthPreviewInner) {
+                    try { messageContainerMaxWidthPreviewInner.style.width = normalized; } catch (err) {}
+                }
+                // While typing in a focused input, show the units guide (not the error)
+                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
+            } else {
+                messageContainerMaxWidth = raw;
+                e.target.style.borderColor = '#ef4444';
+                // Don't surface the error mid-typing; keep showing units help while focused
+                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
+            }
+        };
+
+        // Show units help when the input is focused.
+        messageContainerMaxWidthInput.addEventListener('focus', () => {
+            showMaxWidthUnitsHelp();
+        });
+
+        // Normalize and validate on blur — appending "px" mid-typing causes
+        // values like "5px0" when the user types "50".
+        messageContainerMaxWidthInput.addEventListener('blur', () => {
+            const raw = String(messageContainerMaxWidthInput.value || '').trim();
+            if (!raw) {
+                messageContainerMaxWidthInput.style.borderColor = '';
+                hideMaxWidthHelp();
+                return;
+            }
+            const { valid, normalized } = validateMaxWidth(raw);
+            if (valid) {
+                if (messageContainerMaxWidthInput.value !== normalized) {
+                    messageContainerMaxWidthInput.value = normalized;
+                }
+                messageContainerMaxWidth = normalized;
+                messageContainerMaxWidthInput.style.borderColor = '';
+                hideMaxWidthHelp();
+                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = normalized;
+                if (messageContainerMaxWidthPreviewInner) {
+                    try { messageContainerMaxWidthPreviewInner.style.width = normalized; } catch (err) {}
+                }
+            } else {
+                showMaxWidthError();
+                messageContainerMaxWidthInput.style.borderColor = '#ef4444';
+            }
+        });
+
         hideForYouCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] HIDE FOR YOU CHECKBOX CHANGED');
+            debugLog('[Core] HIDE FOR YOU CHECKBOX CHANGED');
             hideForYouEnabled = e.target.checked;
-            debugLog('[Toolkit] Hide For You:', hideForYouEnabled);
+            debugLog('[Core] Hide For You:', hideForYouEnabled);
         };
         
         pageJumpCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] PAGE JUMP CHECKBOX CHANGED');
+            debugLog('[Core] PAGE JUMP CHECKBOX CHANGED');
             pageJumpEnabled = e.target.checked;
-            debugLog('[Toolkit] Page Jump:', pageJumpEnabled);
+            debugLog('[Core] Page Jump:', pageJumpEnabled);
         };
         
         showStatsCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SHOW STATS CHECKBOX CHANGED');
+            debugLog('[Core] SHOW STATS CHECKBOX CHANGED');
             showStatsEnabled = e.target.checked;
-            debugLog('[Toolkit] Show Stats:', showStatsEnabled);
+            debugLog('[Core] Show Stats:', showStatsEnabled);
             
             // Toggle model details sub-checkbox visibility
             if (showStatsEnabled) {
@@ -9340,15 +11307,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         };
         
         modelDetailsCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] MODEL DETAILS CHECKBOX CHANGED');
+            debugLog('[Core] MODEL DETAILS CHECKBOX CHANGED');
             showModelDetailsEnabled = e.target.checked;
-            debugLog('[Toolkit] Show Model Details:', showModelDetailsEnabled);
+            debugLog('[Core] Show Model Details:', showModelDetailsEnabled);
         };
         
         showTimestampCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SHOW TIMESTAMP CHECKBOX CHANGED');
+            debugLog('[Core] SHOW TIMESTAMP CHECKBOX CHANGED');
             showTimestampEnabled = e.target.checked;
-            debugLog('[Toolkit] Show Timestamp:', showTimestampEnabled);
+            debugLog('[Core] Show Timestamp:', showTimestampEnabled);
             
             // Toggle timestamp format sub-checkbox visibility
             if (showTimestampEnabled) {
@@ -9361,110 +11328,158 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         };
         
         timestampFormatCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] TIMESTAMP FORMAT CHECKBOX CHANGED');
+            debugLog('[Core] TIMESTAMP FORMAT CHECKBOX CHANGED');
             timestampDateFirst = e.target.checked;
-            debugLog('[Toolkit] Timestamp Format:', timestampDateFirst ? 'date@time' : 'time@date');
+            debugLog('[Core] Timestamp Format:', timestampDateFirst ? 'date@time' : 'time@date');
         };
         
         timestampHourFormatCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] TIMESTAMP HOUR FORMAT CHECKBOX CHANGED');
+            debugLog('[Core] TIMESTAMP HOUR FORMAT CHECKBOX CHANGED');
             timestamp24Hour = e.target.checked;
-            debugLog('[Toolkit] Timestamp Hour Format:', timestamp24Hour ? '24-hour' : '12-hour');
+            debugLog('[Core] Timestamp Hour Format:', timestamp24Hour ? '24-hour' : '12-hour');
         };
 
         showMessageIdsCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SHOW MESSAGE IDS CHECKBOX CHANGED');
+            debugLog('[Core] SHOW MESSAGE IDS CHECKBOX CHANGED');
             showMessageIdsEnabled = e.target.checked;
-            debugLog('[Toolkit] Show Message IDs:', showMessageIdsEnabled);
+            debugLog('[Core] Show Message IDs:', showMessageIdsEnabled);
+        };
+
+        highlightModelChangesCheckbox.onchange = (e) => {
+            debugLog('[Core] HIGHLIGHT MODEL CHANGES CHECKBOX CHANGED');
+            highlightModelChangesEnabled = e.target.checked;
+            debugLog('[Core] Highlight Model Changes:', highlightModelChangesEnabled);
+            updateAutoRegenVisibility();
+        };
+
+        autoRegenMismatchCheckbox.onchange = (e) => {
+            debugLog('[Core] AUTO REGEN MISMATCH CHECKBOX CHANGED');
+            autoRegenOnMismatchEnabled = e.target.checked;
+            debugLog('[Core] Auto Regen On Mismatch:', autoRegenOnMismatchEnabled);
+            updateAutoRegenVisibility();
+        };
+
+        autoRegenShortCheckbox.onchange = (e) => {
+            debugLog('[Core] AUTO REGEN SHORT CHECKBOX CHANGED');
+            autoRegenOnShortEnabled = e.target.checked;
+            debugLog('[Core] Auto Regen On Short:', autoRegenOnShortEnabled);
+            updateAutoRegenVisibility();
+        };
+
+        autoRegenMaxSelect.onchange = (e) => {
+            debugLog('[Core] AUTO REGEN MAX SELECT CHANGED');
+            autoRegenMaxAttempts = parseInt(e.target.value, 10);
+            debugLog('[Core] Auto Regen Max Attempts:', autoRegenMaxAttempts);
         };
 
         showChatNameInTitleCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] SHOW CHAT NAME IN TITLE CHECKBOX CHANGED');
+            debugLog('[Core] SHOW CHAT NAME IN TITLE CHECKBOX CHANGED');
             showChatNameInTitleEnabled = e.target.checked;
-            debugLog('[Toolkit] Show Chat Name In Title:', showChatNameInTitleEnabled);
+            debugLog('[Core] Show Chat Name In Title:', showChatNameInTitleEnabled);
         };
         
         nsfwToggleCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] NSFW TOGGLE CHECKBOX CHANGED');
+            debugLog('[Core] NSFW TOGGLE CHECKBOX CHANGED');
             nsfwToggleEnabled = e.target.checked;
-            debugLog('[Toolkit] NSFW Toggle:', nsfwToggleEnabled);
+            debugLog('[Core] NSFW Toggle:', nsfwToggleEnabled);
         };
-        
+
+        messageRecoveryCheckbox.onchange = (e) => {
+            debugLog('[Core] MESSAGE RECOVERY CHECKBOX CHANGED');
+            messageRecoveryEnabled = e.target.checked;
+            debugLog('[Core] Message Recovery:', messageRecoveryEnabled);
+        };
+
+        hideCreatorCheckbox.onchange = (e) => {
+            debugLog('[Core] HIDE CREATOR CHECKBOX CHANGED');
+            hideCreatorEnabled = e.target.checked;
+            debugLog('[Core] Hide Creator:', hideCreatorEnabled);
+        };
+
         wysiwygCheckbox.onchange = (e) => {
-            debugLog('[Toolkit] WYSIWYG CHECKBOX CHANGED');
+            debugLog('[Core] WYSIWYG CHECKBOX CHANGED');
             wysiwygEnabled = e.target.checked;
-            debugLog('[Toolkit] WYSIWYG Enabled:', wysiwygEnabled);
+            debugLog('[Core] WYSIWYG Enabled:', wysiwygEnabled);
         };
         
         // Close modal function
         const closeModal = () => {
-            debugLog('[Toolkit] ===== CLOSE MODAL CALLED =====');
-            debugLog('[Toolkit] Current time:', Date.now());
-            debugLog('[Toolkit] Backdrop element:', backdrop);
-            debugLog('[Toolkit] Modal element:', modal);
-            debugLog('[Toolkit] Shadow root:', shadow);
-            debugLog('[Toolkit] Document body children count:', document.body.children.length);
+            debugLog('[Core] ===== CLOSE MODAL CALLED =====');
+            debugLog('[Core] Current time:', Date.now());
+            debugLog('[Core] Backdrop element:', backdrop);
+            debugLog('[Core] Modal element:', modal);
+            debugLog('[Core] Shadow root:', shadow);
+            debugLog('[Core] Document body children count:', document.body.children.length);
             
             try {
-                debugLog('[Toolkit] Setting backdrop opacity to 0');
+                debugLog('[Core] Setting backdrop opacity to 0');
                 backdrop.style.opacity = '0';
-                debugLog('[Toolkit] Setting backdrop transition');
+                debugLog('[Core] Setting backdrop transition');
                 backdrop.style.transition = 'opacity 0.15s';
-                debugLog('[Toolkit] Setting modal opacity to 0');
+                debugLog('[Core] Setting modal opacity to 0');
                 modal.style.opacity = '0';
-                debugLog('[Toolkit] Setting modal transform');
+                debugLog('[Core] Setting modal transform');
                 modal.style.transform = 'translate(-50%, -50%) scale(0.95)';
-                debugLog('[Toolkit] Setting modal transition');
+                debugLog('[Core] Setting modal transition');
                 modal.style.transition = 'all 0.15s';
-                debugLog('[Toolkit] CSS animations set successfully');
+                debugLog('[Core] CSS animations set successfully');
             } catch (error) {
-                console.error('[Toolkit] Error setting CSS animations:', error);
+                console.error('[Core] Error setting CSS animations:', error);
             }
             
             // Remove from DOM after animation completes
-            debugLog('[Toolkit] Scheduling removal in 200ms');
+            debugLog('[Core] Scheduling removal in 200ms');
             setTimeout(() => {
-                debugLog('[Toolkit] ===== STARTING DOM REMOVAL =====');
-                debugLog('[Toolkit] Time:', Date.now());
-                debugLog('[Toolkit] About to remove backdrop');
+                debugLog('[Core] ===== STARTING DOM REMOVAL =====');
+                debugLog('[Core] Time:', Date.now());
+                debugLog('[Core] About to remove backdrop');
                 try {
                     backdrop.remove();
-                    debugLog('[Toolkit] Backdrop removed successfully');
+                    debugLog('[Core] Backdrop removed successfully');
                 } catch (error) {
-                    console.error('[Toolkit] Error removing backdrop:', error);
+                    console.error('[Core] Error removing backdrop:', error);
                 }
                 
-                debugLog('[Toolkit] About to remove modal');
+                debugLog('[Core] About to remove modal');
                 try {
                     modal.remove();
-                    debugLog('[Toolkit] Modal removed successfully');
+                    debugLog('[Core] Modal removed successfully');
                 } catch (error) {
-                    console.error('[Toolkit] Error removing modal:', error);
+                    console.error('[Core] Error removing modal:', error);
                 }
                 
-                debugLog('[Toolkit] ===== DOM REMOVAL COMPLETE =====');
-                debugLog('[Toolkit] Document body children count after removal:', document.body.children.length);
+                debugLog('[Core] ===== DOM REMOVAL COMPLETE =====');
+                debugLog('[Core] Document body children count after removal:', document.body.children.length);
             }, 200);
             
-            debugLog('[Toolkit] closeModal function execution complete (removal scheduled)');
+            debugLog('[Core] closeModal function execution complete (removal scheduled)');
         };
         
         // Disable backdrop click to close (user must use Cancel or Save buttons)
         backdrop.onclick = (e) => {
-            debugLog('[Toolkit] Backdrop clicked - ignoring (use Cancel or Save buttons)');
+            debugLog('[Core] Backdrop clicked - ignoring (use Cancel or Save buttons)');
             // Do nothing - force user to use buttons
         };
         
-        // Cancel button - just closes modal without saving or refreshing
-        cancelBtn.onclick = (e) => {
-            debugLog('[Toolkit] Cancel button clicked');
+        // Cancel button - closes modal and syncs model override to interceptor (no page refresh needed)
+        cancelBtn.onclick = async (e) => {
+            debugLog('[Core] Cancel button clicked');
             e.stopPropagation();
+            // Ensure model override is live in the interceptor without requiring a page reload
+            const [overrideEnabled, overrideName] = await Promise.all([
+                storage.get('modelOverrideEnabled', false),
+                storage.get('modelOverrideName', '')
+            ]);
+            window.postMessage({
+                type: 'SAI_SET_MODEL_OVERRIDE',
+                model: overrideEnabled && overrideName ? overrideName : null
+            }, '*');
             closeModal();
         };
         
         // Clear All Data button - with confirmation dialog
         clearAllBtn.onclick = async (e) => {
-            debugLog('[Toolkit] Clear All Data button clicked');
+            debugLog('[Core] Clear All Data button clicked');
             e.stopPropagation();
             
             // Create confirmation dialog in shadow DOM
@@ -9476,7 +11491,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             confirmModal.className = 'modal';
             confirmModal.style.zIndex = '10000006';
             confirmModal.style.width = '350px';
-            confirmModal.innerHTML = `
+            confirmModal.replaceChildren(parseHTMLToFragment(`
                 <div class="modal-header">⚠️ Clear All Data?</div>
                 <div class="modal-body">
                     <div style="text-align: center; margin-bottom: 1rem;">
@@ -9493,7 +11508,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     <button class="btn-cancel" id="confirm-cancel-btn">Cancel</button>
                     <button class="btn-save" id="confirm-clear-btn" style="background: #ef4444;">Clear All Data</button>
                 </div>
-            `;
+            `));
             
             shadow.appendChild(confirmBackdrop);
             shadow.appendChild(confirmModal);
@@ -9511,17 +11526,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Confirm clear all data
             confirmClearBtn.onclick = async (e) => {
                 e.stopPropagation();
-                debugLog('[Toolkit] Confirmed - clearing all data');
+                debugLog('[Core] Confirmed - clearing all data');
                 
                 try {
                     await storage.clear();
-                    debugLog('[Toolkit] All data cleared');
+                    debugLog('[Core] All data cleared');
                     showNotification('All data cleared! Refreshing...');
                     setTimeout(() => {
                         window.location.reload();
                     }, 500);
                 } catch (error) {
-                    console.error('[Toolkit] Error clearing data:', error);
+                    console.error('[Core] Error clearing data:', error);
                     alert('Error clearing data: ' + error.message);
                 }
             };
@@ -9537,7 +11552,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Save & Refresh button
         saveBtn.onclick = async (e) => {
-            debugLog('[Toolkit] Save & Refresh button clicked');
+            debugLog('[Core] Save & Refresh button clicked');
             e.stopPropagation();
             
             // Handle sidebar min width - revert to default if empty/invalid
@@ -9560,17 +11575,28 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             timestampDateFirst = timestampFormatCheckbox.checked;
             timestamp24Hour = timestampHourFormatCheckbox.checked;
             showMessageIdsEnabled = showMessageIdsCheckbox.checked;
+            highlightModelChangesEnabled = highlightModelChangesCheckbox.checked;
+            autoRegenOnMismatchEnabled = autoRegenMismatchCheckbox.checked;
+            autoRegenOnShortEnabled = autoRegenShortCheckbox.checked;
+            autoRegenMaxAttempts = parseInt(autoRegenMaxSelect.value, 10);
             showChatNameInTitleEnabled = showChatNameInTitleCheckbox.checked;
             nsfwToggleEnabled = nsfwToggleCheckbox.checked;
+            messageRecoveryEnabled = messageRecoveryCheckbox.checked;
+            hideCreatorEnabled = hideCreatorCheckbox.checked;
             smallProfileImagesEnabled = smallProfileImagesCheckbox.checked;
             roundedProfileImagesEnabled = roundedProfileImagesCheckbox.checked;
             swapCheckboxPositionEnabled = swapCheckboxPositionCheckbox.checked;
             squareMessageEdgesEnabled = squareMessageEdgesCheckbox.checked;
             wysiwygEnabled = wysiwygCheckbox.checked;
             enableGenerationProfilesEnabled = enableGenerationProfilesCheckbox.checked;
-            messageContainerMaxWidth = messageContainerMaxWidthInput.value.trim();
+            // Normalize message container max width on save as well
+            let finalMessageMax = String(messageContainerMaxWidthInput.value || '').trim();
+            if (/^\d+(?:\.\d+)?$/.test(finalMessageMax)) finalMessageMax = `${finalMessageMax}px`;
+            messageContainerMaxWidth = finalMessageMax;
+            memoryDotEnabled = memoryDotEnabledCheckbox.checked;
+            memoryDotColor = memoryDotColorInput.value.trim() || '#ff3b3b';
             
-            debugLog('[Toolkit] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth);
+            debugLog('[Core] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
             await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
             await storage.set(SIDEBAR_MIN_WIDTH_KEY, finalMinWidth);
             await storage.set(COMPACT_GENERATION_KEY, compactGenerationEnabled);
@@ -9586,8 +11612,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set('timestampDateFirst', timestampDateFirst);
             await storage.set('timestamp24Hour', timestamp24Hour);
             await storage.set(SHOW_MESSAGE_IDS_KEY, showMessageIdsEnabled);
+            await storage.set('highlightModelChanges', highlightModelChangesEnabled);
+            await storage.set('autoRegenOnMismatch', autoRegenOnMismatchEnabled);
+            await storage.set('autoRegenOnShort', autoRegenOnShortEnabled);
+            await storage.set('autoRegenMaxAttempts', autoRegenMaxAttempts);
             await storage.set('showChatNameInTitle', showChatNameInTitleEnabled);
             await storage.set('nsfwToggleEnabled', nsfwToggleEnabled);
+            await storage.set('messageRecoveryEnabled', messageRecoveryEnabled);
+            await storage.set(HIDE_CREATOR_KEY, hideCreatorEnabled);
             await storage.set(SMALL_PROFILE_IMAGES_KEY, smallProfileImagesEnabled);
             await storage.set(ROUNDED_PROFILE_IMAGES_KEY, roundedProfileImagesEnabled);
             await storage.set(SWAP_CHECKBOX_POSITION_KEY, swapCheckboxPositionEnabled);
@@ -9595,12 +11627,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set(WYSIWYG_EDITOR_KEY, wysiwygEnabled);
             await storage.set(ENABLE_GENERATION_PROFILES_KEY, enableGenerationProfilesEnabled);
             await storage.set(MESSAGE_CONTAINER_MAX_WIDTH_KEY, messageContainerMaxWidth);
+            await storage.set(MEMORY_DOT_ENABLED_KEY, memoryDotEnabled);
+            await storage.set(MEMORY_DOT_COLOR_KEY, memoryDotColor);
             // Mark onboarding as seen when user saves settings
             await storage.set('hasSeenOnboarding', true);
-            debugLog('[Toolkit] Settings saved to storage');
+            debugLog('[Core] Settings saved to storage');
             showNotification('Settings saved! Refreshing...');
             setTimeout(() => {
-                debugLog('[Toolkit] Reloading page...');
+                debugLog('[Core] Reloading page...');
                 window.location.reload();
             }, 500);
         };
@@ -9621,7 +11655,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     URL.revokeObjectURL(url);
                     showNotification('Profiles exported');
                 } catch (error) {
-                    console.error('[Toolkit] Error exporting profiles:', error);
+                    console.error('[Core] Error exporting profiles:', error);
                     alert('Error exporting profiles: ' + error.message);
                 }
             };
@@ -9677,7 +11711,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         showNotification('All profiles deleted');
                         await updateGenerationProfilesVisibility();
                     } catch (error) {
-                        console.error('[Toolkit] Error deleting profiles:', error);
+                        console.error('[Core] Error deleting profiles:', error);
                         alert('Error deleting profiles: ' + error.message);
                     }
                 }
@@ -9701,7 +11735,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     URL.revokeObjectURL(url);
                     showNotification('Custom Style exported');
                 } catch (error) {
-                    console.error('[Toolkit] Error exporting custom style:', error);
+                    console.error('[Core] Error exporting custom style:', error);
                     alert('Error exporting custom style: ' + error.message);
                 }
             };
@@ -9721,11 +11755,42 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         reader.onload = async function(event) {
                             try {
                                 const imported = JSON.parse(event.target.result);
+                                // Legacy schema migration: old single fontWeight/fontStyle/textDecoration
+                                // applied to all four categories. Spread legacy values across the new
+                                // per-category keys only when the new key is absent from the import.
+                                if (imported.fontWeight !== undefined) {
+                                    if (imported.bodyFontWeight === undefined) imported.bodyFontWeight = imported.fontWeight;
+                                    if (imported.spanQuoteFontWeight === undefined) imported.spanQuoteFontWeight = imported.fontWeight;
+                                    if (imported.narrationFontWeight === undefined) imported.narrationFontWeight = imported.fontWeight;
+                                    if (imported.highlightFontWeight === undefined) imported.highlightFontWeight = imported.fontWeight;
+                                }
+                                if (imported.fontStyle !== undefined) {
+                                    if (imported.bodyFontStyle === undefined) imported.bodyFontStyle = imported.fontStyle;
+                                    if (imported.spanQuoteFontStyle === undefined) imported.spanQuoteFontStyle = imported.fontStyle;
+                                    if (imported.narrationFontStyle === undefined) imported.narrationFontStyle = imported.fontStyle;
+                                    if (imported.highlightFontStyle === undefined) imported.highlightFontStyle = imported.fontStyle;
+                                }
+                                if (imported.textDecoration !== undefined) {
+                                    if (imported.bodyTextDecoration === undefined) imported.bodyTextDecoration = imported.textDecoration;
+                                    if (imported.spanQuoteTextDecoration === undefined) imported.spanQuoteTextDecoration = imported.textDecoration;
+                                    if (imported.narrationTextDecoration === undefined) imported.narrationTextDecoration = imported.textDecoration;
+                                    if (imported.highlightTextDecoration === undefined) imported.highlightTextDecoration = imported.textDecoration;
+                                }
+                                // Drop the legacy keys so they don't pollute the merged object
+                                delete imported.fontWeight;
+                                delete imported.fontStyle;
+                                delete imported.textDecoration;
+                                // Also drop other obsolete keys observed in old saves
+                                delete imported.textColor;
+                                delete imported.italicColor;
+                                delete imported.quoteColor;
+
                                 // Merge with defaults to ensure all fields exist
                                 const mergedValues = { ...DEFAULT_CUSTOM_STYLE, ...imported };
                                 // Update the in-memory values
                                 Object.assign(customStyleValues, mergedValues);
-                                // Update the UI inputs
+
+                                // Update the UI inputs - colors
                                 customAiBgInput.value = customStyleValues.aiMessageBg;
                                 customUserBgInput.value = customStyleValues.userMessageBg;
                                 customBodyColorInput.value = customStyleValues.bodyColor;
@@ -9733,11 +11798,50 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                 customNarrationColorInput.value = customStyleValues.narrationColor;
                                 customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
                                 customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
+                                customHoverButtonColorInput.value = customStyleValues.hoverButtonColor || '#292929';
+                                customCreatorLinkColorInput.value = customStyleValues.creatorLinkColor || '';
+
+                                // Body text styling
+                                customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
+                                customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
+                                customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
+
+                                // Span/quote text styling
+                                customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
+                                customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
+                                customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
+
+                                // Narration text styling
+                                customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
+                                customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
+                                customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
+
+                                // Highlight text styling
+                                customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
+                                customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
+                                customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
+
+                                // Font family/size
                                 customFontSizeInput.value = customStyleValues.fontSize;
                                 customFontFamilyInput.value = customStyleValues.fontFamily || '';
-                                customFontWeightSelect.value = customStyleValues.fontWeight || 'normal';
-                                customFontStyleSelect.value = customStyleValues.fontStyle || 'normal';
-                                customTextDecorationSelect.value = customStyleValues.textDecoration || 'none';
+
+                                // Reset background image file picker (actual data lives in customStyleValues.backgroundImage)
+                                if (customBackgroundImageInput) customBackgroundImageInput.value = '';
+
+                                // Update preview swatches
+                                if (previewAiBg) previewAiBg.style.background = customStyleValues.aiMessageBg || 'transparent';
+                                if (previewUserBg) previewUserBg.style.background = customStyleValues.userMessageBg || 'transparent';
+                                if (previewBodyColor) previewBodyColor.style.background = customStyleValues.bodyColor || 'transparent';
+                                if (previewQuoteColor) previewQuoteColor.style.background = customStyleValues.spanQuoteColor || 'transparent';
+                                if (previewNarrationColor) previewNarrationColor.style.background = customStyleValues.narrationColor || 'transparent';
+                                if (previewHighlightBg) previewHighlightBg.style.background = customStyleValues.highlightBgColor || 'transparent';
+                                if (previewHighlightText) previewHighlightText.style.background = customStyleValues.highlightTextColor || 'transparent';
+                                if (previewHoverButton) previewHoverButton.style.background = customStyleValues.hoverButtonColor || '#292929';
+                                if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = customStyleValues.creatorLinkColor || 'transparent';
+
+                                // Refresh the live font preview block
+                                updateFontPreview();
+
                                 showNotification('Custom Style imported - click Save to apply');
                             } catch (err) {
                                 alert('Error importing custom style: ' + err.message);
@@ -9781,6 +11885,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 customFontSizeInput.value = DEFAULT_CUSTOM_STYLE.fontSize;
                 customFontFamilyInput.value = DEFAULT_CUSTOM_STYLE.fontFamily;
                 customHoverButtonColorInput.value = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
+                customCreatorLinkColorInput.value = DEFAULT_CUSTOM_STYLE.creatorLinkColor;
                 customBackgroundImageInput.value = '';
 
                 // Update preview elements
@@ -9792,6 +11897,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (previewHighlightBg) previewHighlightBg.style.background = DEFAULT_CUSTOM_STYLE.highlightBgColor;
                 if (previewHighlightText) previewHighlightText.style.background = DEFAULT_CUSTOM_STYLE.highlightTextColor;
                 if (previewHoverButton) previewHoverButton.style.background = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
+                if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = DEFAULT_CUSTOM_STYLE.creatorLinkColor || 'transparent';
 
                 // Update font preview
                 updateFontPreview();
@@ -9801,217 +11907,157 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
 
         // Export All Data button
-        debugLog('[Toolkit] Attaching exportAllBtn onclick handler...');
-        debugLog('[Toolkit] exportAllBtn element:', exportAllBtn);
-        debugLog('[Toolkit] exportAllBtn exists?:', !!exportAllBtn);
+        debugLog('[Core] Attaching exportAllBtn onclick handler...');
+        debugLog('[Core] exportAllBtn element:', exportAllBtn);
+        debugLog('[Core] exportAllBtn exists?:', !!exportAllBtn);
         
         if (exportAllBtn) {
             exportAllBtn.onclick = async (e) => {
-                debugLog('[Toolkit] ===== EXPORT ALL DATA CLICKED =====');
-                debugLog('[Toolkit] Event:', e);
+                debugLog('[Core] ===== EXPORT ALL DATA CLICKED =====');
+                debugLog('[Core] Event:', e);
                 e.stopPropagation();
                 
                 try {
-                    debugLog('[Toolkit] Starting data fetch...');
-                    debugLog('[Toolkit] Storage object type:', typeof storage);
-                    debugLog('[Toolkit] Storage object:', storage);
+                    debugLog('[Core] Starting data fetch...');
+                    debugLog('[Core] Storage object type:', typeof storage);
+                    debugLog('[Core] Storage object:', storage);
                     
-                    // Get all data from extension storage - fetch each value separately
-                    debugLog('[Toolkit] Fetching enableSidebarLayout...');
-                const enableSidebarLayout = await storage.get(SIDEBAR_LAYOUT_KEY, false);
-                debugLog('[Toolkit] enableSidebarLayout result:', enableSidebarLayout, 'Type:', typeof enableSidebarLayout);
+                    // Get all data from extension storage
+                    // PERFORMANCE: Batch all export settings into a single storage read
+                    const exportData = await storage.getMultiple({
+                        [SIDEBAR_LAYOUT_KEY]: false,
+                        [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH,
+                        [CLASSIC_LAYOUT_KEY]: false,
+                        [CLASSIC_STYLE_KEY]: false,
+                        [CUSTOM_STYLE_KEY]: false,
+                        [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
+                        [COMPACT_GENERATION_KEY]: false,
+                        [HIDE_FOR_YOU_KEY]: false,
+                        [PAGE_JUMP_KEY]: false,
+                        'showGenerationStats': false,
+                        'showModelDetails': true,
+                        'showTimestamp': false,
+                        'highlightModelChanges': false,
+                        'autoRegenOnMismatch': false,
+                        'autoRegenOnShort': false,
+                        'autoRegenMaxAttempts': 1,
+                        'timestampDateFirst': true,
+                        'timestamp24Hour': false,
+                        [SHOW_MESSAGE_IDS_KEY]: false,
+                        'showChatNameInTitle': false,
+                        'nsfwToggleEnabled': false,
+                        'messageRecoveryEnabled': false,
+                        [WYSIWYG_EDITOR_KEY]: false,
+                        [ENABLE_GENERATION_PROFILES_KEY]: false,
+                        [SMALL_PROFILE_IMAGES_KEY]: false,
+                        [ROUNDED_PROFILE_IMAGES_KEY]: false,
+                        [SWAP_CHECKBOX_POSITION_KEY]: false,
+                        [SQUARE_MESSAGE_EDGES_KEY]: false,
+                        [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
+                        [MEMORY_DOT_ENABLED_KEY]: true,
+                        [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
+                        [HIDE_CREATOR_KEY]: false,
+                        'generationProfiles': '{}',
+                        'lastSelectedProfile': '',
+                        'messageGenerationStats': '{}'
+                    });
+                    
+                    debugLog('[Core] All values fetched. Building export object...');
+                    
+                    // Parse JSON strings for proper export format
+                    const generationProfilesParsed = JSON.parse(exportData['generationProfiles']);
+                    const messageGenerationStatsParsed = JSON.parse(exportData['messageGenerationStats']);
+                    
+                    // Build the export object
+                    const allData = {
+                        enableSidebarLayout: exportData[SIDEBAR_LAYOUT_KEY],
+                        sidebarMinWidth: exportData[SIDEBAR_MIN_WIDTH_KEY],
+                        enableClassicLayout: exportData[CLASSIC_LAYOUT_KEY],
+                        enableClassicStyle: exportData[CLASSIC_STYLE_KEY],
+                        enableCustomStyle: exportData[CUSTOM_STYLE_KEY],
+                        customStyleValues: exportData[CUSTOM_STYLE_VALUES_KEY],
+                        enableCompactGeneration: exportData[COMPACT_GENERATION_KEY],
+                        enableHideForYou: exportData[HIDE_FOR_YOU_KEY],
+                        enablePageJump: exportData[PAGE_JUMP_KEY],
+                        showGenerationStats: exportData['showGenerationStats'],
+                        showModelDetails: exportData['showModelDetails'],
+                        showTimestamp: exportData['showTimestamp'],
+                        timestampDateFirst: exportData['timestampDateFirst'],
+                        timestamp24Hour: exportData['timestamp24Hour'],
+                        showMessageIds: exportData[SHOW_MESSAGE_IDS_KEY],
+                        showChatNameInTitle: exportData['showChatNameInTitle'],
+                        nsfwToggleEnabled: exportData['nsfwToggleEnabled'],
+                        messageRecoveryEnabled: exportData['messageRecoveryEnabled'],
+                        enableWysiwygEditor: exportData[WYSIWYG_EDITOR_KEY],
+                        enableGenerationProfiles: exportData[ENABLE_GENERATION_PROFILES_KEY],
+                        enableSmallProfileImages: exportData[SMALL_PROFILE_IMAGES_KEY],
+                        enableRoundedProfileImages: exportData[ROUNDED_PROFILE_IMAGES_KEY],
+                        swapCheckboxPosition: exportData[SWAP_CHECKBOX_POSITION_KEY],
+                        squareMessageEdges: exportData[SQUARE_MESSAGE_EDGES_KEY],
+                        highlightModelChanges: exportData['highlightModelChanges'],
+                        autoRegenOnMismatch: exportData['autoRegenOnMismatch'],
+                        autoRegenOnShort: exportData['autoRegenOnShort'],
+                        autoRegenMaxAttempts: exportData['autoRegenMaxAttempts'],
+                        messageContainerMaxWidth: exportData[MESSAGE_CONTAINER_MAX_WIDTH_KEY],
+                        memoryDotEnabled: exportData[MEMORY_DOT_ENABLED_KEY],
+                        memoryDotColor: exportData[MEMORY_DOT_COLOR_KEY],
+                        hideCreatorName: exportData[HIDE_CREATOR_KEY],
+                        generationProfiles: generationProfilesParsed,  // Use parsed object
+                        lastSelectedProfile: exportData['lastSelectedProfile'],
+                        messageGenerationStats: messageGenerationStatsParsed  // Use parsed object
+                    };
                 
-                debugLog('[Toolkit] Fetching enableClassicLayout...');
-                const enableClassicLayout = await storage.get(CLASSIC_LAYOUT_KEY, false);
-                debugLog('[Toolkit] enableClassicLayout result:', enableClassicLayout, 'Type:', typeof enableClassicLayout);
-                
-                debugLog('[Toolkit] Fetching enableClassicStyle...');
-                const enableClassicStyle = await storage.get(CLASSIC_STYLE_KEY, false);
-                debugLog('[Toolkit] enableClassicStyle result:', enableClassicStyle, 'Type:', typeof enableClassicStyle);
-                
-                debugLog('[Toolkit] Fetching enableCustomStyle...');
-                const enableCustomStyle = await storage.get(CUSTOM_STYLE_KEY, false);
-                debugLog('[Toolkit] enableCustomStyle result:', enableCustomStyle, 'Type:', typeof enableCustomStyle);
-                
-                debugLog('[Toolkit] Fetching customStyleValues...');
-                const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-                debugLog('[Toolkit] customStyleValues result:', customStyleValuesStr, 'Type:', typeof customStyleValuesStr);
-                
-                debugLog('[Toolkit] Fetching enableCompactGeneration...');
-                const enableCompactGeneration = await storage.get(COMPACT_GENERATION_KEY, false);
-                debugLog('[Toolkit] enableCompactGeneration result:', enableCompactGeneration, 'Type:', typeof enableCompactGeneration);
-                
-                debugLog('[Toolkit] Fetching enableHideForYou...');
-                const enableHideForYou = await storage.get(HIDE_FOR_YOU_KEY, false);
-                debugLog('[Toolkit] enableHideForYou result:', enableHideForYou, 'Type:', typeof enableHideForYou);
-                
-                debugLog('[Toolkit] Fetching enablePageJump...');
-                const enablePageJump = await storage.get(PAGE_JUMP_KEY, false);
-                debugLog('[Toolkit] enablePageJump result:', enablePageJump, 'Type:', typeof enablePageJump);
-                
-                debugLog('[Toolkit] Fetching showGenerationStats...');
-                const showGenerationStats = await storage.get('showGenerationStats', false);
-                debugLog('[Toolkit] showGenerationStats result:', showGenerationStats, 'Type:', typeof showGenerationStats);
-                
-                debugLog('[Toolkit] Fetching timestampDateFirst...');
-                const timestampDateFirst = await storage.get('timestampDateFirst', true);
-                debugLog('[Toolkit] timestampDateFirst result:', timestampDateFirst, 'Type:', typeof timestampDateFirst);
-                
-                debugLog('[Toolkit] Fetching timestamp24Hour...');
-                const timestamp24Hour = await storage.get('timestamp24Hour', false);
-                debugLog('[Toolkit] timestamp24Hour result:', timestamp24Hour, 'Type:', typeof timestamp24Hour);
-                
-                debugLog('[Toolkit] Fetching nsfwToggleEnabled...');
-                const nsfwToggleEnabled = await storage.get('nsfwToggleEnabled', false);
-                debugLog('[Toolkit] nsfwToggleEnabled result:', nsfwToggleEnabled, 'Type:', typeof nsfwToggleEnabled);
-                
-                debugLog('[Toolkit] Fetching enableWysiwygEditor...');
-                const enableWysiwygEditor = await storage.get(WYSIWYG_EDITOR_KEY, false);
-                debugLog('[Toolkit] enableWysiwygEditor result:', enableWysiwygEditor, 'Type:', typeof enableWysiwygEditor);
-                
-                debugLog('[Toolkit] Fetching enableGenerationProfiles...');
-                const enableGenerationProfiles = await storage.get(ENABLE_GENERATION_PROFILES_KEY, false);
-                debugLog('[Toolkit] enableGenerationProfiles result:', enableGenerationProfiles, 'Type:', typeof enableGenerationProfiles);
-                
-                debugLog('[Toolkit] Fetching showModelDetails...');
-                const showModelDetails = await storage.get('showModelDetails', true);
-                debugLog('[Toolkit] showModelDetails result:', showModelDetails, 'Type:', typeof showModelDetails);
-                
-                debugLog('[Toolkit] Fetching showTimestamp...');
-                const showTimestamp = await storage.get('showTimestamp', false);
-                debugLog('[Toolkit] showTimestamp result:', showTimestamp, 'Type:', typeof showTimestamp);
-
-                debugLog('[Toolkit] Fetching showMessageIds...');
-                const showMessageIds = await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-                debugLog('[Toolkit] showMessageIds result:', showMessageIds, 'Type:', typeof showMessageIds);
-
-                debugLog('[Toolkit] Fetching showChatNameInTitle...');
-                const showChatNameInTitle = await storage.get('showChatNameInTitle', false);
-                debugLog('[Toolkit] showChatNameInTitle result:', showChatNameInTitle, 'Type:', typeof showChatNameInTitle);
-                
-                debugLog('[Toolkit] Fetching enableSmallProfileImages...');
-                const enableSmallProfileImages = await storage.get(SMALL_PROFILE_IMAGES_KEY, false);
-                debugLog('[Toolkit] enableSmallProfileImages result:', enableSmallProfileImages, 'Type:', typeof enableSmallProfileImages);
-                
-                debugLog('[Toolkit] Fetching enableRoundedProfileImages...');
-                const enableRoundedProfileImages = await storage.get(ROUNDED_PROFILE_IMAGES_KEY, false);
-                debugLog('[Toolkit] enableRoundedProfileImages result:', enableRoundedProfileImages, 'Type:', typeof enableRoundedProfileImages);
-                
-                debugLog('[Toolkit] Fetching swapCheckboxPosition...');
-                const swapCheckboxPosition = await storage.get(SWAP_CHECKBOX_POSITION_KEY, false);
-                debugLog('[Toolkit] swapCheckboxPosition result:', swapCheckboxPosition, 'Type:', typeof swapCheckboxPosition);
-                
-                debugLog('[Toolkit] Fetching squareMessageEdges...');
-                const squareMessageEdges = await storage.get(SQUARE_MESSAGE_EDGES_KEY, false);
-                debugLog('[Toolkit] squareMessageEdges result:', squareMessageEdges, 'Type:', typeof squareMessageEdges);
-                
-                debugLog('[Toolkit] Fetching sidebarMinWidth...');
-                const sidebarMinWidth = await storage.get(SIDEBAR_MIN_WIDTH_KEY, DEFAULT_SIDEBAR_MIN_WIDTH);
-                debugLog('[Toolkit] sidebarMinWidth result:', sidebarMinWidth, 'Type:', typeof sidebarMinWidth);
-                
-                debugLog('[Toolkit] Fetching generationProfiles...');
-                const generationProfiles = await storage.get('generationProfiles', '{}');
-                debugLog('[Toolkit] generationProfiles result type:', typeof generationProfiles);
-                debugLog('[Toolkit] generationProfiles length:', generationProfiles?.length);
-                debugLog('[Toolkit] generationProfiles sample:', generationProfiles?.substring?.(0, 100));
-                
-                debugLog('[Toolkit] Fetching lastSelectedProfile...');
-                const lastSelectedProfile = await storage.get('lastSelectedProfile', '');
-                debugLog('[Toolkit] lastSelectedProfile result:', lastSelectedProfile, 'Type:', typeof lastSelectedProfile);
-                
-                debugLog('[Toolkit] Fetching messageGenerationStats...');
-                const messageGenerationStats = await storage.get('messageGenerationStats', '{}');
-                debugLog('[Toolkit] messageGenerationStats result type:', typeof messageGenerationStats);
-                debugLog('[Toolkit] messageGenerationStats length:', messageGenerationStats?.length);
-                debugLog('[Toolkit] messageGenerationStats sample:', messageGenerationStats?.substring?.(0, 100));
-                
-                debugLog('[Toolkit] All values fetched. Building export object...');
-                
-                // Parse JSON strings for proper export format
-                const generationProfilesParsed = JSON.parse(generationProfiles);
-                const messageGenerationStatsParsed = JSON.parse(messageGenerationStats);
-                
-                // Build the export object
-                const allData = {
-                    enableSidebarLayout,
-                    sidebarMinWidth,
-                    enableClassicLayout,
-                    enableClassicStyle,
-                    enableCustomStyle,
-                    customStyleValues: customStyleValuesStr,
-                    enableCompactGeneration,
-                    enableHideForYou,
-                    enablePageJump,
-                    showGenerationStats,
-                    showModelDetails,
-                    showTimestamp,
-                    timestampDateFirst,
-                    timestamp24Hour,
-                    showMessageIds,
-                    showChatNameInTitle,
-                    nsfwToggleEnabled,
-                    enableWysiwygEditor,
-                    enableGenerationProfiles,
-                    enableSmallProfileImages,
-                    enableRoundedProfileImages,
-                    swapCheckboxPosition,
-                    squareMessageEdges,
-                    generationProfiles: generationProfilesParsed,  // Use parsed object
-                    lastSelectedProfile,
-                    messageGenerationStats: messageGenerationStatsParsed  // Use parsed object
-                };
-                
-                debugLog('[Toolkit] Export object built:', Object.keys(allData));
-                debugLog('[Toolkit] Export object full:', allData);
-                debugLog('[Toolkit] Checking each property:');
+                debugLog('[Core] Export object built:', Object.keys(allData));
+                debugLog('[Core] Export object full:', allData);
+                debugLog('[Core] Checking each property:');
                 for (const [key, value] of Object.entries(allData)) {
-                    debugLog(`[Toolkit]   ${key}:`, typeof value, value?.constructor?.name, value);
+                    debugLog(`[Core]   ${key}:`, typeof value, value?.constructor?.name, value);
                 }
                 
-                debugLog('[Toolkit] Stringifying to JSON...');
+                debugLog('[Core] Stringifying to JSON...');
                 const dataStr = JSON.stringify(allData, null, 2);
-                debugLog('[Toolkit] JSON string length:', dataStr.length);
-                debugLog('[Toolkit] JSON string sample:', dataStr.substring(0, 200));
+                debugLog('[Core] JSON string length:', dataStr.length);
+                debugLog('[Core] JSON string sample:', dataStr.substring(0, 200));
                 
-                debugLog('[Toolkit] Creating blob...');
+                debugLog('[Core] Creating blob...');
                 const dataBlob = new Blob([dataStr], { type: 'application/json' });
-                debugLog('[Toolkit] Blob created, size:', dataBlob.size);
+                debugLog('[Core] Blob created, size:', dataBlob.size);
                 
                 const url = URL.createObjectURL(dataBlob);
-                debugLog('[Toolkit] Object URL created:', url);
+                debugLog('[Core] Object URL created:', url);
                 
                 const link = document.createElement('a');
                 link.href = url;
                 link.download = `sai-toolkit-extension-${Date.now()}.json`;
-                debugLog('[Toolkit] Download link created, filename:', link.download);
+                debugLog('[Core] Download link created, filename:', link.download);
                 
                 link.click();
-                debugLog('[Toolkit] Link clicked');
+                debugLog('[Core] Link clicked');
                 
                 URL.revokeObjectURL(url);
-                debugLog('[Toolkit] Object URL revoked');
+                debugLog('[Core] Object URL revoked');
                 
                 showNotification('All data exported successfully!\nFile includes: settings, profiles, and message stats');
-                debugLog('[Toolkit] ===== EXPORT COMPLETED SUCCESSFULLY =====');
+                debugLog('[Core] ===== EXPORT COMPLETED SUCCESSFULLY =====');
             } catch (error) {
-                console.error('[Toolkit] ===== EXPORT ERROR =====');
-                console.error('[Toolkit] Error exporting data:', error);
-                console.error('[Toolkit] Error stack:', error.stack);
+                console.error('[Core] ===== EXPORT ERROR =====');
+                console.error('[Core] Error exporting data:', error);
+                console.error('[Core] Error stack:', error.stack);
                 alert('Error exporting data: ' + error.message);
             }
         };
         } else {
-            console.error('[Toolkit] Cannot attach exportAllBtn handler - button not found!');
+            console.error('[Core] Cannot attach exportAllBtn handler - button not found!');
         }
         
         // Import All Data button
-        debugLog('[Toolkit] Attaching importAllBtn onclick handler...');
-        debugLog('[Toolkit] importAllBtn element:', importAllBtn);
-        debugLog('[Toolkit] importAllBtn exists?:', !!importAllBtn);
+        debugLog('[Core] Attaching importAllBtn onclick handler...');
+        debugLog('[Core] importAllBtn element:', importAllBtn);
+        debugLog('[Core] importAllBtn exists?:', !!importAllBtn);
         
         if (importAllBtn) {
             importAllBtn.onclick = async (e) => {
-                debugLog('[Toolkit] Import All Data button clicked');
+                debugLog('[Core] Import All Data button clicked');
                 e.stopPropagation();
                 
                 const input = document.createElement('input');
@@ -10020,16 +12066,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 input.addEventListener('change', async function(event) {
                     const file = event.target.files[0];
                     if (!file) {
-                        debugLog('[Toolkit] No file selected');
+                        debugLog('[Core] No file selected');
                         return;
                     }
                 
-                debugLog('[Toolkit] File selected:', file.name);
+                debugLog('[Core] File selected:', file.name);
                 const reader = new FileReader();
                 reader.onload = async function(e) {
                     try {
                         const imported = JSON.parse(e.target.result);
-                        debugLog('[Toolkit] Parsed imported data:', Object.keys(imported));
+                        debugLog('[Core] Parsed imported data:', Object.keys(imported));
                         
                         // Handle both old (double-encoded strings) and new (proper objects) formats
                         let generationProfilesValue = imported.generationProfiles;
@@ -10037,18 +12083,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         
                         // If they're strings (old format), parse them; if already objects (new format), use as-is
                         if (typeof generationProfilesValue === 'string') {
-                            debugLog('[Toolkit] generationProfiles is string (old format), parsing...');
+                            debugLog('[Core] generationProfiles is string (old format), parsing...');
                             generationProfilesValue = generationProfilesValue;  // Keep as string for storage
                         } else if (typeof generationProfilesValue === 'object') {
-                            debugLog('[Toolkit] generationProfiles is object (new format), stringifying for storage...');
+                            debugLog('[Core] generationProfiles is object (new format), stringifying for storage...');
                             generationProfilesValue = JSON.stringify(generationProfilesValue);  // Convert to string for storage
                         }
                         
                         if (typeof messageGenerationStatsValue === 'string') {
-                            debugLog('[Toolkit] messageGenerationStats is string (old format), parsing...');
+                            debugLog('[Core] messageGenerationStats is string (old format), parsing...');
                             messageGenerationStatsValue = messageGenerationStatsValue;  // Keep as string for storage
                         } else if (typeof messageGenerationStatsValue === 'object') {
-                            debugLog('[Toolkit] messageGenerationStats is object (new format), stringifying for storage...');
+                            debugLog('[Core] messageGenerationStats is object (new format), stringifying for storage...');
                             messageGenerationStatsValue = JSON.stringify(messageGenerationStatsValue);  // Convert to string for storage
                         }
                         
@@ -10076,29 +12122,38 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.showMessageIds !== undefined) updates.showMessageIds = imported.showMessageIds;
                         if (imported.showChatNameInTitle !== undefined) updates.showChatNameInTitle = imported.showChatNameInTitle;
                         if (imported.nsfwToggleEnabled !== undefined) updates.nsfwToggleEnabled = imported.nsfwToggleEnabled;
+                        if (imported.messageRecoveryEnabled !== undefined) updates.messageRecoveryEnabled = imported.messageRecoveryEnabled;
                         if (imported.enableWysiwygEditor !== undefined) updates.enableWysiwygEditor = imported.enableWysiwygEditor;
                         if (imported.enableGenerationProfiles !== undefined) updates.enableGenerationProfiles = imported.enableGenerationProfiles;
                         if (imported.enableSmallProfileImages !== undefined) updates.enableSmallProfileImages = imported.enableSmallProfileImages;
                         if (imported.enableRoundedProfileImages !== undefined) updates.enableRoundedProfileImages = imported.enableRoundedProfileImages;
                         if (imported.swapCheckboxPosition !== undefined) updates.swapCheckboxPosition = imported.swapCheckboxPosition;
                         if (imported.squareMessageEdges !== undefined) updates.squareMessageEdges = imported.squareMessageEdges;
+                        if (imported.highlightModelChanges !== undefined) updates.highlightModelChanges = imported.highlightModelChanges;
+                        if (imported.autoRegenOnMismatch !== undefined) updates.autoRegenOnMismatch = imported.autoRegenOnMismatch;
+                        if (imported.autoRegenOnShort !== undefined) updates.autoRegenOnShort = imported.autoRegenOnShort;
+                        if (imported.autoRegenMaxAttempts !== undefined) updates.autoRegenMaxAttempts = imported.autoRegenMaxAttempts;
+                        if (imported.messageContainerMaxWidth !== undefined) updates[MESSAGE_CONTAINER_MAX_WIDTH_KEY] = imported.messageContainerMaxWidth;
+                        if (imported.memoryDotEnabled !== undefined) updates[MEMORY_DOT_ENABLED_KEY] = imported.memoryDotEnabled;
+                        if (imported.memoryDotColor !== undefined) updates[MEMORY_DOT_COLOR_KEY] = imported.memoryDotColor;
+                        if (imported.hideCreatorName !== undefined) updates[HIDE_CREATOR_KEY] = imported.hideCreatorName;
                         if (generationProfilesValue !== undefined) updates.generationProfiles = generationProfilesValue;
                         if (imported.lastSelectedProfile !== undefined) updates.lastSelectedProfile = imported.lastSelectedProfile;
                         if (messageGenerationStatsValue !== undefined) updates.messageGenerationStats = messageGenerationStatsValue;
                         
-                        debugLog('[Toolkit] Importing keys:', Object.keys(updates));
+                        debugLog('[Core] Importing keys:', Object.keys(updates));
                         
                         // Apply all updates
                         await storage.setMultiple(updates);
-                        debugLog('[Toolkit] All data imported successfully');
+                        debugLog('[Core] All data imported successfully');
                         
                         showNotification('All data imported successfully!\nRefreshing page...');
                         setTimeout(() => {
-                            debugLog('[Toolkit] Reloading page...');
+                            debugLog('[Core] Reloading page...');
                             window.location.reload();
                         }, 1500);
                     } catch (error) {
-                        console.error('[Toolkit] Error importing data:', error);
+                        console.error('[Core] Error importing data:', error);
                         alert('Error importing data: ' + error.message);
                     }
                 };
@@ -10107,34 +12162,3099 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             input.click();
         };
         } else {
-            console.error('[Toolkit] Cannot attach importAllBtn handler - button not found!');
+            console.error('[Core] Cannot attach importAllBtn handler - button not found!');
         }
         
         // Escape key to close
         const escapeHandler = (e) => {
             if (e.key === 'Escape') {
-                debugLog('[Toolkit] Escape key pressed');
+                debugLog('[Core] Escape key pressed');
                 closeModal();
                 document.removeEventListener('keydown', escapeHandler);
             }
         };
         document.addEventListener('keydown', escapeHandler);
         
-        debugLog('[Toolkit] ===== MODAL SETUP COMPLETE =====');
+        debugLog('[Core] ===== MODAL SETUP COMPLETE =====');
     }
+
+    // Global error monitoring to track React crashes
+    window.addEventListener('error', async (event) => {
+        debugLog('[Core] ===== GLOBAL ERROR DETECTED =====');
+        debugLog('[Core] Error message:', event.message);
+        debugLog('[Core] Error filename:', event.filename);
+        debugLog('[Core] Error line:', event.lineno, 'col:', event.colno);
+        debugLog('[Core] Error object:', event.error);
+        debugLog('[Core] Stack trace:', event.error?.stack);
+        debugLog('[Core] Time:', Date.now());
+    }, true);
+    
+    // Monitor unhandled promise rejections too
+    window.addEventListener('unhandledrejection', async (event) => {
+        debugLog('[Core] ===== UNHANDLED PROMISE REJECTION =====');
+        debugLog('[Core] Reason:', event.reason);
+        debugLog('[Core] Promise:', event.promise);
+        debugLog('[Core] Time:', Date.now());
+    });
+
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+    // ===                                                                       ===
+    // ===                     TOOLKIT SPECIFIC CODE - END                      ===
+    // ===                                                                       ===
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+
+
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+    // ===                                                                       ===
+    // ===                    INITIALIZATION & OBSERVERS                        ===
+    // ===                                                                       ===
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+
+    // CHECK ONBOARDING FIRST - before initializing anything else
+    // Get all storage to check if it's truly empty or has any toolkit settings
+    const allStorage = await (typeof browser !== 'undefined' ? browser : chrome).storage.local.get(null);
+    const storageKeys = Object.keys(allStorage);
+    
+    debugLog('[Core] ===== ONBOARDING CHECK (BEFORE INIT) =====');
+    debugLog('[Core] All storage keys:', storageKeys);
+    debugLog('[Core] Storage contents:', allStorage);
+    
+    // Check if this is first run: no hasSeenOnboarding key OR it's explicitly false
+    // OR if Classic Style key is missing (indicates update from old version)
+    const hasSeenOnboarding = allStorage.hasSeenOnboarding;
+    const hasClassicStyleKey = CLASSIC_STYLE_KEY in allStorage;
+    const hasToolkitSettings = (
+        SIDEBAR_LAYOUT_KEY in allStorage ||
+        CLASSIC_LAYOUT_KEY in allStorage ||
+        CLASSIC_STYLE_KEY in allStorage ||
+        'enableThemeCustomization' in allStorage || // Legacy key
+        COMPACT_GENERATION_KEY in allStorage ||
+        HIDE_FOR_YOU_KEY in allStorage ||
+        PAGE_JUMP_KEY in allStorage
+    );
+    
+    debugLog('[Core] Onboarding check - hasSeenOnboarding:', hasSeenOnboarding);
+    debugLog('[Core] Onboarding check - hasClassicStyleKey:', hasClassicStyleKey);
+    debugLog('[Core] Onboarding check - hasToolkitSettings:', hasToolkitSettings);
+    
+    // Show onboarding if: never seen before (undefined) OR explicitly false
+    // OR if user has settings but Classic Style key is missing (update scenario)
+    const shouldShowOnboarding = hasSeenOnboarding === undefined || 
+                                  hasSeenOnboarding === false ||
+                                  (hasToolkitSettings && !hasClassicStyleKey);
+    debugLog('[Core] Should show onboarding?', shouldShowOnboarding);
+    
+    // Initialize styles on page load
+    await initializeStyles();
+
+    // Initialize Message Recovery: read the user's opt-in state from storage
+    // and forward it to the page-context interceptor. Idempotent — safe to
+    // call before/after initializeStyles.
+    await initMessageRecovery();
+    
+    // Expose a helper function to reset onboarding (for testing)
+    // Since content scripts can't expose functions to page context, we use custom events
+    window.addEventListener('SAI_RESET_ONBOARDING', async function() {
+        debugLog('[Core] Reset onboarding event received');
+        // Clear the onboarding flag
+        await storage.remove('hasSeenOnboarding');
+        // Also clear all settings to simulate a truly fresh install
+        await storage.remove(SIDEBAR_LAYOUT_KEY);
+        await storage.remove(CLASSIC_LAYOUT_KEY);
+        await storage.remove(CLASSIC_STYLE_KEY);
+        await storage.remove('enableThemeCustomization'); // Legacy key
+        await storage.remove(COMPACT_GENERATION_KEY);
+        await storage.remove(HIDE_FOR_YOU_KEY);
+        await storage.remove(PAGE_JUMP_KEY);
+        await storage.remove('showGenerationStats');
+        await storage.remove('timestampDateFirst');
+        debugLog('[Core] Onboarding and all settings reset! Reload the page to see the onboarding modal.');
+        setTimeout(() => location.reload(), 1000);
+    });
+    
+    // Note: resetSAIToolkitOnboarding() function is injected via page-context.js
+    
+    if (shouldShowOnboarding) {
+        debugLog('[Core] First run detected - will show onboarding modal');
+        // Don't mark as seen yet - only mark when user clicks "Save & Refresh"
+        // Wait for page to fully load and toolkit icon to be injected before showing modal
+        setTimeout(() => {
+            debugLog('[Core] Triggering onboarding modal...');
+            try {
+                showToolkitSettingsModal();
+            } catch (error) {
+                console.error('[Core] Error showing onboarding modal:', error);
+            }
+        }, 3000); // Increased delay to ensure page is fully loaded
+    } else {
+        debugLog('[Core] Not first run - skipping onboarding modal');
+    }
+
+    // Track button check interval to prevent multiple intervals (memory leak fix)
+    let buttonCheckInterval = null;
+
+    // Resize protection to prevent React 185 error during sidebar collapse/expand transitions
+    let lastResizeTime = 0;
+    let pendingButtonInjection = null;
+    const RESIZE_DEBOUNCE_MS = 500; // Increased from 300ms
+    // isResizing and resizeEndTimer are hoisted to the top of the IIFE — see early-declared state.
+
+    // Track all pending injection timeouts so we can cancel them on resize
+    let pendingInjectionTimeouts = [];
+    
+    // Helper to schedule injection with cancellation support
+    function scheduleInjection(fn, delay) {
+        const timeoutId = setTimeout(() => {
+            // Remove from tracking array
+            pendingInjectionTimeouts = pendingInjectionTimeouts.filter(id => id !== timeoutId);
+            // Double-check resize state before executing
+            if (!isResizing && !sidebarWidthTransitionPending) {
+                fn();
+            }
+        }, delay);
+        pendingInjectionTimeouts.push(timeoutId);
+        return timeoutId;
+    }
+    
+    // Cancel all pending injection timeouts
+    function cancelAllPendingInjections() {
+        pendingInjectionTimeouts.forEach(id => clearTimeout(id));
+        pendingInjectionTimeouts = [];
+    }
+    
+    // Remove all WYSIWYG editors from DOM to prevent React conflicts during resize
+    function removeAllWysiwygEditorsForResize() {
+        debugLog('[WYSIWYG] Removing all WYSIWYG editors from DOM for resize');
+        const allEditors = document.querySelectorAll('.sai-wysiwyg-editor');
+        let removeCount = 0;
+        allEditors.forEach(editor => {
+            // Find the associated textarea to clean up references
+            const textarea = editor.nextElementSibling;
+            if (textarea && textarea.tagName === 'TEXTAREA') {
+                // Mark that it needs re-setup after resize
+                textarea.dataset.wysiwygSetup = '';
+                // Clean up observers
+                if (textarea._wysiwygResizeObserver) {
+                    textarea._wysiwygResizeObserver.disconnect();
+                    delete textarea._wysiwygResizeObserver;
+                }
+                if (textarea._wysiwygMutationObserver) {
+                    textarea._wysiwygMutationObserver.disconnect();
+                    delete textarea._wysiwygMutationObserver;
+                }
+                if (textarea._wysiwygValueCheckInterval) {
+                    clearInterval(textarea._wysiwygValueCheckInterval);
+                    delete textarea._wysiwygValueCheckInterval;
+                }
+                // Restore textarea visibility
+                textarea.classList.remove('sai-wysiwyg-hidden');
+                textarea.style.removeProperty('position');
+                textarea.style.removeProperty('opacity');
+                textarea.style.removeProperty('pointer-events');
+                textarea.style.removeProperty('width');
+                textarea.style.removeProperty('height');
+                textarea.style.removeProperty('min-width');
+                textarea.style.removeProperty('min-height');
+                textarea.style.removeProperty('max-width');
+                textarea.style.removeProperty('max-height');
+                textarea.style.removeProperty('padding');
+                textarea.style.removeProperty('margin');
+                textarea.style.removeProperty('border');
+                textarea.style.removeProperty('overflow');
+                textarea.style.removeProperty('z-index');
+            }
+            editor.remove();
+            removeCount++;
+        });
+        debugLog('[WYSIWYG] Removed', removeCount, 'WYSIWYG editors from DOM');
+    }
+    
+    // Pre-emptive resize detection using mousedown on window edges
+    // This removes elements BEFORE resize starts, avoiding React conflicts
+    let resizeStartPending = false;
+    
+    document.addEventListener('mousedown', function(e) {
+        // Detect if mouse is near window edge (potential resize drag)
+        const edgeThreshold = 10;
+        const nearRightEdge = e.clientX >= window.innerWidth - edgeThreshold;
+        const nearBottomEdge = e.clientY >= window.innerHeight - edgeThreshold;
+        
+        if (nearRightEdge || nearBottomEdge) {
+            debugLog('[Core] RESIZE START DETECTED (mousedown near edge)');
+            resizeStartPending = true;
+            isResizing = true;
+            sidebarWidthTransitionPending = true;
+            cancelAllPendingInjections();
+            
+            // CRITICAL: Remove all WYSIWYG editors from DOM to prevent React 185 error
+            removeAllWysiwygEditorsForResize();
+            
+            // Remove button IMMEDIATELY before any resize events fire
+            const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
+            if (sidebarBtn) {
+                const wrapper = sidebarBtn.closest('div.w-full');
+                if (wrapper) {
+                    wrapper.remove();
+                    debugLog('[Core] RESIZE START - pre-emptively removed sidebar button');
+                } else {
+                    sidebarBtn.remove();
+                }
+            }
+        }
+    }, true); // Use capture phase to run before other handlers
+    
+    document.addEventListener('mouseup', function() {
+        if (resizeStartPending) {
+            resizeStartPending = false;
+            // Don't reset isResizing here - let the resize end timer handle it
+        }
+    });
+    
+    // Track last-known window width so we can ignore height-only resize events.
+    // On Firefox Android PWA (standalone display-mode), opening the soft keyboard
+    // resizes the layout viewport (height shrinks, width unchanged) and fires a
+    // window 'resize' event. Without this guard, the handler tears down the WYSIWYG
+    // editor the user just tapped, which steals focus and dismisses the keyboard.
+    // React-185 avoidance only depends on width breakpoints, so height-only changes
+    // are safe to skip here.
+    let lastResizeWidth = window.innerWidth;
+    window.addEventListener('resize', function() {
+        const width = window.innerWidth;
+        if (width === lastResizeWidth) {
+            debugLog('[Core] RESIZE EVENT (height-only, ignored) - width:', width);
+            return;
+        }
+        lastResizeWidth = width;
+        debugLog('[Core] RESIZE EVENT - width:', width, 'wasResizing:', isResizing);
+        lastResizeTime = Date.now();
+        
+        // If we didn't catch the resize start via mousedown, do removal now
+        if (!isResizing) {
+            isResizing = true;
+            sidebarWidthTransitionPending = true;
+            cancelAllPendingInjections();
+            
+            // CRITICAL: Remove all WYSIWYG editors from DOM to prevent React 185 error
+            removeAllWysiwygEditorsForResize();
+            
+            // Remove button immediately
+            const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
+            if (sidebarBtn) {
+                debugLog('[Core] RESIZE - removing sidebar button');
+                const wrapper = sidebarBtn.closest('div.w-full');
+                if (wrapper) {
+                    wrapper.remove();
+                } else {
+                    sidebarBtn.remove();
+                }
+            }
+        }
+        
+        // Clear any pending injection during resize
+        if (pendingButtonInjection) {
+            clearTimeout(pendingButtonInjection);
+            pendingButtonInjection = null;
+        }
+        
+        // Reset sidebar width tracking so next injection will succeed
+        lastKnownSidebarWidth = null;
+        
+        // Mark resize as ended after debounce period
+        if (resizeEndTimer) clearTimeout(resizeEndTimer);
+        resizeEndTimer = setTimeout(function() {
+            isResizing = false;
+            sidebarWidthTransitionPending = false; // Allow sidebar injection again
+            debugLog('[Core] RESIZE END - width:', window.innerWidth, 'will re-inject if needed');
+            
+            // Re-inject button after resize settles
+            if (window.innerWidth >= 600) {
+                setTimeout(() => {
+                    if (!isResizing) {
+                        injectToolkitSidebarButton();
+                    }
+                }, 100);
+            }
+            
+            // Re-setup WYSIWYG editors after resize ends
+            if (!isResizing) {
+                debugLog('[WYSIWYG] Re-initializing editors after resize');
+                findAndSetupWysiwygTextareas();
+            }
+        }, RESIZE_DEBOUNCE_MS);
+    });
+    
+    // CRITICAL: Periodic check to remove WYSIWYG editors if window is in danger zone
+    // This prevents React Error 185 when user types/sends messages at ~768px breakpoint
+    setInterval(() => {
+        const windowWidth = window.innerWidth;
+        const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
+        
+        if (inDangerZone && !isResizing) {
+            const editors = document.querySelectorAll('.sai-wysiwyg-editor');
+            if (editors.length > 0) {
+                debugLog('[WYSIWYG] Danger zone detected (' + windowWidth + 'px), removing ' + editors.length + ' editor(s)');
+                removeAllWysiwygEditorsForResize();
+            }
+        }
+    }, 250); // Check every 250ms
+    
+    // =============================================================================
+    // SIDEBAR LAYOUT BODY-CLASS OBSERVER
+    // =============================================================================
+    // Maintains a small set of state classes on document.body that the Sidebar
+    // Layout CSS reads instead of `body:has(...)` selectors. The original ~30
+    // chained `:has()` rules forced the style engine to re-test the entire body
+    // subtree on every DOM mutation — catastrophic on older CPUs (8s+ forced
+    // reflows during typing). With body classes, each rule is O(1) to match.
+    //
+    // Classes managed (all gated on `body`):
+    //   sai-mm-sidebar-modal-open  → any Memories/Gen Settings modal is open
+    //   sai-mm-image-modal-open    → image lightbox is open
+    //   sai-mm-toolkit-modal-open  → our own settings modal is open
+    //   sai-mm-gen-settings-open   → Generation Settings modal is open
+    //   sai-mm-memories-open       → Memories modal is open
+    //   sai-mm-nav-collapsed       → left nav is at the 54px collapsed width
+    //
+    // The observer is intentionally cheap: it only RE-RUNS the cached selector
+    // checks when an added/removed node could plausibly be a modal or nav
+    // (pre-filtered against the same patterns the old `:has()` rules used).
+    // Updates are coalesced into a single requestAnimationFrame callback so
+    // bursts of React mutations only produce one classList toggle pass.
+    // (sidebarLayoutBodyObserver and sidebarLayoutBodyClassRafPending are
+    // hoisted to the top of the IIFE — see the early-declared state block.)
+
+    function updateSidebarLayoutBodyClasses() {
+        if (!document.body) return;
+        const cl = document.body.classList;
+
+        const hasSidebarModal = !!document.querySelector(
+            'div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container)'
+        );
+        const hasImageModal = !!document.querySelector(
+            'div.fixed.left-1\\/2.top-1\\/2.size-full'
+        );
+        const hasToolkitModal = !!document.querySelector('#toolkit-modal-root .backdrop');
+        const hasGenSettings = !!document.querySelector(
+            'div.fixed.left-1\\/2.top-1\\/2.max-h-\\[600px\\]:not(.h-full):not(.size-full), ' +
+            'div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:not(.h-full):not(.size-full)'
+        );
+        const hasMemories = !!document.querySelector(
+            'div.fixed.left-1\\/2.top-1\\/2.h-full:not(.size-full):not(.toolkit-modal-container)'
+        );
+        const navCollapsed = !!document.querySelector('nav[style*="width: 54px"]');
+
+        cl.toggle('sai-mm-sidebar-modal-open', hasSidebarModal);
+        cl.toggle('sai-mm-image-modal-open', hasImageModal);
+        cl.toggle('sai-mm-toolkit-modal-open', hasToolkitModal);
+        cl.toggle('sai-mm-gen-settings-open', hasGenSettings);
+        cl.toggle('sai-mm-memories-open', hasMemories);
+        cl.toggle('sai-mm-nav-collapsed', navCollapsed);
+        // Combined: any centered modal exists (sidebar OR image). Used by the
+        // chat-width adjustment rules that need to react to either.
+        cl.toggle('sai-mm-any-center-modal-open', hasSidebarModal || hasImageModal);
+    }
+
+    function scheduleSidebarLayoutBodyClassUpdate() {
+        if (sidebarLayoutBodyClassRafPending) return;
+        sidebarLayoutBodyClassRafPending = true;
+        requestAnimationFrame(() => {
+            sidebarLayoutBodyClassRafPending = false;
+            updateSidebarLayoutBodyClasses();
+        });
+    }
+
+    // A mutation is interesting only if it could change the result of one of
+    // the selectors above. We pre-filter on tagName/class patterns so we don't
+    // re-run the queries on every keystroke-induced text node change.
+    function mutationCouldAffectModalState(mutation) {
+        if (mutation.type === 'attributes') {
+            // Style changes on nav (collapse/expand) or class flips on modals
+            const t = mutation.target;
+            if (!t || t.nodeType !== 1) return false;
+            if (t.tagName === 'NAV') return true;
+            if (t.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]')) return true;
+            return false;
+        }
+        if (mutation.addedNodes.length === 0 && mutation.removedNodes.length === 0) return false;
+        const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        for (const n of nodes) {
+            if (n.nodeType !== 1) continue;
+            if (n.tagName === 'NAV' || n.querySelector?.('nav')) return true;
+            if (n.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]')) return true;
+            if (n.querySelector?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]')) return true;
+            if (n.id === 'toolkit-modal-root' || n.querySelector?.('#toolkit-modal-root')) return true;
+            if (n.classList?.contains('backdrop') && n.closest?.('#toolkit-modal-root')) return true;
+        }
+        return false;
+    }
+
+    function startSidebarLayoutBodyClassObserver() {
+        if (sidebarLayoutBodyObserver) return; // already running
+
+        sidebarLayoutBodyObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (mutationCouldAffectModalState(m)) {
+                    scheduleSidebarLayoutBodyClassUpdate();
+                    return;
+                }
+            }
+        });
+
+        const attach = () => {
+            if (!document.body) {
+                // Body not ready yet — retry on next tick. (Early-inject is called
+                // before <body> exists; without this we'd race React rendering modals
+                // into the DOM before the observer ever attached.)
+                setTimeout(attach, 50);
+                return;
+            }
+            sidebarLayoutBodyObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['style', 'class']
+            });
+            // Critical: sweep AFTER body exists and observer is attached.
+            // The previous version ran the sweep before attach() — which meant
+            // it bailed when body didn't exist yet, then the observer never saw
+            // the modals React had already mounted. Result: body classes never
+            // got set on pages that load with a modal already open, and all of
+            // the class-based sidebar CSS sat inert.
+            updateSidebarLayoutBodyClasses();
+            debugLog('[Core] Sidebar Layout body-class observer attached and swept');
+        };
+        attach();
+    }
+
+    function stopSidebarLayoutBodyClassObserver() {
+        if (sidebarLayoutBodyObserver) {
+            sidebarLayoutBodyObserver.disconnect();
+            sidebarLayoutBodyObserver = null;
+        }
+        if (document.body) {
+            document.body.classList.remove(
+                'sai-mm-sidebar-modal-open',
+                'sai-mm-image-modal-open',
+                'sai-mm-toolkit-modal-open',
+                'sai-mm-gen-settings-open',
+                'sai-mm-memories-open',
+                'sai-mm-nav-collapsed',
+                'sai-mm-any-center-modal-open'
+            );
+        }
+    }
+
+    // Watch sidebar element for width changes using ResizeObserver
+    // This catches sidebar width transitions that happen without a window resize event
+    let sidebarResizeObserver = null;
+    let lastObservedSidebarWidth = null;
+    let sidebarResizeTimer = null;
+    
+    function setupSidebarResizeObserver() {
+        if (sidebarResizeObserver) {
+            sidebarResizeObserver.disconnect();
+        }
+        
+        const sidebar = document.querySelector('nav.flex.flex-col');
+        if (!sidebar) {
+            debugLog('[Core] Sidebar not found for ResizeObserver');
+            return;
+        }
+        
+        lastObservedSidebarWidth = sidebar.offsetWidth;
+        debugLog('[Core] Setting up sidebar ResizeObserver, initial width:', lastObservedSidebarWidth);
+        
+        sidebarResizeObserver = new ResizeObserver((entries) => {
+            // CRITICAL: Skip entirely if window resize is in progress
+            // The window resize handler already handles button removal
+            if (isResizing) {
+                // Just update tracked width silently, don't do anything else
+                for (const entry of entries) {
+                    lastObservedSidebarWidth = entry.contentRect.width;
+                }
+                return;
+            }
+            
+            for (const entry of entries) {
+                const newWidth = entry.contentRect.width;
+                
+                if (lastObservedSidebarWidth !== null && lastObservedSidebarWidth !== newWidth) {
+                    debugLog('[Core] Sidebar width changed (not during resize):', lastObservedSidebarWidth, '->', newWidth);
+                    
+                    // Mark as transitioning
+                    sidebarWidthTransitionPending = true;
+                    
+                    // Remove sidebar button during transition to avoid React conflicts
+                    const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
+                    if (sidebarBtn) {
+                        debugLog('[Core] Removing sidebar button during width transition');
+                        const wrapper = sidebarBtn.closest('div.w-full');
+                        if (wrapper) {
+                            wrapper.remove();
+                        } else {
+                            sidebarBtn.remove();
+                        }
+                    }
+                    
+                    // Reset transition flag after debounce and re-inject
+                    if (sidebarResizeTimer) clearTimeout(sidebarResizeTimer);
+                    sidebarResizeTimer = setTimeout(() => {
+                        sidebarWidthTransitionPending = false;
+                        debugLog('[Core] Sidebar transition complete, new width:', newWidth);
+                        
+                        // Re-inject button if width supports it
+                        if (window.innerWidth >= 600 && !isResizing) {
+                            setTimeout(() => {
+                                if (!sidebarWidthTransitionPending && !isResizing) {
+                                    injectToolkitSidebarButton();
+                                }
+                            }, 100);
+                        }
+                    }, 400);
+                }
+                
+                lastObservedSidebarWidth = newWidth;
+            }
+        });
+        
+        sidebarResizeObserver.observe(sidebar);
+    }
+    
+    // Set up observer after a delay to ensure sidebar exists
+    setTimeout(setupSidebarResizeObserver, 1000);
+    
+    // Debounced button injection to prevent React re-render loops
+    function debouncedButtonInjection() {
+        // Skip entirely if currently resizing or sidebar is transitioning
+        if (isResizing || sidebarWidthTransitionPending) {
+            return;
+        }
+        
+        // Skip if resize just happened (sidebar may be in transition)
+        const timeSinceResize = Date.now() - lastResizeTime;
+        if (timeSinceResize < RESIZE_DEBOUNCE_MS) {
+            // Schedule a delayed check after resize settles
+            if (!pendingButtonInjection) {
+                pendingButtonInjection = setTimeout(function() {
+                    pendingButtonInjection = null;
+                    // Double-check we're not resizing when timer fires
+                    if (!isResizing && !sidebarWidthTransitionPending && window.innerWidth >= 600) {
+                        injectToolkitSidebarButton();
+                    }
+                }, RESIZE_DEBOUNCE_MS);
+            }
+            return;
+        }
+        
+        // Safe to inject
+        injectToolkitSidebarButton();
+    }
+
+    // Cache the one-shot CSS injection state so we don't query the DOM on every batch.
+    let toolkitButtonCssInjected = false;
+
+    // Observe for modal appearance / button host elements appearing
+    const observer = new MutationObserver(function(mutations) {
+        // Skip all processing during resize or sidebar transition to prevent React 185 error
+        if (isResizing || sidebarWidthTransitionPending) {
+            return;
+        }
+
+        // Perf: pre-filter mutations. The vast majority of body mutations during
+        // streaming are message-bubble updates that have nothing to do with the
+        // sidebar, modals, or our injection targets. Only run the (expensive)
+        // full pass when an element is added/removed that could be one of our hosts.
+        let relevant = false;
+        for (const m of mutations) {
+            if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
+            const nodes = [...m.addedNodes, ...m.removedNodes];
+            for (const n of nodes) {
+                if (n.nodeType !== 1) continue;
+                if (
+                    n.tagName === 'NAV' || n.querySelector?.('nav') ||
+                    n.matches?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]') ||
+                    n.querySelector?.('div[class*="fixed"][class*="left-1/2"][class*="top-1/2"]') ||
+                    n.matches?.('button[aria-label="ThumbsUp-button"]') ||
+                    n.querySelector?.('button[aria-label="ThumbsUp-button"]') ||
+                    n.matches?.('svg.lucide-info') ||
+                    n.querySelector?.('svg.lucide-info')
+                ) {
+                    relevant = true;
+                    break;
+                }
+            }
+            if (relevant) break;
+        }
+        if (!relevant) return;
+
+        // Look specifically for the Generation Settings modal (supports both old and new UI)
+        const modal = findGenerationSettingsModal();
+
+        if (modal && !modal.querySelector('#profile-controls')) {
+            // Wait a bit for the modal to fully render
+            setTimeout(createProfileControls, 100);
+        }
+
+        // Try to inject sidebar button (watches for sidebar to load) - debounced to prevent React 185
+        debouncedButtonInjection();
+
+        // Inject CSS to hide toolkit button text when sidebar is collapsed (only once)
+        if (!toolkitButtonCssInjected) {
+            const toolkitButtonCSS = document.createElement('style');
+            toolkitButtonCSS.id = 'sai-toolkit-button-css';
+            toolkitButtonCSS.textContent = `
+/* Ensure tooltip wrapper doesn't break width */
+#sai-toolkit-sidebar-btn[data-tooltip-id],
+div.w-full > [data-tooltip-id]:has(#sai-toolkit-sidebar-btn) {
+    display: block !important;
+    width: 100%;
+}
+
+/* Hide S.AI Toolkit button text when sidebar is collapsed */
+nav[style*="width: 54px"] #sai-toolkit-sidebar-btn .toolkit-button-text,
+nav[style*="width: 54px"] #sai-toolkit-sidebar-btn p {
+    display: none !important;
+}
+
+/* Ensure text is visible when sidebar is expanded */
+nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn .toolkit-button-text,
+nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
+    display: inline !important;
+}
+`;
+            document.head.appendChild(toolkitButtonCSS);
+            toolkitButtonCssInjected = true;
+            debugLog('[Core] Button CSS injected');
+        }
+
+        // Try to inject mobile button (watches for Like button to appear)
+        injectToolkitMobileButton();
+
+        // Try to inject chat export button (only on chat pages)
+        injectChatExportButton();
+
+        // Try to inject NSFW toggle button (only on chat pages, after export button)
+        injectNSFWToggleButton();
+
+        // NOTE: previously we scheduled 20 retry setTimeouts (5 delays × 4 buttons) on
+        // every mutation batch. The buttonCheckInterval below already re-injects any
+        // missing buttons every 2s, so those retries were redundant churn. Removed.
+
+        // Instead of heavy MutationObservers, use lightweight periodic checks
+        // Check every 2 seconds if buttons still exist and text element is present
+        // Only create interval once to prevent memory leak from multiple intervals
+        if (!buttonCheckInterval) {
+            buttonCheckInterval = setInterval(() => {
+            // Skip ALL checks during resize to prevent React conflicts
+            if (isResizing || sidebarWidthTransitionPending) {
+                return;
+            }
+            
+            // Skip sidebar button checks on mobile - sidebar doesn't exist below 600px
+            if (window.innerWidth >= 600) {
+                const sidebarButton = document.getElementById('sai-toolkit-sidebar-btn');
+                if (sidebarButton) {
+                    // Check if text element exists, if not re-add it
+                    const iconContainer = sidebarButton.querySelector('.flex.items-center.gap-2');
+                    if (iconContainer && !iconContainer.querySelector('.toolkit-button-text')) {
+                        let textElement = document.createElement('p');
+                        textElement.className = 'font-sans text-decoration-skip-ink-none text-underline-position-from-font text-label-lg font-regular text-left truncate toolkit-button-text';
+                        textElement.textContent = 'S.AI Toolkit';
+                        iconContainer.appendChild(textElement);
+                        debugLog('[Core] Text element re-added after React removed it');
+                    }
+                } else {
+                    // Button missing, try to re-inject (debounced for resize safety)
+                    const helpIcon = document.querySelector('svg.lucide-info');
+                    if (helpIcon) {
+                        debouncedButtonInjection();
+                    }
+                }
+            }
+            
+            // Check mobile button
+            const mobileButton = document.getElementById('sai-toolkit-mobile-btn');
+            if (!mobileButton) {
+                const likeButton = document.querySelector('button[aria-label="ThumbsUp-button"]');
+                if (likeButton) {
+                    injectToolkitMobileButton();
+                }
+            }
+            
+            // Check export button (only on chat pages - supports both /chat/ and /{language}/chat/)
+            if (isOnChatPage()) {
+                const exportButton = document.getElementById('sai-export-btn');
+                if (!exportButton) {
+                    injectChatExportButton();
+                }
+
+                // Check NSFW toggle button
+                const nsfwButton = document.getElementById('sai-nsfw-btn');
+                if (!nsfwButton) {
+                    injectNSFWToggleButton();
+                }
+
+                // Message Recovery: if the "Oops!" banner is on screen and
+                // we have a saved failed message, offer the recover button.
+                // Cheap no-op when the feature is off or the banner is gone.
+                injectRecoverButtonIfNeeded();
+            }
+            }, TIMING.PERIODIC_CHECK); // Check periodically instead of on every DOM mutation
+        }
+    });
+
+    // Wait for body before starting observer (fixes middle-click new tab issue)
+    waitForBody().then((body) => {
+        debugLog('[Core] document.body available, starting main observer');
+        observer.observe(body, {
+            childList: true,
+            subtree: true
+        });
+        
+        // Trigger initial button injection now that body exists
+        injectToolkitSidebarButton();
+        injectToolkitMobileButton();
+        injectChatExportButton();
+        injectNSFWToggleButton();
+        
+        // Also schedule retry attempts in case page content loads slowly
+        // Use scheduleInjection so these can be cancelled on resize
+        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
+            scheduleInjection(() => {
+                injectToolkitSidebarButton();
+                injectToolkitMobileButton();
+                injectChatExportButton();
+                injectNSFWToggleButton();
+            }, delay);
+        });
+    }).catch((err) => {
+        console.error('[Core] Failed to wait for body:', err);
+        // Last resort: try anyway after a delay
+        setTimeout(() => {
+            if (document.body) {
+                debugLog('[Core] Retrying observer setup after error');
+                observer.observe(document.body, { childList: true, subtree: true });
+                injectToolkitSidebarButton();
+                injectToolkitMobileButton();
+                injectChatExportButton();
+                injectNSFWToggleButton();
+            }
+        }, 2000);
+    });
+
+    // Observer to add generation stats to messages
+    // Debounce to prevent excessive processing during rapid DOM changes
+    let statsProcessingTimeout = null;
+    let pendingMutations = false;
+    
+    const messageObserver = new MutationObserver(async function(mutations) {
+        // Quick check: Only process if we see relevant mutations (message wrappers)
+        let hasRelevantMutation = false;
+        for (const mutation of mutations) {
+            // Only care about added nodes that could be message wrappers
+            if (mutation.addedNodes.length > 0) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === 1 && (node.classList?.contains('mb-lg') || node.querySelector?.('.mb-lg'))) {
+                        hasRelevantMutation = true;
+                        break;
+                    }
+                }
+            }
+            if (hasRelevantMutation) break;
+        }
+        
+        if (!hasRelevantMutation) return;
+        
+        // Debounce: Only process after 150ms of no mutations (Issue #12)
+        pendingMutations = true;
+        if (statsProcessingTimeout) {
+            clearTimeout(statsProcessingTimeout);
+        }
+        
+        statsProcessingTimeout = setTimeout(() => {
+            pendingMutations = false;
+            processMessagesForStats(true);
+        }, TIMING.MUTATION_DEBOUNCE);
+    });
+
+    // Special function to insert stats for a regenerated message
+    // This is needed because regenerations REPLACE the message content, not add a new element
+    // So processMessagesForStats can't find them by DOM index
+    // Note: statsInsertedForMessageIds and statsInsertionInProgress are defined earlier in the file
+    const statsFailedForWrappers = new WeakSet();      // Wrappers that failed ID extraction (prevents retries)
+    let lastConversationIdForStatsSet = null;
+
+    // Memory optimization: Maximum tracked message IDs to prevent unbounded growth
+    const MAX_STATS_TRACKING = 200;
+
+    // Helper to limit Set size - removes oldest entries when over limit
+    function limitSetSize(set, maxSize) {
+        if (set.size > maxSize) {
+            // Only remove enough to get back to maxSize (Sets maintain insertion order)
+            const excess = set.size - maxSize;
+            const iterator = set.values();
+            for (let i = 0; i < excess; i++) {
+                set.delete(iterator.next().value);
+            }
+        }
+    }
+    
+    // Sequential retry wrapper - prevents race conditions from browser timer throttling
+    // When a tab is in background, multiple setTimeout calls can fire at once on restore
+    async function insertStatsWithRetry(messageId, model, settings, createdAt, attempt = 1) {
+        const maxAttempts = 4;
+        // First attempt is immediate (0ms delay), then use increasing delays for retries
+        // This ensures we try to insert stats BEFORE processMessagesForStats runs (150ms debounce)
+        const delays = [0, 500, 1000, 1500]; // Delay before each attempt
+
+        if (attempt > maxAttempts) {
+            debugLog('[Stats RETRY] Max attempts reached for message:', messageId?.substring(0, 8));
+            // Decrement pending count since we're done trying (failed)
+            if (pendingNewMessageCount > 0) {
+                pendingNewMessageCount--;
+                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+            }
+            return;
+        }
+
+        // Wait before attempting (first attempt is immediate with 0ms delay)
+        const delay = delays[attempt - 1] || 500;
+        if (delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+        
+        // Check if already successfully inserted (by this or another call)
+        if (statsInsertedForMessageIds.has(messageId)) {
+            debugLog('[Stats RETRY] Already inserted, stopping retries for:', messageId?.substring(0, 8));
+            // Decrement pending count since insertion is complete
+            if (pendingNewMessageCount > 0) {
+                pendingNewMessageCount--;
+                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+            }
+            return;
+        }
+        
+        // Try to insert
+        const success = await insertStatsForRegeneratedMessage(messageId, model, settings, createdAt);
+        
+        // If failed and not yet inserted, retry
+        if (!success && !statsInsertedForMessageIds.has(messageId)) {
+            debugLog('[Stats RETRY] Attempt', attempt, 'failed, will retry for:', messageId?.substring(0, 8));
+            insertStatsWithRetry(messageId, model, settings, createdAt, attempt + 1);
+        }
+    }
+    
+    async function insertStatsForRegeneratedMessage(messageId, model, settings, createdAt) {
+        debugLog('[Stats REGEN] Attempting to insert stats for regenerated message:', messageId?.substring(0, 8));
+        
+        // Clear the sets if we're in a different conversation (handles page navigation)
+        if (currentConversationId && currentConversationId !== lastConversationIdForStatsSet) {
+            debugLog('[Stats REGEN] Conversation changed, clearing insertion tracking sets');
+            statsInsertedForMessageIds.clear();
+            statsInsertionInProgress.clear();
+            pendingNewMessageCount = 0; // Reset pending count on conversation change
+            lastConversationIdForStatsSet = currentConversationId;
+        }
+        
+        // Skip if already successfully inserted
+        if (statsInsertedForMessageIds.has(messageId)) {
+            debugLog('[Stats REGEN] Stats already inserted for this message ID, skipping');
+            return true; // Already done, consider it a success
+        }
+        
+        // Skip if another call is currently processing this message (prevents parallel execution)
+        if (statsInsertionInProgress.has(messageId)) {
+            debugLog('[Stats REGEN] Another call is already processing this message ID, skipping');
+            return false; // Let the other call handle it
+        }
+        
+        // Mark as in-progress to prevent parallel calls
+        statsInsertionInProgress.add(messageId);
+        
+        const cache = window.__toolkitStorageCache;
+        const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
+        const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
+        const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+        
+        // Cache the highlight model changes setting globally for synchronous access
+        window.__highlightModelChanges = cache ? await cache.get('highlightModelChanges', false) : await storage.get('highlightModelChanges', false);
+        
+        // Cache auto-regeneration settings globally for synchronous access
+        window.__autoRegenOnMismatch = cache ? await cache.get('autoRegenOnMismatch', false) : await storage.get('autoRegenOnMismatch', false);
+        window.__autoRegenOnShort = cache ? await cache.get('autoRegenOnShort', false) : await storage.get('autoRegenOnShort', false);
+        window.__autoRegenMaxAttempts = cache ? await cache.get('autoRegenMaxAttempts', 1) : await storage.get('autoRegenMaxAttempts', 1);
+
+        if (!statsEnabled && !timestampEnabled && !showMessageIds) {
+            debugLog('[Stats REGEN] Neither stats, timestamp, nor message IDs enabled, skipping');
+            // Remove from in-progress so future attempts can try again if settings change
+            statsInsertionInProgress.delete(messageId);
+            return true; // Not an error, just nothing to do
+        }
+        
+        // Find the message that's currently showing the latest regeneration
+        // Look for message bubbles and find the one with a version counter showing the highest version
+        const versionCounters = document.querySelectorAll('p.text-label-md');
+        let targetBubble = null;
+        let highestVersion = 0;
+        
+        for (const counter of versionCounters) {
+            const match = counter.textContent.trim().match(/^(\d+)\/(\d+)$/);
+            if (match) {
+                const currentVer = parseInt(match[1]);
+                const totalVer = parseInt(match[2]);
+                // We want the one showing the LATEST version (currentVer === totalVer)
+                if (currentVer === totalVer && totalVer > highestVersion) {
+                    highestVersion = totalVer;
+                    targetBubble = counter.closest('div[class*="bg-gray-4"][class*="rounded"]');
+                    if (!targetBubble) {
+                        targetBubble = counter.closest('div[class*="px-\\[13px\\]"]');
+                    }
+                }
+            }
+        }
+        
+        // FALLBACK: If no version counter found (brand new message, not a regeneration),
+        // find the LAST bot message bubble in the chat (the newest one)
+        // First, try to find a message that matches our messageId directly
+        if (!targetBubble) {
+            debugLog('[Stats REGEN] No version counter found, trying to find last bot message bubble');
+            
+            // Try to find the message by data-message-id first (most reliable)
+            const messageByIdElement = document.querySelector(`[data-message-id="${messageId}"]`);
+            if (messageByIdElement) {
+                const wrapper = messageByIdElement.closest('div.w-full.flex.mb-lg');
+                if (wrapper) {
+                    targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
+                    if (!targetBubble) {
+                        targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
+                    }
+                    if (targetBubble) {
+                        debugLog('[Stats REGEN] Found message bubble by data-message-id:', messageId?.substring(0, 8));
+                    }
+                }
+            }
+            
+            // If still not found, fall back to last bot message
+            if (!targetBubble) {
+                // Find all message wrappers and get the last bot message
+                const allMessageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
+                for (let i = allMessageWrappers.length - 1; i >= 0; i--) {
+                    const wrapper = allMessageWrappers[i];
+                    // Check if this is a bot message (has character link)
+                    // Use contains selector to support localized URLs like /pt/chatbot/
+                    const characterLink = wrapper.querySelector('a[href*="/chatbot/"]');
+                    if (characterLink) {
+                        // This is a bot message - find its bubble
+                        targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
+                        if (!targetBubble) {
+                            targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
+                        }
+                        if (targetBubble) {
+                            debugLog('[Stats REGEN] Found last bot message bubble via fallback');
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (!targetBubble) {
+            debugLog('[Stats REGEN] Could not find target message bubble (neither version counter nor fallback worked)');
+            // Remove from in-progress so later retry attempts can try again
+            statsInsertionInProgress.delete(messageId);
+            return false;
+        }
+        
+        debugLog('[Stats REGEN] Found target bubble for message');
+
+        // Mark the message wrapper with the message ID so extractMessageId can find it
+        const messageWrapper = targetBubble.closest('div.w-full.flex.mb-lg');
+        if (messageWrapper) {
+            messageWrapper.dataset.messageId = messageId;
+            debugLog('[Stats REGEN] Marked message wrapper with data-message-id');
+        }
+
+        // Find the header container (supports both gap-md and gap-0)
+        const headerContainer = targetBubble.querySelector('div.flex.justify-between.items-center.gap-md, div.flex.justify-between.items-center.gap-0, div.flex.justify-between.items-center');
+        if (!headerContainer) {
+            debugLog('[Stats REGEN] Could not find header container');
+            // Remove from in-progress so later retry attempts can try again
+            statsInsertionInProgress.delete(messageId);
+            return false;
+        }
+        
+        // Check if stats already exist in DOM
+        let statsDiv = headerContainer.querySelector('.generation-stats');
+        
+        // Build display lines
+        let displayLines = [];
+        
+        // Get full stats from storage (has the flattened settings)
+        const fullStats = await getStatsForMessage(messageId);
+        debugLog('[Stats REGEN] Full stats from storage:', fullStats);
+        
+        const hasSettings = fullStats?.max_tokens !== null && fullStats?.max_tokens !== undefined;
+        const hasModel = fullStats?.model || model;
+        const hasTimestamp = fullStats?.timestamp || createdAt;
+        
+        if (statsEnabled && hasModel) {
+            let modelDisplay = fullStats?.model || model;
+            if (!showModelDetails && modelDisplay && modelDisplay.includes('→')) {
+                modelDisplay = modelDisplay.split('→')[0].trim();
+            }
+            
+            if (hasSettings) {
+                displayLines.push(modelDisplay);
+                displayLines.push(`Tokens: ${fullStats.max_tokens} | Temp: ${fullStats.temperature.toFixed(2)} | Top P: ${fullStats.top_p} | Top K: ${fullStats.top_k}`);
+            } else if (modelDisplay) {
+                displayLines.push(modelDisplay);
+            }
+        }
+        
+        if (timestampEnabled && hasTimestamp) {
+            const timestamp = await formatTimestamp(fullStats?.timestamp || createdAt);
+            if (timestamp) {
+                displayLines.push(timestamp);
+            }
+        }
+
+        if (showMessageIds && messageId) {
+            displayLines.push(`ID: ${messageId}`);
+        }
+
+        if (displayLines.length === 0) {
+            debugLog('[Stats REGEN] No displayable data');
+            // Remove from in-progress, allow retries (data might not be in storage yet)
+            statsInsertionInProgress.delete(messageId);
+            return false;
+        }
+        
+        const displayText = displayLines.join('<br>');
+        
+        if (!statsDiv) {
+            // Create new stats div
+            statsDiv = document.createElement('div');
+            statsDiv.className = 'generation-stats';
+            
+            // Check if we're in story mode for different positioning
+            const inStoryMode = isStoryMode();
+            
+            if (inStoryMode) {
+                // In story mode: position above the message, inside the container
+                statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                // Find the inner flex-col container and insert inside it
+                const innerContainer = headerContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                if (innerContainer) {
+                    // Insert stats as first child inside the container
+                    innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                } else {
+                    // Fallback: insert at the top of header
+                    headerContainer.insertBefore(statsDiv, headerContainer.firstChild);
+                }
+            } else {
+                // Normal mode: position to the right in the header
+                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                
+                // Insert before the menu button container
+                const menuButtonContainer = headerContainer.querySelector('.relative');
+                if (menuButtonContainer) {
+                    headerContainer.insertBefore(statsDiv, menuButtonContainer);
+                    headerContainer.style.setProperty('gap', '4px', 'important');
+                } else {
+                    headerContainer.appendChild(statsDiv);
+                }
+            }
+        }
+        
+        // Set the content and version ID
+        statsDiv.dataset.versionId = messageId;
+        safeSetHTML(statsDiv, displayText);
+        
+        // Apply model change indicators after this new message is inserted
+        applyModelChangeIndicators();
+        
+        // Mark as successfully inserted (prevents future retries)
+        statsInsertedForMessageIds.add(messageId);
+        limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+        // Remove from in-progress
+        statsInsertionInProgress.delete(messageId);
+        // Decrement pending count since insertion is complete
+        if (pendingNewMessageCount > 0) {
+            pendingNewMessageCount--;
+            debugLog('[Stats REGEN] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
+        }
+
+        debugLog('[Stats REGEN] Successfully inserted/updated stats for regenerated message');
+        return true;
+    }
+
+    // Separate function to process messages (can be called multiple times)
+    // This unified function handles all stats injection to avoid duplication and inconsistency
+    // skipVersionCounterMessages: if true, skip messages with version counters (for new message handling)
+    //                             if false, process all messages (for initial page load)
+    async function processMessagesForStats(skipVersionCounterMessages = false) {
+        debugLog('[Stats DISPLAY] ========== processMessagesForStats CALLED ==========');
+        debugLog('[Stats DISPLAY] skipVersionCounterMessages:', skipVersionCounterMessages);
+        debugLog('[Stats DISPLAY] Call stack:', new Error().stack);
+        
+        // Perf: only read the three settings needed to decide whether to bail.
+        // Defer the rest until we know we're actually going to process messages —
+        // this is a hot path called on every batch of message-wrapper mutations.
+        const cache = window.__toolkitStorageCache;
+        const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
+        const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
+        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+
+        // If none are enabled, no need to process
+        if (!statsEnabled && !timestampEnabled && !showMessageIds) return;
+
+        const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+
+        // Cache the highlight model changes setting globally for synchronous access
+        window.__highlightModelChanges = cache ? await cache.get('highlightModelChanges', false) : await storage.get('highlightModelChanges', false);
+
+        // Cache auto-regeneration settings globally for synchronous access
+        window.__autoRegenOnMismatch = cache ? await cache.get('autoRegenOnMismatch', false) : await storage.get('autoRegenOnMismatch', false);
+        window.__autoRegenOnShort = cache ? await cache.get('autoRegenOnShort', false) : await storage.get('autoRegenOnShort', false);
+        window.__autoRegenMaxAttempts = cache ? await cache.get('autoRegenMaxAttempts', 1) : await storage.get('autoRegenMaxAttempts', 1);
+
+        debugLog('[Stats DISPLAY] Stats enabled:', statsEnabled, 'Timestamp enabled:', timestampEnabled, 'Model details:', showModelDetails, 'Message IDs:', showMessageIds, 'Highlight model changes:', window.__highlightModelChanges);
+        
+        const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
+
+        debugLog('[Stats] Found message wrappers:', messageWrappers.length);
+
+        // Calculate total messages in the combined index map
+        const totalMessages = Object.keys(messageIdToIndexMap).length;
+        debugLog('[Stats] Total messages in combined index map:', totalMessages);
+
+        // Calculate offset: if page shows fewer messages than stored, offset to the end
+        const messagesOnPage = messageWrappers.length;
+        const storageOffset = Math.max(0, totalMessages - messagesOnPage);
+        debugLog('[Stats] Messages on page:', messagesOnPage, 'Storage offset:', storageOffset);
+
+        // Process messages in reverse order (bottom to top, newest first)
+        // This ensures the most recent messages get correct stats even if there's an index issue
+        const wrappersArray = Array.from(messageWrappers).reverse();
+        let messageIndex = messagesOnPage - 1; // Start from the last message
+
+        for (const wrapper of wrappersArray) {
+            // Skip wrappers that we've already failed to extract IDs from
+            // This prevents endless retries on messages that don't have IDs yet
+            if (statsFailedForWrappers.has(wrapper)) {
+                debugLog('[Stats] Skipping wrapper that previously failed ID extraction');
+                messageIndex--;
+                continue;
+            }
+
+            // Check if this is a bot message (has character link) or user message
+            // In Story Mode, there's no chatbot link, so we need alternative detection
+            // Use contains selector to support localized URLs like /pt/chatbot/
+            const characterLink = wrapper.querySelector('a[href*="/chatbot/"]');
+            let isBotMessage = !!characterLink;
+            
+            // Story Mode fallback: check for bot-specific UI elements or message styling
+            // Bot messages in Story Mode have different styling (e.g., rounded corners)
+            if (!isBotMessage && isStoryMode()) {
+                // In Story Mode, check message bubble styling to detect bot vs user
+                // Bot messages typically have left-aligned rounded corners, user has right-aligned
+                const messageBubble = wrapper.querySelector('.rounded-\\[4px_20px_20px_20px\\]');
+                if (messageBubble) {
+                    isBotMessage = true;
+                }
+            }
+            debugLog('[Stats] Processing message, isBotMessage:', isBotMessage, 'messageIndex:', messageIndex);
+
+            // Skip messages with version counters when processing new messages
+            // (they're handled by insertStatsForRegeneratedMessage in that case)
+            // But on initial page load, we need to process them here
+            const versionCounter = wrapper.querySelector('p.text-label-md');
+            const hasVersionCounter = versionCounter && /^\d+\/\d+$/.test(versionCounter.textContent.trim());
+            if (skipVersionCounterMessages && hasVersionCounter) {
+                debugLog('[Stats] Skipping message with version counter (handled by insertStatsForRegeneratedMessage)');
+                messageIndex--;
+                continue;
+            }
+            
+            // Update selector to match new DOM structure - action container has gap-0 and may have flex-row-reverse
+            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center.gap-0, .flex.justify-between.items-center');
+            
+            if (!actionContainer) {
+                debugLog('[Stats] No action container found!');
+                messageIndex--;
+                continue;
+            }
+            
+            // Check if stats already exist
+            const existingStatsDiv = actionContainer.querySelector('.generation-stats');
+            if (existingStatsDiv) {
+                debugLog('[Stats] Found existing stats div');
+                
+                // OPTIMIZATION: If stats are marked as finalized (with arrow format), skip entirely
+                // This prevents unnecessary storage reads for every message on every mutation
+                if (actionContainer.dataset.statsFinalized === 'true') {
+                    debugLog('[Stats] Stats already finalized, skipping without storage check');
+                    messageIndex--;
+                    continue;
+                }
+                
+                // Check if we need to update the stats (e.g., from partial to full model format)
+                if (isBotMessage) {
+                    let messageId = extractMessageId(wrapper);
+                    debugLog('[Stats] Bot message, messageId:', messageId);
+                    
+                    // Try fallback to index map if extraction failed
+                    if (!messageId) {
+                        // Calculate the correct index: page shows newest messages, so offset from end of storage
+                        // Use cached storageOffset calculated at start of function
+                        const correctedIndex = storageOffset + messageIndex;
+                        
+                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                            messageId = messageIdToIndexMap[correctedIndex];
+                            debugLog('[Stats] Using fallback messageId from index map:', messageId);
+                        }
+                    }
+                    
+                    if (messageId) {
+                        const latestStats = await getStatsForMessage(messageId);
+                        debugLog('[Stats] Latest stats from storage:', latestStats);
+                        if (latestStats?.model && latestStats.model.includes('→')) {
+                            // We have full format in storage but need to check if it's displayed
+                            const existingText = existingStatsDiv.textContent;
+                            if (DEBUG_MODE) {
+                                console.log('[Stats] Storage has arrow format:', latestStats.model);
+                                console.log('[Stats] Display shows:', existingText);
+                            }
+                            if (!existingText.includes('→')) {
+                                // Stats are outdated - remove and re-insert
+                                debugLog('[Stats] OUTDATED! Removing old stats div and re-inserting...');
+                                existingStatsDiv.remove();
+                                // Don't skip - let it fall through to re-insert
+                            } else {
+                                // Mark as finalized so we don't check again
+                                actionContainer.dataset.statsFinalized = 'true';
+                                debugLog('[Stats] Stats already up-to-date, marking as finalized');
+                                messageIndex--;
+                                continue;
+                            }
+                        } else {
+                            debugLog('[Stats] Storage does not have arrow format, skipping update');
+                            debugLog('[Stats] Stats already present, skipping');
+                            messageIndex--;
+                            continue;
+                        }
+                    } else {
+                        debugLog('[Stats] No messageId extracted, skipping');
+                        debugLog('[Stats] Stats already present, skipping');
+                        messageIndex--;
+                        continue;
+                    }
+                } else {
+                    debugLog('[Stats] User message, skipping');
+                    debugLog('[Stats] Stats already present, skipping');
+                    messageIndex--;
+                    continue;
+                }
+            }
+            
+            if (actionContainer.dataset.statsProcessing) {
+                debugLog('[Stats] Already being processed (race condition), skipping');
+                messageIndex--;
+                continue;
+            }
+            
+            // Mark as processing immediately to prevent race conditions
+            actionContainer.dataset.statsProcessing = 'true';
+            
+            // Wrap entire processing in try/catch to ensure cleanup on errors
+            try {
+                // In Story Mode, we may misdetect bot messages as user messages due to DOM differences
+                // We'll do a preliminary check here and potentially correct isBotMessage later based on stored role
+                let effectiveIsBotMessage = isBotMessage;
+                
+                // Story Mode: If we can extract a messageId and check its role, use that for detection
+                if (!isBotMessage && isStoryMode()) {
+                    let preCheckMessageId = extractMessageId(wrapper);
+                    if (!preCheckMessageId) {
+                        const correctedIndex = storageOffset + messageIndex;
+                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                            preCheckMessageId = messageIdToIndexMap[correctedIndex];
+                        }
+                    }
+                    if (preCheckMessageId) {
+                        const preCheckStats = await getStatsForMessage(preCheckMessageId);
+                        // If role is 'bot' OR we have generation settings (max_tokens), treat as bot message
+                        if (preCheckStats?.role === 'bot' || (preCheckStats?.max_tokens !== null && preCheckStats?.max_tokens !== undefined)) {
+                            effectiveIsBotMessage = true;
+                            debugLog('[Stats] Story Mode: Corrected isBotMessage to true based on stored role/stats');
+                        }
+                    }
+                }
+                
+                if (effectiveIsBotMessage) {
+                // Bot message - show full stats
+                let messageId = extractMessageId(wrapper);
+                
+                if (DEBUG_MODE) {
+                    debugLog('[Stats DISPLAY] ========== PROCESSING BOT MESSAGE ==========');
+                    debugLog('[Stats DISPLAY] Extracted messageId:', messageId);
+                    debugLog('[Stats DISPLAY] messageIndex:', messageIndex);
+                    debugLog('[Stats DISPLAY] hasVersionCounter:', hasVersionCounter);
+                }
+                
+                // For messages with version counters, find the correct message ID from alternativeMessageGroups
+                // based on which version is currently being displayed
+                if (hasVersionCounter && versionCounter) {
+                    const versionMatch = versionCounter.textContent.trim().match(/^(\d+)\/(\d+)$/);
+                    if (versionMatch) {
+                        const currentVersion = parseInt(versionMatch[1]);
+                        const totalVersions = parseInt(versionMatch[2]);
+                        debugLog('[Stats] Message has version counter:', currentVersion, '/', totalVersions);
+                        
+                        // Find the alternative group that matches this total version count
+                        for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
+                            if (alternatives.length === totalVersions) {
+                                // Found matching group - get the message ID for the current version
+                                const targetIndex = currentVersion - 1; // versions are 1-indexed
+                                if (targetIndex >= 0 && targetIndex < alternatives.length) {
+                                    messageId = alternatives[targetIndex].id;
+                                    debugLog('[Stats] Found message ID from alternativeMessageGroups:', messageId?.substring(0, 8));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Calculate the correct index: page shows newest messages, so offset from end of storage
+                if (!messageId) {
+                    // Use cached storageOffset calculated at start of function
+                    const correctedIndex = storageOffset + messageIndex;
+                    
+                    if (DEBUG_MODE) {
+                        debugLog('[Stats DISPLAY] Fallback - correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
+                    }
+                    debugLog('[Stats] Extracted messageId:', messageId, 'messageIndex:', messageIndex, 'correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
+                    if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                        messageId = messageIdToIndexMap[correctedIndex];
+                        if (DEBUG_MODE) {
+                            debugLog('[Stats DISPLAY] Using mapped messageId:', messageId);
+                        }
+                        debugLog('[Stats] Using mapped messageId:', messageId);
+                    }
+                }
+                
+                if (DEBUG_MODE) {
+                    debugLog('[Stats DISPLAY] Final messageId to lookup:', messageId);
+                }
+                
+                // Skip if this message was already handled or is being handled by insertStatsWithRetry
+                // This prevents duplicate stats when both paths try to insert
+                if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
+                    debugLog('[Stats DISPLAY] Message already handled or in progress by insertStatsForRegeneratedMessage, skipping');
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
+                
+                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
+                if (DEBUG_MODE) {
+                    debugLog('[Stats DISPLAY] Retrieved from storage:', generationStats);
+                    debugLog('[Stats DISPLAY] Timestamp from storage:', generationStats?.timestamp);
+                    debugLog('[Stats DISPLAY] Timestamp as Date:', generationStats?.timestamp ? new Date(generationStats.timestamp).toISOString() : 'null');
+                }
+                debugLog('[Stats] Got stats from storage:', generationStats);
+                if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
+                if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
+                debugLog('[Stats] Final stats:', generationStats);
+                
+                if (!generationStats) {
+                    debugLog('[Stats] No stats found, skipping message');
+                    // If we couldn't extract a messageId, mark this wrapper as failed
+                    // to prevent endless retries on every mutation
+                    // BUT: Only mark as failed if there are no pending new messages
+                    // New messages may not have their data-message-id set yet
+                    if (!messageId && pendingNewMessageCount === 0) {
+                        statsFailedForWrappers.add(wrapper);
+                        debugLog('[Stats] Marked wrapper as failed (no message ID)');
+                    } else if (!messageId) {
+                        debugLog('[Stats] Not marking wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
+                    }
+                    // Clear the processing flag so it can be retried later if messageId becomes available
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
+                
+                debugLog('[Stats] Creating stats div...');
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'generation-stats';
+                
+                // Check if we're in story mode for different positioning
+                const inStoryMode = isStoryMode();
+                
+                if (inStoryMode) {
+                    // In story mode: position above the message
+                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                } else {
+                    // Normal mode: position to the right in the header
+                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                }
+                
+                // Add data-version-id to prevent being hidden by the regeneration switcher CSS
+                if (messageId) {
+                    statsDiv.dataset.versionId = messageId;
+                }
+                
+                debugLog('[Stats] Checking stats content:', generationStats);
+                
+                // Check for model and settings (new flat format with max_tokens)
+                const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
+                const hasModel = generationStats.model;
+                const hasTimestamp = generationStats.timestamp;
+                
+                // Build display components based on settings
+                let displayLines = [];
+                
+                if (statsEnabled && hasSettings && hasModel) {
+                    debugLog('[Stats] Has full stats with settings');
+                    const maxTokens = generationStats.max_tokens;
+                    const temperature = generationStats.temperature;
+                    const topP = generationStats.top_p;
+                    const topK = generationStats.top_k;
+                    
+                    // Process model name based on showModelDetails setting
+                    let modelDisplay = generationStats.model;
+                    if (!showModelDetails && modelDisplay.includes('→')) {
+                        // Truncate to just the requested model (before the arrow)
+                        modelDisplay = modelDisplay.split('→')[0].trim();
+                    }
+
+                    displayLines.push(modelDisplay);
+                    displayLines.push(`Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`);
+                }
+                
+                if (timestampEnabled && hasTimestamp) {
+                    const timestamp = await formatTimestamp(generationStats.timestamp);
+                    if (DEBUG_MODE) {
+                        debugLog('[Stats DISPLAY] Formatted timestamp:', timestamp);
+                        debugLog('[Stats DISPLAY] Input to formatTimestamp was:', generationStats.timestamp);
+                    }
+                    if (timestamp) {
+                        displayLines.push(timestamp);
+                    }
+                }
+
+                if (showMessageIds && messageId) {
+                    displayLines.push(`ID: ${messageId}`);
+                }
+
+                // If we have nothing to display, skip
+                if (displayLines.length === 0) {
+                    debugLog('[Stats] No displayable data, skipping');
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
+                
+                // Join lines with <br>
+                const displayText = displayLines.join('<br>');
+                safeSetHTML(statsDiv, displayText);
+                if (DEBUG_MODE) {
+                    debugLog('[Stats DISPLAY] Stats div content:', statsDiv.textContent);
+                }
+                debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
+                
+                // Insert positioning based on story mode
+                if (inStoryMode) {
+                    // In story mode: insert INSIDE the message container as first child
+                    // This keeps the stats within the same width constraints as the message
+                    const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                    if (innerContainer) {
+                        // Insert stats as first child inside the flex-col container
+                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%;';
+                        innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                        if (DEBUG_MODE) {
+                            debugLog('[Stats DISPLAY] ========== INSERTING STATS DIV (STORY MODE) ==========');
+                            debugLog('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
+                            debugLog('[Stats DISPLAY] Inserted inside message container as first child');
+                        }
+                    } else {
+                        // Fallback: insert in action container
+                        actionContainer.appendChild(statsDiv);
+                    }
+                } else {
+                    // Normal mode: insert in the action container header
+                    const menuButtonContainer = actionContainer.querySelector('.relative');
+                    debugLog('[Stats] Menu button container:', menuButtonContainer);
+                    if (menuButtonContainer) {
+                        if (DEBUG_MODE) {
+                            debugLog('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
+                            debugLog('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
+                            debugLog('[Stats DISPLAY] Inserting into action container');
+                        }
+                        debugLog('[Stats] Inserting stats div...');
+                        actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                        actionContainer.style.setProperty('gap', '4px', 'important');
+                    } else {
+                        actionContainer.appendChild(statsDiv);
+                    }
+                }
+                
+                // Mark this message as having stats inserted to prevent duplicates
+                if (messageId) {
+                    statsInsertedForMessageIds.add(messageId);
+                    limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                    debugLog('[Stats] Added messageId to statsInsertedForMessageIds:', messageId);
+                }
+                
+                // OPTIMIZATION: Mark stats as finalized if they have arrow format
+                // This prevents unnecessary storage checks on future mutations
+                if (generationStats.model && generationStats.model.includes('→')) {
+                    actionContainer.dataset.statsFinalized = 'true';
+                    debugLog('[Stats] Marked stats as finalized (has arrow format)');
+                }
+                
+                delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                if (DEBUG_MODE) {
+                    debugLog('[Stats DISPLAY] Stats div inserted! Final content:', statsDiv.textContent);
+                    debugLog('[Stats DISPLAY] Stats div is in DOM:', document.contains(statsDiv));
+                    debugLog('[Stats DISPLAY] ===========================================');
+                }
+                debugLog('[Stats] Stats div inserted successfully!');
+
+                messageIndex--;
+            } else {
+                // User message - show only timestamp if enabled
+                if (!timestampEnabled) {
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
+                
+                let messageId = extractMessageId(wrapper);
+                debugLog('[Stats] User message - extracted messageId:', messageId, 'messageIndex:', messageIndex);
+                    
+                    // Fallback to combined index map if extraction failed
+                    if (!messageId) {
+                        const correctedIndex = storageOffset + messageIndex;
+                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
+                            messageId = messageIdToIndexMap[correctedIndex];
+                            debugLog('[Stats] User message - using fallback from combined index map:', messageId);
+                        }
+                    }
+                    
+                    let generationStats = messageId ? await getStatsForMessage(messageId) : null;
+                    debugLog('[Stats] User message - generationStats:', generationStats);
+                    
+                    // Skip if this message was already handled or is being handled
+                    if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
+                        debugLog('[Stats] User message already handled or in progress, skipping');
+                        delete actionContainer.dataset.statsProcessing;
+                        messageIndex--;
+                        continue;
+                    }
+
+                    // Only display if we have a valid timestamp
+                    if (!generationStats?.timestamp) {
+                        debugLog('[Stats] User message - no timestamp, skipping');
+                        // If we couldn't extract a messageId, mark this wrapper as failed
+                        // BUT: Only mark as failed if there are no pending new messages
+                        if (!messageId && pendingNewMessageCount === 0) {
+                            statsFailedForWrappers.add(wrapper);
+                            debugLog('[Stats] Marked user message wrapper as failed (no message ID)');
+                        } else if (!messageId) {
+                            debugLog('[Stats] Not marking user wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
+                        }
+                        delete actionContainer.dataset.statsProcessing;
+                        messageIndex--;
+                        continue;
+                    }
+
+                    const timestamp = await formatTimestamp(generationStats.timestamp);
+                    if (!timestamp) {
+                        delete actionContainer.dataset.statsProcessing;
+                        messageIndex--;
+                        continue;
+                    }
+
+                    // Create timestamp div for user messages
+                    const statsDiv = document.createElement('div');
+                    statsDiv.className = 'generation-stats';
+                    
+                    // Check if we're in story mode for different positioning
+                    const inStoryMode = isStoryMode();
+                    
+                    if (inStoryMode) {
+                        // In story mode: position above the message
+                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                    } else {
+                        // Normal mode: position to the right in the header
+                        statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                    }
+                    
+                    // Add data-version-id to prevent being hidden by the regeneration switcher CSS
+                    if (messageId) {
+                        statsDiv.dataset.versionId = messageId;
+                    }
+
+                    // Build display content for user messages
+                    let displayLines = [timestamp];
+
+                    // Add message ID if enabled
+                    if (showMessageIds && messageId) {
+                        displayLines.push(`ID: ${messageId}`);
+                    }
+
+                    safeSetHTML(statsDiv, displayLines.join('<br>'));
+                    
+                    // Insert positioning based on story mode
+                    if (inStoryMode) {
+                        // In story mode: insert INSIDE the message container as first child
+                        const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                        if (innerContainer) {
+                            // Insert stats as first child inside the container
+                            innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
+                            // Mark this message as having stats inserted
+                            if (messageId) {
+                                statsInsertedForMessageIds.add(messageId);
+                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                            }
+                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                            debugLog('[Stats] User message - timestamp inserted successfully (story mode)');
+                        } else {
+                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                        }
+                    } else {
+                        // Normal mode: insert in the action container header
+                        const menuButtonContainer = actionContainer.querySelector('.relative');
+                        if (menuButtonContainer) {
+                            actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                            actionContainer.style.setProperty('gap', '4px', 'important');
+                            // Mark this message as having stats inserted
+                            if (messageId) {
+                                statsInsertedForMessageIds.add(messageId);
+                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
+                            }
+                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
+                            debugLog('[Stats] User message - timestamp inserted successfully');
+                        } else {
+                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
+                        }
+                    }
+                    messageIndex--;
+                }
+            } catch (error) {
+                // Ensure cleanup on any error during stats processing
+                console.error('[Core] Error processing message stats:', error);
+                delete actionContainer.dataset.statsProcessing;
+                messageIndex--;
+            }
+        }
+        
+        // After all stats are inserted, apply model change indicators
+        applyModelChangeIndicators();
+    }
+
+    // Initialize: Build index map from stored stats for imported/old messages
+    debugLog('[Stats] About to call buildIndexMapFromStats...');
+    buildIndexMapFromStats()
+        .then(() => {
+            debugLog('[Stats] Initialization complete, starting message observer');
+        })
+        .catch((error) => {
+            console.error('[Stats] Error building index map:', error);
+        });
+
+    // Perf (Round 3): scope messageObserver to the chat thread container instead of
+    // document.body. The container is `[class*="flex-col"][class*="items-center"]`
+    // (same selector used elsewhere in this file). When the SPA navigates between
+    // chat pages the container unmounts and a new one mounts, so we reattach on
+    // location changes. If we can't find the container, we fall back to body —
+    // worst case is the pre-Round-3 behavior. The startup setTimeouts at
+    // INITIAL_STATS_CHECK / DELAYED_STATS_CHECK call processMessagesForStats
+    // directly, so even if a reattach is briefly missed, stats still land.
+    let _messageObserverHost = null;
+
+    function findChatContainerForObserver() {
+        // Same selector family used by the post-regen reapply observer.
+        // Pick the outermost candidate that actually contains message wrappers —
+        // this returns the chat scroller, which survives individual message
+        // renders. If no wrappers exist yet (empty conversation), prefer the
+        // scroller-shaped element with overflow-auto so we still observe the
+        // right region. Fall back to document.body as a last resort.
+        const candidates = document.querySelectorAll('[class*="flex-col"][class*="items-center"]');
+        for (const c of candidates) {
+            if (c.querySelector?.('div.w-full.flex.mb-lg')) return c;
+        }
+        for (const c of candidates) {
+            const cls = c.className || '';
+            if (typeof cls === 'string' && cls.includes('overflow-auto')) return c;
+        }
+        return candidates[0] || document.body;
+    }
+
+    function attachMessageObserver() {
+        const host = findChatContainerForObserver();
+        if (host === _messageObserverHost) return;
+        try { messageObserver.disconnect(); } catch (_) {}
+        _messageObserverHost = host;
+        messageObserver.observe(host, { childList: true, subtree: true });
+        debugLog('[Stats] messageObserver attached to', host === document.body ? 'document.body (fallback)' : 'chat container');
+    }
+
+    // Reattach on SPA navigation. Patch history methods + popstate so we get
+    // notified when the chat container is replaced. We delay the reattach a tick
+    // so React has a chance to mount the new container.
+    function scheduleReattachAfterNav() {
+        setTimeout(() => {
+            // If the current host is detached from the document, or we've moved
+            // pages, find the new container and rebind.
+            if (!_messageObserverHost || !_messageObserverHost.isConnected) {
+                attachMessageObserver();
+                return;
+            }
+            // Even if still connected, prefer a more specific container if one
+            // appeared on this page (e.g. arriving on /chat/ from /).
+            const candidate = findChatContainerForObserver();
+            if (candidate !== _messageObserverHost) {
+                attachMessageObserver();
+            }
+        }, 50);
+        // Second pass for slow mounts
+        setTimeout(() => {
+            if (!_messageObserverHost || !_messageObserverHost.isConnected) {
+                attachMessageObserver();
+            }
+        }, 500);
+    }
+
+    (function installNavHooks() {
+        const origPush = history.pushState;
+        const origReplace = history.replaceState;
+        history.pushState = function (...args) {
+            const r = origPush.apply(this, args);
+            scheduleReattachAfterNav();
+            return r;
+        };
+        history.replaceState = function (...args) {
+            const r = origReplace.apply(this, args);
+            scheduleReattachAfterNav();
+            return r;
+        };
+        window.addEventListener('popstate', scheduleReattachAfterNav);
+    })();
+
+    // Initial attach: wait for body, then bind to chat container if present.
+    waitForBody().then(() => {
+        debugLog('[Stats] document.body available, starting message observer');
+        attachMessageObserver();
+        // The chat container often mounts shortly after body. Re-check once more
+        // so we upgrade from the body fallback to the real container.
+        scheduleReattachAfterNav();
+    }).catch((err) => {
+        console.error('[Stats] Failed to wait for body:', err);
+        setTimeout(() => {
+            if (document.body) {
+                debugLog('[Stats] Retrying message observer setup after error');
+                attachMessageObserver();
+            }
+        }, 2000);
+    });
+
+    // Periodic check to ensure stats are inserted even if mutations are missed
+    // DISABLED FOR DEBUGGING - flooding logs
+    /*
+    setInterval(async () => {
+        const statsEnabled = await storage.get('showGenerationStats', false);
+        if (statsEnabled) {
+            processMessagesForStats();
+        }
+    }, 2000); // Check every 2 seconds
+    */
+
+    // Alias for backward compatibility - both names call the same unified function
+    const insertStatsForAllMessages = processMessagesForStats;
+
+    // Initial check for existing messages after page load
+    debugLog('[Stats] Scheduling initial check at', TIMING.INITIAL_STATS_CHECK, 'ms');
+    setTimeout(insertStatsForAllMessages, TIMING.INITIAL_STATS_CHECK);
+    
+    // Also check again after a longer delay in case messages load slowly
+    debugLog('[Stats] Scheduling delayed check at', TIMING.DELAYED_STATS_CHECK, 'ms');
+    setTimeout(insertStatsForAllMessages, TIMING.DELAYED_STATS_CHECK);
+
+    // =============================================================================
+    // ===          REGENERATION SWITCHER HANDLER (Stats Update)               ===
+    // =============================================================================
+    // When user switches between message regenerations (< 1/2 > buttons or arrow keys),
+    // update the displayed stats to match the currently visible version
+    
+    // Shared function to handle version switch stats update
+    async function handleVersionSwitch(currentVersion, totalVersions, isNext) {
+        // Calculate the NEW version number after the switch
+        let newVersion;
+        if (isNext) {
+            newVersion = currentVersion < totalVersions ? currentVersion + 1 : currentVersion;
+        } else {
+            newVersion = currentVersion > 1 ? currentVersion - 1 : currentVersion;
+        }
+        
+        debugLog('[Core] Version change:', currentVersion, '->', newVersion);
+        
+        // If version didn't change (button was disabled), do nothing
+        if (newVersion === currentVersion) {
+            debugLog('[Core] Version unchanged, skipping');
+            return;
+        }
+        
+        // IMMEDIATELY inject CSS to hide any stats div that React might create
+        // This prevents flicker by hiding React's stats divs at the CSS level
+        let hideStyle = document.getElementById('sai-hide-react-stats');
+        if (!hideStyle) {
+            hideStyle = document.createElement('style');
+            hideStyle.id = 'sai-hide-react-stats';
+            document.head.appendChild(hideStyle);
+        }
+        hideStyle.textContent = '.generation-stats:not([data-version-id]) { display: none !important; }';
+        
+        // Wait for React to update the DOM with the new message version
+        // Use a shorter delay for faster response
+        setTimeout(async () => {
+            debugLog('[Core] === INSIDE SETTIMEOUT - STARTING VERSION SWITCH HANDLER ===');
+            
+            // The counter element is likely detached by React after the version switch
+            // Instead, we search the LIVE DOM for the version switcher showing the NEW version
+            const versionText = `${newVersion}/${totalVersions}`;
+            debugLog('[Core] Searching for version text:', versionText);
+            
+            let liveStatsDiv = null;
+            let liveHeaderContainer = null;
+            let messageBubble = null;
+            
+            // Find the paragraph showing our target version (e.g., "2/2")
+            const allParagraphs = document.querySelectorAll('p.text-label-md');
+            for (const p of allParagraphs) {
+                if (p.textContent.trim() === versionText) {
+                    debugLog('[Core] Found version text paragraph in LIVE DOM');
+                    
+                    // Navigate up to the message bubble
+                    // The bubble has classes: flex flex-col ... gap-md ... px-[13px] ... rounded-[...]  bg-gray-4
+                    messageBubble = p.closest('div[class*="bg-gray-4"][class*="rounded"]');
+                    if (!messageBubble) {
+                        // Fallback: try finding by px-[13px] which is unique to message bubbles
+                        messageBubble = p.closest('div[class*="px-\\[13px\\]"]');
+                    }
+                    
+                    if (messageBubble) {
+                        debugLog('[Core] Message bubble found:', messageBubble.className.substring(0, 80));
+                        
+                        // Find the header container (has gap-md AND justify-between items-center)
+                        liveHeaderContainer = messageBubble.querySelector('div.flex.justify-between.items-center.gap-md');
+                        debugLog('[Core] Header container found:', !!liveHeaderContainer);
+                        
+                        if (liveHeaderContainer) {
+                            liveStatsDiv = liveHeaderContainer.querySelector('.generation-stats');
+                            debugLog('[Core] Stats div in header:', !!liveStatsDiv);
+                        }
+                    }
+                    break;
+                }
+            }
+            
+            // If we couldn't find the header container, we can't proceed
+            if (!liveHeaderContainer) {
+                debugLog('[Core] Could not find header container, aborting');
+                return;
+            }
+            
+            // Try to find the message ID from our alternative groups
+            let newMessageId = null;
+            
+            // Method 3: Fall back to matching by version count (works if counts are unique)
+            // alternativeMessageGroups[prev_id] contains ALL versions including the original (v1)
+            // so alternatives.length === totalVersions
+            if (!newMessageId) {
+                debugLog('[Core] Trying to match by version count:', totalVersions);
+                debugLog('[Core] Available groups:', Object.entries(alternativeMessageGroups).map(([k, v]) => 
+                    `${k.substring(0, 8)}: ${v.length} versions [${v.map(m => m.id.substring(0, 8)).join(', ')}]`
+                ));
+                for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
+                    if (alternatives.length === totalVersions) {
+                        const targetIndex = newVersion - 1;
+                        debugLog('[Core] Found group by count match! prev_id:', prevId.substring(0, 8));
+                        debugLog('[Core] Alternatives in group:', alternatives.map((m, i) => `v${i+1}=${m.id.substring(0, 8)}`));
+                        debugLog('[Core] Target index:', targetIndex, 'for newVersion:', newVersion);
+                        if (targetIndex >= 0 && targetIndex < alternatives.length) {
+                            newMessageId = alternatives[targetIndex].id;
+                            debugLog('[Core] Selected message ID:', newMessageId.substring(0, 8));
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            if (!newMessageId) {
+                debugLog('[Core] Could not determine message ID after version switch');
+                return;
+            }
+            
+            debugLog('[Core] Final message ID for lookup:', newMessageId.substring(0, 8));
+            debugLog('[Core] messageTimestamps has this ID?', !!messageTimestamps[newMessageId]);
+            debugLog('[Core] messageTimestamps[newMessageId]:', messageTimestamps[newMessageId]);
+            debugLog('[Core] All messageTimestamps keys:', Object.keys(messageTimestamps).map(k => k.substring(0, 8)));
+            
+            // Get the stats for this specific message version
+            // Note: getStatsForMessage automatically uses the API timestamp from messageTimestamps
+            const generationStats = await getStatsForMessage(newMessageId);
+            debugLog('[Core] Stats lookup result:', generationStats ? 'found' : 'not found', generationStats);
+            debugLog('[Core] Stats timestamp after getStatsForMessage:', generationStats?.timestamp, '→', generationStats?.timestamp ? new Date(generationStats.timestamp).toLocaleString() : 'null');
+            
+            if (!generationStats) {
+                debugLog('[Core] No stats found for message:', newMessageId);
+                // Clear existing stats if present
+                if (liveStatsDiv) {
+                    liveStatsDiv.textContent = '';
+                }
+                return;
+            }
+            
+            // Get current settings
+            const cache = window.__toolkitStorageCache;
+            const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
+            const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
+            const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+            const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
+
+            debugLog('[Core] Settings:', { statsEnabled, timestampEnabled, showModelDetails, showMessageIds });
+            
+            // Build updated display
+            let displayLines = [];
+            
+            const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
+            const hasModel = generationStats.model;
+            const hasTimestamp = generationStats.timestamp;
+            
+            if (statsEnabled && hasSettings && hasModel) {
+                let modelDisplay = generationStats.model;
+                if (!showModelDetails && modelDisplay.includes('→')) {
+                    modelDisplay = modelDisplay.split('→')[0].trim();
+                }
+                displayLines.push(modelDisplay);
+                displayLines.push(`Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`);
+            }
+            
+            if (timestampEnabled && hasTimestamp) {
+                const timestamp = await formatTimestamp(generationStats.timestamp);
+                if (timestamp) {
+                    displayLines.push(timestamp);
+                }
+            }
+
+            if (showMessageIds && newMessageId) {
+                displayLines.push(`ID: ${newMessageId}`);
+            }
+
+            debugLog('[Core] Display lines:', displayLines);
+            
+            if (displayLines.length > 0) {
+                const displayText = displayLines.join('<br>');
+                
+                // Use the liveStatsDiv and liveHeaderContainer we found earlier via versionCounterElement
+                // These were found by navigating from the clicked version counter
+                
+                // FIRST: Remove any stats divs that React created (they don't have our data-version-id)
+                // This prevents flicker by cleaning up before we add/update ours
+                if (liveHeaderContainer) {
+                    const reactStatsDivs = liveHeaderContainer.querySelectorAll('.generation-stats:not([data-version-id])');
+                    reactStatsDivs.forEach(div => div.remove());
+                }
+                
+                // If no stats div exists but we have a header container, create one
+                if (!liveStatsDiv && liveHeaderContainer) {
+                    debugLog('[Core] No stats div found, creating new one in header container');
+                    liveStatsDiv = document.createElement('div');
+                    liveStatsDiv.className = 'generation-stats';
+                    liveStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                    
+                    // Insert before the menu button container
+                    const menuButtonContainer = liveHeaderContainer.querySelector('.relative');
+                    if (menuButtonContainer) {
+                        liveHeaderContainer.insertBefore(liveStatsDiv, menuButtonContainer);
+                        liveHeaderContainer.style.setProperty('gap', '4px', 'important');
+                    } else {
+                        liveHeaderContainer.appendChild(liveStatsDiv);
+                    }
+                }
+                
+                if (!liveStatsDiv) {
+                    debugLog('[Core] ERROR: Could not find or create any live stats div to update!');
+                    return;
+                }
+                
+                debugLog('[Core] BEFORE update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
+                debugLog('[Core] Stats div is in document:', document.body.contains(liveStatsDiv));
+                
+                // Apply the update
+                liveStatsDiv.dataset.versionId = newMessageId;
+                safeSetHTML(liveStatsDiv, displayText);
+                
+                // Apply model change indicators (will re-evaluate all stats divs)
+                applyModelChangeIndicators();
+                
+                // IMPORTANT: Remove any duplicate stats divs in this header
+                // React might have created another one, or we might have created a duplicate
+                const allStatsDivsInHeader = liveHeaderContainer.querySelectorAll('.generation-stats');
+                debugLog('[Core] Stats divs in header after update:', allStatsDivsInHeader.length);
+                if (allStatsDivsInHeader.length > 1) {
+                    // Keep only the first one (ours), remove the rest
+                    for (let i = 1; i < allStatsDivsInHeader.length; i++) {
+                        debugLog('[Core] Removing duplicate stats div');
+                        allStatsDivsInHeader[i].remove();
+                    }
+                }
+                
+                debugLog('[Core] AFTER update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
+                debugLog('[Core] Updated stats display!');
+                
+                // React re-renders aggressively, so we need to keep re-applying our update
+                // Use a MutationObserver to watch for React replacing the stats div
+                const reapplyStats = () => {
+                    // Find the message bubble containing our version switcher
+                    const allVersionSwitchers = document.querySelectorAll('p.text-label-md');
+                    for (const switcher of allVersionSwitchers) {
+                        if (switcher.textContent.trim() === `${newVersion}/${totalVersions}`) {
+                            // Found the switcher, find the message bubble
+                            const msgBubble = switcher.closest('div[class*="bg-gray-4"][class*="rounded"]');
+                            if (msgBubble) {
+                                const headerContainer = msgBubble.querySelector('div.flex.justify-between.items-center.gap-md');
+                                if (headerContainer) {
+                                    // First, remove any React-created stats divs (without our data-version-id)
+                                    const reactStatsDivs = headerContainer.querySelectorAll('.generation-stats:not([data-version-id])');
+                                    reactStatsDivs.forEach(div => div.remove());
+                                    
+                                    let allStatsDivs = headerContainer.querySelectorAll('.generation-stats');
+                                    
+                                    // If no stats div exists AT ALL, CREATE one
+                                    if (allStatsDivs.length === 0) {
+                                        debugLog('[Core] reapplyStats: No stats div found, creating new one');
+                                        const newStatsDiv = document.createElement('div');
+                                        newStatsDiv.className = 'generation-stats';
+                                        newStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
+                                        newStatsDiv.dataset.versionId = newMessageId;
+                                        safeSetHTML(newStatsDiv, displayText);
+                                        
+                                        // Insert before the menu button container
+                                        const menuButtonContainer = headerContainer.querySelector('.relative');
+                                        if (menuButtonContainer) {
+                                            headerContainer.insertBefore(newStatsDiv, menuButtonContainer);
+                                            headerContainer.style.setProperty('gap', '4px', 'important');
+                                        } else {
+                                            headerContainer.appendChild(newStatsDiv);
+                                        }
+                                    } else {
+                                        // Stats div exists - update it if needed
+                                        const statsDiv = allStatsDivs[0];
+                                        if (statsDiv.dataset.versionId !== newMessageId) {
+                                            debugLog('[Core] reapplyStats: Updating existing stats div');
+                                            statsDiv.dataset.versionId = newMessageId;
+                                            safeSetHTML(statsDiv, displayText);
+                                        }
+                                        
+                                        // Remove any duplicates
+                                        for (let i = 1; i < allStatsDivs.length; i++) {
+                                            allStatsDivs[i].remove();
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                };
+                
+                // Set up a temporary MutationObserver to catch React re-renders
+                const observer = new MutationObserver((mutations) => {
+                    reapplyStats();
+                });
+                
+                // Watch the entire chat container for changes
+                const chatContainer = document.querySelector('[class*="flex-col"][class*="items-center"]') || document.body;
+                observer.observe(chatContainer, { 
+                    childList: true, 
+                    subtree: true,
+                    characterData: true
+                });
+                
+                // Also do periodic checks for the next 2 seconds (longer duration)
+                const checkInterval = setInterval(reapplyStats, 50); // More frequent checks
+                
+                // Clean up after 2 seconds
+                setTimeout(() => {
+                    observer.disconnect();
+                    clearInterval(checkInterval);
+                    // Remove the hide-React-stats CSS rule - our stats div is stable now
+                    const hideStyle = document.getElementById('sai-hide-react-stats');
+                    if (hideStyle) {
+                        hideStyle.textContent = '';
+                    }
+                    debugLog('[Core] Stopped watching for React re-renders');
+                }, 2000);
+            } else {
+                // No displayable content, clear stats div
+                if (liveStatsDiv) {
+                    liveStatsDiv.textContent = '';
+                }
+                // Remove the hide-React-stats CSS rule
+                const hideStyle = document.getElementById('sai-hide-react-stats');
+                if (hideStyle) {
+                    hideStyle.textContent = '';
+                }
+                debugLog('[Core] No displayable content, cleared stats div');
+            }
+        }, 50); // Reduced from 200ms to 50ms for faster response
+    }
+    
+    // Detect manual model changes via SpicyChat's own Generation Settings UI
+    // Covers: (a) "Set Model" confirmation button in new UI, (b) direct model-option selection
+    // in old UI, and (c) SpicyChat's native generation presets that swap the model.
+    document.addEventListener('click', (e) => {
+        const target = e.target;
+        if (!target) return;
+
+        // New UI: user clicked the "Set Model" confirmation button
+        const confirmBtn = target.closest('button[aria-label="Set Model"]') ||
+            target.closest('button');
+        if (confirmBtn) {
+            const btnText = confirmBtn.textContent && confirmBtn.textContent.trim();
+            if (btnText === 'Set Model') {
+                window.__suppressMismatchNext = true;
+                debugLog('[Model] "Set Model" button clicked — suppressing next mismatch auto-regen');
+                return;
+            }
+        }
+
+        // Old UI: model option selected directly in the model picker list
+        // The picker has a heading containing "Select a model" / "Choose Model" / "Select Model"
+        const pickerOption = target.closest('li, div[role="option"]');
+        if (pickerOption) {
+            const modal = pickerOption.closest('div.fixed, div[class*="fixed"]');
+            if (modal) {
+                const modalText = modal.textContent || '';
+                if (modalText.includes('Select a model') || modalText.includes('Choose Model') || modalText.includes('Select Model')) {
+                    window.__suppressMismatchNext = true;
+                    debugLog('[Model] Model option selected in picker — suppressing next mismatch auto-regen');
+                }
+            }
+        }
+    }, true); // capture phase so we fire before React
+
+    // Click handler for regeneration switcher buttons
+    document.addEventListener('click', async (e) => {
+        // Check if click was on a regeneration switcher button (prev/next chevron)
+        const button = e.target.closest('button[aria-label="previous"], button[aria-label="next"]');
+        if (!button) return;
+        
+        // Verify it's the regeneration switcher (has sibling with X/Y format)
+        const container = button.closest('.flex.items-center');
+        if (!container) return;
+        
+        const counterText = container.querySelector('p');
+        if (!counterText || !/^\d+\/\d+$/.test(counterText.textContent.trim())) return;
+        
+        // Parse the CURRENT version before the click updates the UI
+        const [currentVersion, totalVersions] = counterText.textContent.trim().split('/').map(Number);
+        const isNext = button.getAttribute('aria-label') === 'next';
+        
+        debugLog('[Core] Regeneration switcher clicked!', {
+            button: button.getAttribute('aria-label'),
+            currentVersion,
+            totalVersions,
+            alternativeGroupsCount: Object.keys(alternativeMessageGroups).length
+        });
+        
+        await handleVersionSwitch(currentVersion, totalVersions, isNext);
+    }, true); // Use capture phase to catch event early
+    
+    // Keyboard handler for arrow keys (left/right) to switch regeneration versions
+    document.addEventListener('keydown', async (e) => {
+        // Only handle left/right arrow keys
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        
+        // Don't interfere if user is typing in an input or textarea
+        const activeElement = document.activeElement;
+        if (activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.isContentEditable)) {
+            return;
+        }
+        
+        // Find all version switchers on the page
+        const versionSwitchers = document.querySelectorAll('p.text-label-md');
+        let foundSwitcher = null;
+        let currentVersion = 0;
+        let totalVersions = 0;
+        
+        for (const switcher of versionSwitchers) {
+            const match = switcher.textContent.trim().match(/^(\d+)\/(\d+)$/);
+            if (match) {
+                currentVersion = parseInt(match[1]);
+                totalVersions = parseInt(match[2]);
+                foundSwitcher = switcher;
+                break; // Use the first version switcher found
+            }
+        }
+        
+        if (!foundSwitcher || totalVersions <= 1) {
+            return; // No version switcher or only one version
+        }
+        
+        const isNext = e.key === 'ArrowRight';
+        
+        // Check if the version would actually change
+        if (isNext && currentVersion >= totalVersions) return;
+        if (!isNext && currentVersion <= 1) return;
+        
+        debugLog('[Core] Arrow key pressed for version switch!', {
+            key: e.key,
+            currentVersion,
+            totalVersions,
+            alternativeGroupsCount: Object.keys(alternativeMessageGroups).length
+        });
+        
+        await handleVersionSwitch(currentVersion, totalVersions, isNext);
+    }, true); // Use capture phase
+
+    // Initial check in case modal is already open
+    setTimeout(createProfileControls, 1000);
+
+    // Watch for model name changes in Generation Settings modal (SpicyChat's own presets)
+    startGenerationSettingsModelWatcher();
+
+    // =============================================================================
+    // ===                   MEMORY MANAGER AUTO-REFRESH                        ===
+    // =============================================================================
+    
+    let memoryRefreshInterval = null;
+    let memoryRefreshInProgress = false; // Guard to prevent concurrent refresh operations
+    
+    /**
+     * Extracts conversation ID from current URL
+     */
+    function getConversationId() {
+        // Use the conversation ID captured from the messages GET request
+        // This is more reliable than parsing the URL
+        return currentConversationId;
+    }
+    
+    /**
+     * Fetches fresh memory data from the API by injecting into page context
+     */
+    async function refreshMemoryContent() {
+        // Guard against concurrent refresh operations which can cause React conflicts
+        if (memoryRefreshInProgress) {
+            debugLog('[Memories] Memory refresh already in progress, skipping...');
+            return false;
+        }
+        memoryRefreshInProgress = true;
+        
+        try {
+            return await doRefreshMemoryContent();
+        } finally {
+            // Always reset the flag, even if an error occurs
+            memoryRefreshInProgress = false;
+        }
+    }
+    
+    /**
+     * Internal implementation of memory refresh
+     */
+    async function doRefreshMemoryContent() {
+        debugLog('[Memories] Refreshing Memory Manager content via API...');
+        
+        // Find the Memories modal specifically by its unique z-index
+        // Use Array.from to check all modals and find the one with "Memories" heading
+        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
+        let memoryModal = null;
+        
+        for (const modal of allModals) {
+            const heading = modal.querySelector('p.text-heading-6');
+            if (heading && heading.textContent.trim() === 'Memories') {
+                memoryModal = modal;
+                break;
+            }
+        }
+        
+        if (!memoryModal) {
+            debugLog('[Memories] Memory modal not found');
+            return false;
+        }
+        
+        // Get conversation ID from captured API data
+        const conversationId = getConversationId();
+        if (!conversationId) {
+            debugLog('[Memories] Could not get conversation ID (not yet captured from messages API)');
+            return false;
+        }
+        debugLog('[Memories] Using conversation ID:', conversationId);
+        
+        try {
+            // Use postMessage to communicate with page-context.js instead of inline script
+            // This avoids CSP issues with inline script injection
+            const responsePromise = new Promise((resolve) => {
+                const handler = (event) => {
+                    // Only handle our specific response
+                    if (event.source !== window) return;
+                    if (event.data.type !== 'SAI_MEMORY_REFRESH_RESPONSE') return;
+                    
+                    window.removeEventListener('message', handler);
+                    resolve(event.data);
+                };
+                window.addEventListener('message', handler);
+                
+                // Timeout after 10 seconds
+                setTimeout(() => {
+                    window.removeEventListener('message', handler);
+                    resolve({ success: false, error: 'timeout' });
+                }, 10000);
+            });
+            
+            // Send request to page-context.js
+            window.postMessage({
+                type: 'SAI_MEMORY_REFRESH_REQUEST',
+                conversationId: conversationId
+            }, '*');
+            
+            // Wait for the response
+            const result = await responsePromise;
+            
+            if (!result.success) {
+                if (result.error === 'timeout') {
+                    debugLog('[Memories] API fetch timed out, falling back to close/reopen approach');
+                } else {
+                    console.error('[Memories] Failed to fetch memories:', result.status || result.error);
+                    if (result.status === 401) {
+                        console.error('[Memories] Authentication failed - token may be invalid or expired. Auth token present:', result.hasAuth);
+                    }
+                }
+                // Don't return false here - fall through to close/reopen approach
+            } else {
+                debugLog(`[Memories] Fetched ${result.count} memories from API`);
+            }
+            
+            // Try multiple approaches to trigger React re-render
+            debugLog('[Memories] Attempting to trigger React re-render...');
+            debugLog('[Memories] Memory modal element:', memoryModal);
+            
+            // NEW Approach: Try to find and click the "Load More Memories" button
+            const loadMoreButton = Array.from(memoryModal.querySelectorAll('button'))
+                .find(btn => btn.textContent?.includes('Load More'));
+            
+            if (loadMoreButton) {
+                debugLog('[Memories] Found Load More button, clicking it');
+                loadMoreButton.click();
+                await new Promise(resolve => setTimeout(resolve, 500));
+                debugLog('[Memories] Load More clicked, checking if memories updated');
+                // The button click might trigger a refetch which would update the UI
+                // Fall through to close/reopen if this doesn't work
+            }
+            
+            // Approach 1: Find React component and manipulate state directly
+            try {
+                // Try the modal itself first
+                let elementToCheck = memoryModal;
+                let depth = 0;
+                
+                while (elementToCheck && depth < 5) {
+                    const allKeys = Object.keys(elementToCheck);
+                    const reactKeys = allKeys.filter(key => 
+                        key.startsWith('__react') || key.includes('react') || key.includes('fiber')
+                    );
+                    
+                    if (reactKeys.length > 0) {
+                        debugLog('[Memories] Found React keys at depth', depth, ':', reactKeys);
+                        
+                        const reactKey = reactKeys[0];
+                        const reactObj = elementToCheck[reactKey];
+                        
+                        // Walk the fiber tree
+                        let current = reactObj;
+                        let attempts = 0;
+                        while (current && attempts < 30) {
+                            if (current.stateNode && typeof current.stateNode.forceUpdate === 'function') {
+                                debugLog('[Memories] Found forceUpdate at level', attempts, '- skipping to avoid React conflicts');
+                                // DISABLED: forceUpdate can cause React error #185 (Maximum update depth exceeded)
+                                // Instead, fall through to the close/reopen approach which is safer
+                                // current.stateNode.forceUpdate();
+                                // await new Promise(resolve => setTimeout(resolve, 1000));
+                                // debugLog('[Memories] Memory refresh completed (via forceUpdate)');
+                                // return true;
+                                break; // Skip forceUpdate, use close/reopen instead
+                            }
+                            current = current.return;
+                            attempts++;
+                        }
+                        break;
+                    }
+                    
+                    elementToCheck = elementToCheck.parentElement;
+                    depth++;
+                }
+                
+                debugLog('[Memories] No React fiber found after checking', depth, 'parent levels');
+            } catch (e) {
+                console.error('[Memories] React manipulation failed:', e);
+            }
+            
+            // Approach 2: Close and reopen (most reliable)
+            debugLog('[Memories] Attempting close/reopen approach...');
+            
+            // Try multiple close button selectors - use aria-label="X-button"
+            let closeButton = memoryModal.querySelector('button[aria-label="X-button"]');
+            if (!closeButton) {
+                closeButton = memoryModal.querySelector('button[aria-label="Close"]');
+            }
+            if (!closeButton) {
+                // Look for button with X icon
+                const buttons = Array.from(memoryModal.querySelectorAll('button'));
+                debugLog('[Memories] Searching through', buttons.length, 'buttons for close button');
+                closeButton = buttons.find(btn => {
+                    const svg = btn.querySelector('svg');
+                    if (!svg) return false;
+                    // Close buttons typically have an X icon with crossing paths
+                    const paths = svg.querySelectorAll('path');
+                    return paths.length >= 2;
+                });
+            }
+            
+            if (closeButton) {
+                debugLog('[Memories] Found close button, closing modal...');
+                
+                // TRICK: Create a simple invisible placeholder div to hold the sidebar space
+                // This is cleaner than opening Generation Settings
+                let placeholderDiv = null;
+                
+                // Check if Generation Settings is already open
+                const allModals = Array.from(document.querySelectorAll('div.fixed'));
+                const hasGenerationSettings = allModals.some(modal => {
+                    const heading = modal.querySelector('p.text-heading-6');
+                    return heading && heading.textContent.includes('Generation Settings');
+                });
+                
+                if (!hasGenerationSettings) {
+                    debugLog('[Memories] Creating invisible placeholder to hold sidebar space');
+                    
+                    // Create a simple placeholder that looks like a sidebar to the layout engine
+                    placeholderDiv = document.createElement('div');
+                    placeholderDiv.id = 'sai-sidebar-placeholder';
+                    placeholderDiv.style.cssText = `
+                        position: fixed;
+                        top: 0;
+                        right: 0;
+                        width: 400px;
+                        height: 100vh;
+                        pointer-events: none;
+                        z-index: 1;
+                        background: transparent;
+                    `;
+                    
+                    document.body.appendChild(placeholderDiv);
+                    debugLog('[Memories] Placeholder div created');
+                }
+                
+                // Now close the Memories modal
+                closeButton.click();
+                closeButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                closeButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                closeButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+                
+                // Wait just long enough for close
+                await new Promise(resolve => setTimeout(resolve, 50));
+                
+                // Reopen quickly - search more thoroughly for the Memory Manager button
+                debugLog('[Memories] Looking for Memory Manager button to reopen...');
+                
+                // First, try to find and open the chat dropdown menu
+                const menuButton = document.querySelector('button[aria-label="chat-dropdown"]');
+                if (menuButton) {
+                    debugLog('[Memories] Found chat dropdown menu button, opening it...');
+                    menuButton.click();
+                    await new Promise(resolve => setTimeout(resolve, 30));
+                } else {
+                    debugLog('[Memories] Chat dropdown button not found');
+                }
+                
+                // Try multiple selectors for the Manage Memories button
+                debugLog('[Memories] Looking for Manage Memories button...');
+                let memoryButton = document.querySelector('button[aria-label="Manage Memories"]');
+                debugLog('[Memories] Direct selector result:', !!memoryButton);
+                
+                if (!memoryButton) {
+                    // Look through all buttons for one with "Manage Memories" text
+                    const allButtons = Array.from(document.querySelectorAll('button'));
+                    debugLog('[Memories] Searching through', allButtons.length, 'buttons on page');
+                    
+                    const memoryButtons = allButtons.filter(btn => {
+                        const text = btn.textContent || '';
+                        const ariaLabel = btn.getAttribute('aria-label') || '';
+                        return text.toLowerCase().includes('manage memor') || ariaLabel.toLowerCase().includes('manage memor');
+                    });
+                    
+                    debugLog('[Memories] Found', memoryButtons.length, 'buttons with "manage memor" in text/aria-label');
+                    if (memoryButtons.length > 0) {
+                        memoryButtons.forEach((btn, i) => {
+                            debugLog(`[Memories] Memory button ${i}:`, {
+                                text: btn.textContent?.substring(0, 50),
+                                ariaLabel: btn.getAttribute('aria-label'),
+                                visible: btn.offsetParent !== null,
+                                displayed: window.getComputedStyle(btn).display !== 'none'
+                            });
+                        });
+                    }
+                    
+                    // Use the first one found
+                    memoryButton = memoryButtons[0];
+                }
+                
+                if (memoryButton) {
+                    debugLog('[Memories] Found Memory Manager button:', memoryButton.textContent || memoryButton.getAttribute('aria-label'));
+                    memoryButton.click();
+                    
+                    // Wait a moment for the modal to reopen and re-style the Load More button
+                    setTimeout(() => {
+                        // Find the reopened Memories modal by checking all modals
+                        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
+                        let reopenedModal = null;
+                        
+                        for (const modal of allModals) {
+                            const heading = modal.querySelector('p.text-heading-6');
+                            if (heading && heading.textContent.trim() === 'Memories') {
+                                reopenedModal = modal;
+                                break;
+                            }
+                        }
+                        
+                        if (reopenedModal) {
+                            styleLoadMoreButton(reopenedModal);
+                        }
+                        
+                        // Remove the placeholder div if we created one
+                        if (placeholderDiv) {
+                            placeholderDiv.remove();
+                            debugLog('[Memories] Removed placeholder div');
+                        }
+                    }, 500);
+                    
+                    debugLog('[Memories] Memory refresh completed (via close/reopen)');
+                    return true;
+                } else {
+                    debugLog('[Memories] Could not find Memory Manager button to reopen');
+                    debugLog('[Memories] Tried aria-label and text content searches');
+                }
+            } else {
+                debugLog('[Memories] Could not find close button');
+                // Log the modal structure to help debug
+                debugLog('[Memories] Modal HTML structure:', memoryModal.outerHTML.substring(0, 500));
+            }
+            
+            // Clean up overlay and spacer if they still exist
+            const overlay = document.getElementById('sai-refresh-overlay');
+            const spacer = document.getElementById('sai-refresh-spacer');
+            if (overlay) overlay.remove();
+            if (spacer) spacer.remove();
+            
+            debugLog('[Memories] All refresh approaches attempted');
+            return true;
+            
+        } catch (error) {
+            console.error('[Memories] Error refreshing memories:', error);
+            
+            // Clean up placeholder div if it exists
+            if (placeholderDiv) {
+                placeholderDiv.remove();
+                debugLog('[Memories] Removed placeholder div after error');
+            }
+            
+            return false;
+        }
+    }
+    
+    /**
+     * Starts the auto-refresh interval for the Memory Manager modal
+     * DISABLED: Auto-refresh is currently disabled to prevent issues
+     */
+    function startMemoryRefresh() {
+        // Auto-refresh disabled - use manual refresh button instead
+        debugLog('[Memories] Memory Manager auto-refresh is disabled');
+        return;
+        
+        // Clear any existing interval first
+        if (memoryRefreshInterval) {
+            clearInterval(memoryRefreshInterval);
+        }
+        
+        debugLog('[Memories] Memory Manager auto-refresh started (120 seconds)');
+        
+        // Set up interval to refresh every 120 seconds
+        memoryRefreshInterval = setInterval(() => {
+            // Check if modal is still open
+            const memoryModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2[class*="z-\\[900000\\]"]');
+            if (memoryModal) {
+                const memoryHeading = memoryModal.querySelector('p.text-heading-6');
+                if (memoryHeading && memoryHeading.textContent.trim() === 'Memories') {
+                    refreshMemoryContent();
+                } else {
+                    // Modal is open but it's not the Memory Manager, stop the interval
+                    debugLog('[Memories] Memory Manager closed, stopping auto-refresh');
+                    clearInterval(memoryRefreshInterval);
+                    memoryRefreshInterval = null;
+                }
+            } else {
+                // Modal is no longer open, stop the interval
+                debugLog('[Memories] Memory Manager closed, stopping auto-refresh');
+                clearInterval(memoryRefreshInterval);
+                memoryRefreshInterval = null;
+            }
+        }, 120000); // 120 seconds = 120000 milliseconds
+    }
+    
+    /**
+     * Stops the auto-refresh interval
+     */
+    function stopMemoryRefresh() {
+        if (memoryRefreshInterval) {
+            clearInterval(memoryRefreshInterval);
+            memoryRefreshInterval = null;
+            debugLog('[Memories] Memory Manager auto-refresh stopped');
+        }
+    }
+    
+    /**
+     * Adds a manual refresh button to the Memory Manager modal
+     */
+    function addManualRefreshButton(modal) {
+        // Mark modal as being processed to prevent duplicate calls
+        if (modal.dataset.saiButtonProcessing) {
+            debugLog('[Memories] Refresh button already being added');
+            return;
+        }
+        modal.dataset.saiButtonProcessing = 'true';
+        
+        // Check if button already exists
+        if (modal.querySelector('[data-sai-refresh-button]')) {
+            debugLog('[Memories] Refresh button already exists');
+            delete modal.dataset.saiButtonProcessing;
+            return;
+        }
+        
+        // Wait a bit for React to fully render the modal buttons
+        setTimeout(() => {
+            // Find the button container (with the + and ... buttons)
+            // Try multiple selectors as the class order might vary
+            let buttonContainer = modal.querySelector('.flex.justify-end.items-undefined.m-0');
+            if (!buttonContainer) {
+                // Try without m-0 in case that class was removed
+                buttonContainer = modal.querySelector('.flex.justify-end.items-undefined');
+            }
+            if (!buttonContainer) {
+                debugLog('[Memories] Could not find button container with primary selectors');
+                debugLog('[Memories] Trying alternate selectors...');
+                
+                // Try finding any flex container with buttons near the heading
+                buttonContainer = modal.querySelector('.flex.justify-end.items-center');
+                if (!buttonContainer) {
+                    // Look for any flex container with justify-end that contains a square-plus button
+                    const allFlexContainers = modal.querySelectorAll('.flex.justify-end');
+                    for (const container of allFlexContainers) {
+                        if (container.querySelector('svg.lucide-square-plus')) {
+                            buttonContainer = container;
+                            debugLog('[Memories] Found container via square-plus icon');
+                            break;
+                        }
+                    }
+                }
+                
+                if (buttonContainer) {
+                    debugLog('[Memories] Found alternate container:', buttonContainer.className);
+                } else {
+                    debugLog('[Memories] No button container found at all');
+                    delete modal.dataset.saiButtonProcessing;
+                    return;
+                }
+            }
+            
+            debugLog('[Memories] Found button container:', buttonContainer.className);
+            debugLog('[Memories] Container children:', buttonContainer.children.length);
+            
+            // Find the + button (first button with lucide-square-plus SVG)
+            let addButton = buttonContainer.querySelector('svg.lucide-square-plus')?.closest('button');
+            
+            // If not found, try alternate approach
+            if (!addButton) {
+                debugLog('[Memories] Trying alternate add button selector...');
+                // Look for any button in the container
+                const buttons = buttonContainer.querySelectorAll('button');
+                debugLog('[Memories] Found buttons:', buttons.length);
+                
+                if (buttons.length > 0) {
+                    // Assume first button is the add button
+                    addButton = buttons[0];
+                    debugLog('[Memories] Using first button as reference');
+                } else {
+                    debugLog('[Memories] No buttons found in container');
+                    debugLog('[Memories] Container HTML:', buttonContainer.outerHTML.substring(0, 500));
+                    return;
+                }
+            }
+            
+            debugLog('[Memories] Found reference button, creating refresh button');
+            
+            // Create refresh button with the same styling as existing buttons
+            const refreshButton = document.createElement('button');
+            refreshButton.setAttribute('data-sai-refresh-button', 'true');
+            refreshButton.className = addButton.className; // Copy exact classes from add button
+            refreshButton.type = 'button';
+            refreshButton.title = 'Refresh memories';
+            refreshButton.setAttribute('default', '');
+            refreshButton.appendChild(makeSVG({
+                xmlns: SVG_NS, width: '16', height: '16', viewBox: '0 0 24 24',
+                fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+                'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+                class: 'lucide lucide-refresh-cw inline-flex items-center justify-center'
+            }, [
+                ['path', { d: 'M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8' }],
+                ['path', { d: 'M21 3v5h-5' }],
+                ['path', { d: 'M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16' }],
+                ['path', { d: 'M3 21v-5h5' }]
+            ]));
+            const refreshLabelSpan = document.createElement('span');
+            refreshLabelSpan.className = 'flex items-center justify-center text-center gap-1.5';
+            refreshButton.appendChild(refreshLabelSpan);
+            
+            // Add click handler
+            refreshButton.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                debugLog('[Memories] Manual refresh triggered');
+                
+                // Visual feedback - spin the icon
+                const svg = refreshButton.querySelector('svg');
+                if (svg) {
+                    svg.style.transition = 'transform 0.5s ease';
+                    svg.style.transform = 'rotate(360deg)';
+                    setTimeout(() => {
+                        svg.style.transform = 'rotate(0deg)';
+                    }, 500);
+                }
+                
+                // Trigger refresh
+                await refreshMemoryContent();
+            });
+            
+            // Insert before the add button
+            buttonContainer.insertBefore(refreshButton, addButton);
+            
+            debugLog('[Memories] Manual refresh button added to Memory Manager');
+            debugLog('[Memories] Button visible in DOM:', !!modal.querySelector('[data-sai-refresh-button]'));
+            delete modal.dataset.saiButtonProcessing;
+        }, 500); // Wait 500ms for React to render
+    }
+    
+    /**
+     * Styles the "Load More Memories" button when sidebar layout is enabled
+     */
+    function styleLoadMoreButton(memoryModal) {
+        if (!memoryModal) return;
+        
+        const applyStyles = () => {
+            // Find the Load More Memories button
+            const buttons = memoryModal.querySelectorAll('button');
+            const loadMoreButton = Array.from(buttons).find(btn => 
+                btn.textContent?.includes('Load More Memories')
+            );
+            
+            if (loadMoreButton && !loadMoreButton.dataset.saiStyled) {
+                // Use !important to override React's inline styles
+                loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
+                loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
+                loadMoreButton.dataset.saiStyled = 'true';
+                debugLog('[Memories] Styled Load More Memories button for sidebar layout');
+                
+                // Watch for attribute changes in case React resets the style
+                // Use debouncing to prevent infinite loops with React's reconciliation
+                let styleDebounceTimer = null;
+                const buttonObserver = new MutationObserver(() => {
+                    // Debounce to prevent rapid re-application causing React conflicts
+                    if (styleDebounceTimer) clearTimeout(styleDebounceTimer);
+                    styleDebounceTimer = setTimeout(() => {
+                        if (!loadMoreButton.style.marginTop || !loadMoreButton.style.marginBottom) {
+                            loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
+                            loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
+                        }
+                    }, 100); // 100ms debounce
+                });
+                
+                buttonObserver.observe(loadMoreButton, {
+                    attributes: true,
+                    attributeFilter: ['style']
+                });
+                
+                return true; // Success
+            }
+            return false; // Button not found yet
+        };
+        
+        // Try immediately
+        if (!applyStyles()) {
+            // Button not rendered yet, wait and try again
+            setTimeout(() => {
+                if (!applyStyles()) {
+                    // Still not found, set up observer to watch for it
+                    const modalObserver = new MutationObserver((mutations) => {
+                        if (applyStyles()) {
+                            modalObserver.disconnect();
+                        }
+                    });
+                    
+                    modalObserver.observe(memoryModal, {
+                        childList: true,
+                        subtree: true
+                    });
+                    
+                    // Disconnect after 5 seconds to avoid memory leak
+                    setTimeout(() => modalObserver.disconnect(), 5000);
+                }
+            }, 500);
+        }
+    }
+    
+    /**
+     * Monitors for Memory Manager modal opening
+     */
+    // Store observer reference to prevent duplicate observers (memory leak fix)
+    let memoryModalObserver = null;
+    let memoryModalDebounceTimer = null; // Debounce timer to prevent rapid firing
+
+    function monitorMemoryModal() {
+        // Disconnect existing observer if any to prevent accumulation
+        if (memoryModalObserver) {
+            memoryModalObserver.disconnect();
+        }
+
+        memoryModalObserver = new MutationObserver((mutations) => {
+            // Skip processing during resize to prevent React 185 error
+            const timeSinceResize = Date.now() - lastResizeTime;
+            if (timeSinceResize < RESIZE_DEBOUNCE_MS) {
+                return; // Skip entirely during resize
+            }
+            
+            // Debounce to prevent rapid firing which can conflict with React
+            if (memoryModalDebounceTimer) clearTimeout(memoryModalDebounceTimer);
+            memoryModalDebounceTimer = setTimeout(() => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            // Early exit for nodes that can't be the Memory Manager modal
+                            // Only div elements with 'fixed' class can be the modal
+                            const nodeTag = node.tagName?.toLowerCase();
+                            if (nodeTag !== 'div') {
+                                continue; // Skip non-div elements entirely
+                            }
+                            
+                            let foundModal = null;
+                            
+                            // Check if this is the Memory Manager modal
+                            if (node.classList && node.classList.contains('fixed')) {
+                                const heading = node.querySelector('p.text-heading-6');
+                                if (heading && heading.textContent.trim() === 'Memories') {
+                                    foundModal = node;
+                                    debugLog('[Memories] Matched Memories modal directly');
+                                }
+                            }
+                            
+                            // Also check children in case modal was added in a container
+                            if (!foundModal) {
+                                // Look for div.fixed that contains the "Memories" heading
+                                const allFixedDivs = node.querySelectorAll?.('div.fixed');
+                                if (allFixedDivs && allFixedDivs.length > 0) {
+                                    for (const fixedDiv of allFixedDivs) {
+                                        const heading = fixedDiv.querySelector('p.text-heading-6');
+                                        if (heading && heading.textContent.trim() === 'Memories') {
+                                            foundModal = fixedDiv;
+                                            debugLog('[Memories] Matched Memories modal in child');
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // If we found the modal, add button and start refresh
+                            if (foundModal) {
+                                debugLog('[Memories] Memory Manager detected, starting auto-refresh');
+                                addManualRefreshButton(foundModal);
+                                styleLoadMoreButton(foundModal);
+                                startMemoryRefresh();
+                                break; // Stop processing this mutation batch
+                            }
+                        }
+                    }
+                    
+                    // Check for removed nodes to stop the interval if modal is closed
+                    for (const node of mutation.removedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            if (node.classList && node.classList.contains('fixed')) {
+                                const heading = node.querySelector?.('p.text-heading-6');
+                                if (heading && heading.textContent.trim() === 'Memories') {
+                                    debugLog('[Memories] Memory Manager removed from DOM');
+                                    stopMemoryRefresh();
+                                }
+                            }
+                        }
+                    }
+                }
+            }, 50); // 50ms debounce
+        });
+
+        memoryModalObserver.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        debugLog('[Memories] Memory Manager auto-refresh monitor initialized');
+    }
+    
+    // Initialize the memory modal monitor
+    monitorMemoryModal();
+    
+    // Check if Memory Manager is already open on page load
+    setTimeout(() => {
+        const existingModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2');
+        if (existingModal) {
+            const heading = existingModal.querySelector('p.text-heading-6');
+            if (heading && heading.textContent.trim() === 'Memories') {
+                debugLog('[Memories] Memory Manager already open on page load');
+                addManualRefreshButton(existingModal);
+                styleLoadMoreButton(existingModal);
+                startMemoryRefresh();
+            }
+        }
+    }, 2000);
+    
+    // Fallback: Periodically check for Memory Manager modal in case observer misses it
+    // This handles cases where React portals or complex DOM changes aren't caught
+    let memoryModalFallbackInterval = null;
+    let memoryModalFallbackActive = false;
+    
+    function startMemoryModalFallback() {
+        if (memoryModalFallbackInterval) return; // Already running
+
+        // Track whether the modal was present on the previous poll so we only
+        // act / log on transitions (open → present → closed) rather than every
+        // single tick. The previous version checked a `dataset.saiRefreshButton`
+        // flag that was never actually set, so every poll fell through to
+        // addManualRefreshButton + styleLoadMoreButton + startMemoryRefresh —
+        // each of which logged "already exists" / "auto-refresh disabled".
+        // Result: ~6 log lines per second of pure noise.
+        let modalPresentLastTick = false;
+
+        memoryModalFallbackInterval = setInterval(() => {
+            // Look for the Memory Manager modal using multiple selectors
+            let modal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2');
+            if (!modal) {
+                // Try alternate selectors
+                const allFixedModals = document.querySelectorAll('div.fixed');
+                for (const fixedDiv of allFixedModals) {
+                    const heading = fixedDiv.querySelector('p.text-heading-6');
+                    if (heading && heading.textContent.trim() === 'Memories') {
+                        modal = fixedDiv;
+                        break;
+                    }
+                }
+            }
+
+            // Confirm it's actually the Memory Manager modal (heading text match)
+            const isMemoryManager = modal &&
+                modal.querySelector('p.text-heading-6')?.textContent?.trim() === 'Memories';
+            const modalPresentNow = !!isMemoryManager;
+
+            if (modalPresentNow) {
+                // Only act when the modal first appears, OR if our button is
+                // missing (React may have torn it out after a re-render).
+                // Querying the actual button is the source of truth — no more
+                // relying on a dataset flag that nothing ever sets.
+                const buttonExists = !!modal.querySelector('[data-sai-refresh-button]');
+                if (!modalPresentLastTick || !buttonExists) {
+                    debugLog('[Memories] Memory Manager detected via fallback check' +
+                        (modalPresentLastTick ? ' (button missing — re-adding)' : ''));
+                    addManualRefreshButton(modal);
+                    styleLoadMoreButton(modal);
+                    if (!modalPresentLastTick) {
+                        startMemoryRefresh();
+                        memoryModalFallbackActive = true;
+                    }
+                }
+            } else if (modalPresentLastTick) {
+                // Modal was open but now closed
+                debugLog('[Memories] Memory Manager closed (fallback detection)');
+                stopMemoryRefresh();
+                memoryModalFallbackActive = false;
+            }
+
+            modalPresentLastTick = modalPresentNow;
+        }, 2000); // Check every 2 seconds — the primary MutationObserver catches
+                   // most transitions; this fallback only exists for React-portal
+                   // cases the observer misses, where a 2s delay is fine.
+
+        debugLog('[Memories] Memory Manager fallback checker started');
+    }
+    
+    // Start the fallback checker
+    startMemoryModalFallback();
+
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+    // ===                                                                       ===
+    // ===                      END OF INITIALIZATION                           ===
+    // ===                                                                       ===
+    // =============================================================================
+    // =============================================================================
+    // =============================================================================
+    
+    } // End of initializeMainCode function
+    
+    // =============================================================================
+    // NEW TAB AUTO-RELOAD - Handle race condition
+    // =============================================================================
+    // When middle-clicking to open a bot in a new tab, sometimes the page loads
+    // before our extension fully initializes. Detect this and auto-reload once.
+    // =============================================================================
+    
+    const RELOAD_FLAG_KEY = 'sai-toolkit-reloaded-for-init';
+    const hasAlreadyReloaded = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
 
     // =============================================================================
     // ===                    UPDATE NOTIFICATION MODAL                         ===
     // =============================================================================
     // Show update notification modal with changelog after extension update
+    // NOTE: This function must be defined OUTSIDE initializeMainCode so it can be
+    // called from checkForUpdateNotification (which also runs outside initializeMainCode)
     function showUpdateNotificationModal(version) {
-        debugLog('[Toolkit] Showing update notification for version:', version);
+        debugLog('[Core] Showing update notification for version:', version);
 
         // Get changelog data from global CHANGELOG object (defined at top of file)
         const changelogData = CHANGELOG[version] || {
             title: `Version ${version}`,
             date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-            features: ['Bug fixes and improvements']
+            features: ['Added customization for bot creator name under each bot message, as well as the option to hide it completely','Fixed bug with sidebar layout affeecting the lorebook page','Reduced number of DOM mutations by 90%, resulting in massive performance improvements (Thanks to Vegeta on Discord for troubleshooting)','Implemented fix for keyboard behavior on Firefox Android PWA (standalone display-mode)','Implemented Message Recovery (opt-in) feature which saves your message when SpicyChat\'s chat backend fails (502, CORS, network drop, timeout)']
         };
 
         // Create container with shadow DOM
@@ -10365,6 +15485,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const modalHeader = document.createElement('div');
         modalHeader.className = 'modal-header';
         
+        // Add "S.AI Toolkit updated!" at the top
+        const updateAnnouncement = document.createElement('div');
+        updateAnnouncement.style.cssText = 'font-size: 0.875rem; font-weight: 600; color: #3b82f6; margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;';
+        updateAnnouncement.textContent = 'S.AI Toolkit updated!';
+        
         const updateIcon = document.createElement('div');
         updateIcon.className = 'update-icon';
         updateIcon.textContent = '🎉';
@@ -10377,6 +15502,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         modalDate.className = 'modal-date';
         modalDate.textContent = changelogData.date;
         
+        modalHeader.appendChild(updateAnnouncement);
         modalHeader.appendChild(updateIcon);
         modalHeader.appendChild(modalTitle);
         modalHeader.appendChild(modalDate);
@@ -10426,7 +15552,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         async function closeModal() {
             // Mark this version as seen
             await storage.set('lastSeenVersion', version);
-            debugLog('[Toolkit] Update notification dismissed, marked version as seen:', version);
+            debugLog('[Core] Update notification dismissed, marked version as seen:', version);
 
             // Animate out
             backdrop.style.animation = 'fadeIn 0.2s ease-out reverse';
@@ -10444,2411 +15570,67 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         modal.addEventListener('click', (e) => e.stopPropagation());
     }
 
-    // Global error monitoring to track React crashes
-    window.addEventListener('error', async (event) => {
-        debugLog('[Toolkit] ===== GLOBAL ERROR DETECTED =====');
-        debugLog('[Toolkit] Error message:', event.message);
-        debugLog('[Toolkit] Error filename:', event.filename);
-        debugLog('[Toolkit] Error line:', event.lineno, 'col:', event.colno);
-        debugLog('[Toolkit] Error object:', event.error);
-        debugLog('[Toolkit] Stack trace:', event.error?.stack);
-        debugLog('[Toolkit] Time:', Date.now());
-    }, true);
-    
-    // Monitor unhandled promise rejections too
-    window.addEventListener('unhandledrejection', async (event) => {
-        debugLog('[Toolkit] ===== UNHANDLED PROMISE REJECTION =====');
-        debugLog('[Toolkit] Reason:', event.reason);
-        debugLog('[Toolkit] Promise:', event.promise);
-        debugLog('[Toolkit] Time:', Date.now());
-    });
-
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-    // ===                                                                       ===
-    // ===                     TOOLKIT SPECIFIC CODE - END                      ===
-    // ===                                                                       ===
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-
-
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-    // ===                                                                       ===
-    // ===                    INITIALIZATION & OBSERVERS                        ===
-    // ===                                                                       ===
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-
-    // CHECK ONBOARDING FIRST - before initializing anything else
-    // Get all storage to check if it's truly empty or has any toolkit settings
-    const allStorage = await (typeof browser !== 'undefined' ? browser : chrome).storage.local.get(null);
-    const storageKeys = Object.keys(allStorage);
-    
-    debugLog('[Toolkit] ===== ONBOARDING CHECK (BEFORE INIT) =====');
-    debugLog('[Toolkit] All storage keys:', storageKeys);
-    debugLog('[Toolkit] Storage contents:', allStorage);
-    
-    // Check if this is first run: no hasSeenOnboarding key OR it's explicitly false
-    // OR if Classic Style key is missing (indicates update from old version)
-    const hasSeenOnboarding = allStorage.hasSeenOnboarding;
-    const hasClassicStyleKey = CLASSIC_STYLE_KEY in allStorage;
-    const hasToolkitSettings = (
-        SIDEBAR_LAYOUT_KEY in allStorage ||
-        CLASSIC_LAYOUT_KEY in allStorage ||
-        CLASSIC_STYLE_KEY in allStorage ||
-        'enableThemeCustomization' in allStorage || // Legacy key
-        COMPACT_GENERATION_KEY in allStorage ||
-        HIDE_FOR_YOU_KEY in allStorage ||
-        PAGE_JUMP_KEY in allStorage
-    );
-    
-    debugLog('[Toolkit] Onboarding check - hasSeenOnboarding:', hasSeenOnboarding);
-    debugLog('[Toolkit] Onboarding check - hasClassicStyleKey:', hasClassicStyleKey);
-    debugLog('[Toolkit] Onboarding check - hasToolkitSettings:', hasToolkitSettings);
-    
-    // Show onboarding if: never seen before (undefined) OR explicitly false
-    // OR if user has settings but Classic Style key is missing (update scenario)
-    const shouldShowOnboarding = hasSeenOnboarding === undefined || 
-                                  hasSeenOnboarding === false ||
-                                  (hasToolkitSettings && !hasClassicStyleKey);
-    debugLog('[Toolkit] Should show onboarding?', shouldShowOnboarding);
-    
-    // Initialize styles on page load
-    await initializeStyles();
-    
-    // Expose a helper function to reset onboarding (for testing)
-    // Since content scripts can't expose functions to page context, we use custom events
-    window.addEventListener('SAI_RESET_ONBOARDING', async function() {
-        debugLog('[Toolkit] Reset onboarding event received');
-        // Clear the onboarding flag
-        await storage.remove('hasSeenOnboarding');
-        // Also clear all settings to simulate a truly fresh install
-        await storage.remove(SIDEBAR_LAYOUT_KEY);
-        await storage.remove(CLASSIC_LAYOUT_KEY);
-        await storage.remove(CLASSIC_STYLE_KEY);
-        await storage.remove('enableThemeCustomization'); // Legacy key
-        await storage.remove(COMPACT_GENERATION_KEY);
-        await storage.remove(HIDE_FOR_YOU_KEY);
-        await storage.remove(PAGE_JUMP_KEY);
-        await storage.remove('showGenerationStats');
-        await storage.remove('timestampDateFirst');
-        debugLog('[Toolkit] Onboarding and all settings reset! Reload the page to see the onboarding modal.');
-        setTimeout(() => location.reload(), 1000);
-    });
-    
-    // Note: resetSAIToolkitOnboarding() function is injected via page-context.js
-    
-    if (shouldShowOnboarding) {
-        debugLog('[Toolkit] First run detected - will show onboarding modal');
-        // Don't mark as seen yet - only mark when user clicks "Save & Refresh"
-        // Wait for page to fully load and toolkit icon to be injected before showing modal
-        setTimeout(() => {
-            debugLog('[Toolkit] Triggering onboarding modal...');
-            try {
-                showToolkitSettingsModal();
-            } catch (error) {
-                console.error('[Toolkit] Error showing onboarding modal:', error);
-            }
-        }, 3000); // Increased delay to ensure page is fully loaded
-    } else {
-        debugLog('[Toolkit] Not first run - skipping onboarding modal');
-    }
-
-    // Track button check interval to prevent multiple intervals (memory leak fix)
-    let buttonCheckInterval = null;
-
-    // Observe for modal appearance
-    const observer = new MutationObserver(function(mutations) {
-        // Look specifically for the Generation Settings modal (supports both old and new UI)
-        const modal = findGenerationSettingsModal();
-        
-        if (modal && !modal.querySelector('#profile-controls')) {
-            // Wait a bit for the modal to fully render
-            setTimeout(createProfileControls, 100);
-        }
-        
-        // Try to inject sidebar button (watches for sidebar to load)
-        injectToolkitSidebarButton();
-        
-        // Inject CSS to hide toolkit button text when sidebar is collapsed (only once)
-        if (!document.getElementById('sai-toolkit-button-css')) {
-            const toolkitButtonCSS = document.createElement('style');
-            toolkitButtonCSS.id = 'sai-toolkit-button-css';
-            toolkitButtonCSS.textContent = `
-/* Ensure tooltip wrapper doesn't break width */
-#sai-toolkit-sidebar-btn[data-tooltip-id],
-div.w-full > [data-tooltip-id]:has(#sai-toolkit-sidebar-btn) {
-    display: block !important;
-    width: 100%;
-}
-
-/* Hide S.AI Toolkit button text when sidebar is collapsed */
-nav[style*="width: 54px"] #sai-toolkit-sidebar-btn .toolkit-button-text,
-nav[style*="width: 54px"] #sai-toolkit-sidebar-btn p {
-    display: none !important;
-}
-
-/* Ensure text is visible when sidebar is expanded */
-nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn .toolkit-button-text,
-nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
-    display: inline !important;
-}
-`;
-            document.head.appendChild(toolkitButtonCSS);
-            debugLog('[Toolkit] Button CSS injected');
-        }
-        
-        // Try to inject mobile button (watches for Like button to appear)
-        injectToolkitMobileButton();
-        
-        // Try to inject chat export button (only on chat pages)
-        injectChatExportButton();
-        
-        // Try to inject NSFW toggle button (only on chat pages, after export button)
-        injectNSFWToggleButton();
-        
-        // Retry sidebar button injection with delays (in case sidebar loads later)
-        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
-            setTimeout(() => injectToolkitSidebarButton(), delay);
-        });
-        
-        // Retry mobile button injection with delays
-        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
-            setTimeout(() => injectToolkitMobileButton(), delay);
-        });
-        
-        // Retry export button injection with delays
-        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
-            setTimeout(() => injectChatExportButton(), delay);
-        });
-        
-        // Retry NSFW toggle button injection with delays
-        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
-            setTimeout(() => injectNSFWToggleButton(), delay);
-        });
-        
-        // Instead of heavy MutationObservers, use lightweight periodic checks
-        // Check every 2 seconds if buttons still exist and text element is present
-        // Only create interval once to prevent memory leak from multiple intervals
-        if (!buttonCheckInterval) {
-            buttonCheckInterval = setInterval(() => {
-            const sidebarButton = document.getElementById('sai-toolkit-sidebar-btn');
-            if (sidebarButton) {
-                // Check if text element exists, if not re-add it
-                const iconContainer = sidebarButton.querySelector('.flex.items-center.gap-2');
-                if (iconContainer && !iconContainer.querySelector('.toolkit-button-text')) {
-                    let textElement = document.createElement('p');
-                    textElement.className = 'font-sans text-decoration-skip-ink-none text-underline-position-from-font text-label-lg font-regular text-left truncate toolkit-button-text';
-                    textElement.textContent = 'S.AI Toolkit';
-                    iconContainer.appendChild(textElement);
-                    debugLog('[Toolkit] Text element re-added after React removed it');
-                }
-            } else {
-                // Button missing, try to re-inject
-                const helpIcon = document.querySelector('svg.lucide-info');
-                if (helpIcon) {
-                    injectToolkitSidebarButton();
-                }
-            }
-            
-            // Check mobile button
-            const mobileButton = document.getElementById('sai-toolkit-mobile-btn');
-            if (!mobileButton) {
-                const likeButton = document.querySelector('button[aria-label="ThumbsUp-button"]');
-                if (likeButton) {
-                    injectToolkitMobileButton();
-                }
-            }
-            
-            // Check export button (only on chat pages - case-insensitive)
-            if (window.location.pathname.toLowerCase().startsWith('/chat/')) {
-                const exportButton = document.getElementById('sai-export-btn');
-                if (!exportButton) {
-                    injectChatExportButton();
-                }
-
-                // Check NSFW toggle button
-                const nsfwButton = document.getElementById('sai-nsfw-btn');
-                if (!nsfwButton) {
-                    injectNSFWToggleButton();
-                }
-            }
-            }, TIMING.PERIODIC_CHECK); // Check periodically instead of on every DOM mutation
-        }
-    });
-
-    // Wait for body before starting observer (fixes middle-click new tab issue)
-    waitForBody().then((body) => {
-        debugLog('[Toolkit] document.body available, starting main observer');
-        observer.observe(body, {
-            childList: true,
-            subtree: true
-        });
-        
-        // Trigger initial button injection now that body exists
-        injectToolkitSidebarButton();
-        injectToolkitMobileButton();
-        injectChatExportButton();
-        injectNSFWToggleButton();
-        
-        // Also schedule retry attempts in case page content loads slowly
-        TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
-            setTimeout(() => {
-                injectToolkitSidebarButton();
-                injectToolkitMobileButton();
-                injectChatExportButton();
-                injectNSFWToggleButton();
-            }, delay);
-        });
-    }).catch((err) => {
-        console.error('[Toolkit] Failed to wait for body:', err);
-        // Last resort: try anyway after a delay
-        setTimeout(() => {
-            if (document.body) {
-                debugLog('[Toolkit] Retrying observer setup after error');
-                observer.observe(document.body, { childList: true, subtree: true });
-                injectToolkitSidebarButton();
-                injectToolkitMobileButton();
-                injectChatExportButton();
-                injectNSFWToggleButton();
-            }
-        }, 2000);
-    });
-
-    // Observer to add generation stats to messages
-    // Debounce to prevent excessive processing during rapid DOM changes
-    let statsProcessingTimeout = null;
-    let pendingMutations = false;
-    
-    const messageObserver = new MutationObserver(async function(mutations) {
-        // Quick check: Only process if we see relevant mutations (message wrappers)
-        let hasRelevantMutation = false;
-        for (const mutation of mutations) {
-            // Only care about added nodes that could be message wrappers
-            if (mutation.addedNodes.length > 0) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType === 1 && (node.classList?.contains('mb-lg') || node.querySelector?.('.mb-lg'))) {
-                        hasRelevantMutation = true;
-                        break;
-                    }
-                }
-            }
-            if (hasRelevantMutation) break;
-        }
-        
-        if (!hasRelevantMutation) return;
-        
-        // Debounce: Only process after 150ms of no mutations (Issue #12)
-        pendingMutations = true;
-        if (statsProcessingTimeout) {
-            clearTimeout(statsProcessingTimeout);
-        }
-        
-        statsProcessingTimeout = setTimeout(() => {
-            pendingMutations = false;
-            processMessagesForStats(true);
-        }, TIMING.MUTATION_DEBOUNCE);
-    });
-
-    // Special function to insert stats for a regenerated message
-    // This is needed because regenerations REPLACE the message content, not add a new element
-    // So processMessagesForStats can't find them by DOM index
-    // Note: statsInsertedForMessageIds and statsInsertionInProgress are defined earlier in the file
-    const statsFailedForWrappers = new WeakSet();      // Wrappers that failed ID extraction (prevents retries)
-    let lastConversationIdForStatsSet = null;
-
-    // Memory optimization: Maximum tracked message IDs to prevent unbounded growth
-    const MAX_STATS_TRACKING = 200;
-
-    // Helper to limit Set size - removes oldest entries when over limit
-    function limitSetSize(set, maxSize) {
-        if (set.size > maxSize) {
-            // Only remove enough to get back to maxSize (Sets maintain insertion order)
-            const excess = set.size - maxSize;
-            const iterator = set.values();
-            for (let i = 0; i < excess; i++) {
-                set.delete(iterator.next().value);
-            }
-        }
-    }
-    
-    // Sequential retry wrapper - prevents race conditions from browser timer throttling
-    // When a tab is in background, multiple setTimeout calls can fire at once on restore
-    async function insertStatsWithRetry(messageId, model, settings, createdAt, attempt = 1) {
-        const maxAttempts = 4;
-        // First attempt is immediate (0ms delay), then use increasing delays for retries
-        // This ensures we try to insert stats BEFORE processMessagesForStats runs (150ms debounce)
-        const delays = [0, 500, 1000, 1500]; // Delay before each attempt
-
-        if (attempt > maxAttempts) {
-            debugLog('[Stats RETRY] Max attempts reached for message:', messageId?.substring(0, 8));
-            // Decrement pending count since we're done trying (failed)
-            if (pendingNewMessageCount > 0) {
-                pendingNewMessageCount--;
-                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
-            }
-            return;
-        }
-
-        // Wait before attempting (first attempt is immediate with 0ms delay)
-        const delay = delays[attempt - 1] || 500;
-        if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-        
-        // Check if already successfully inserted (by this or another call)
-        if (statsInsertedForMessageIds.has(messageId)) {
-            debugLog('[Stats RETRY] Already inserted, stopping retries for:', messageId?.substring(0, 8));
-            // Decrement pending count since insertion is complete
-            if (pendingNewMessageCount > 0) {
-                pendingNewMessageCount--;
-                debugLog('[Stats RETRY] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
-            }
-            return;
-        }
-        
-        // Try to insert
-        const success = await insertStatsForRegeneratedMessage(messageId, model, settings, createdAt);
-        
-        // If failed and not yet inserted, retry
-        if (!success && !statsInsertedForMessageIds.has(messageId)) {
-            debugLog('[Stats RETRY] Attempt', attempt, 'failed, will retry for:', messageId?.substring(0, 8));
-            insertStatsWithRetry(messageId, model, settings, createdAt, attempt + 1);
-        }
-    }
-    
-    async function insertStatsForRegeneratedMessage(messageId, model, settings, createdAt) {
-        debugLog('[Stats REGEN] Attempting to insert stats for regenerated message:', messageId?.substring(0, 8));
-        
-        // Clear the sets if we're in a different conversation (handles page navigation)
-        if (currentConversationId && currentConversationId !== lastConversationIdForStatsSet) {
-            debugLog('[Stats REGEN] Conversation changed, clearing insertion tracking sets');
-            statsInsertedForMessageIds.clear();
-            statsInsertionInProgress.clear();
-            pendingNewMessageCount = 0; // Reset pending count on conversation change
-            lastConversationIdForStatsSet = currentConversationId;
-        }
-        
-        // Skip if already successfully inserted
-        if (statsInsertedForMessageIds.has(messageId)) {
-            debugLog('[Stats REGEN] Stats already inserted for this message ID, skipping');
-            return true; // Already done, consider it a success
-        }
-        
-        // Skip if another call is currently processing this message (prevents parallel execution)
-        if (statsInsertionInProgress.has(messageId)) {
-            debugLog('[Stats REGEN] Another call is already processing this message ID, skipping');
-            return false; // Let the other call handle it
-        }
-        
-        // Mark as in-progress to prevent parallel calls
-        statsInsertionInProgress.add(messageId);
-        
-        const cache = window.__toolkitStorageCache;
-        const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
-        const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
-        const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-
-        if (!statsEnabled && !timestampEnabled && !showMessageIds) {
-            debugLog('[Stats REGEN] Neither stats, timestamp, nor message IDs enabled, skipping');
-            // Remove from in-progress so future attempts can try again if settings change
-            statsInsertionInProgress.delete(messageId);
-            return true; // Not an error, just nothing to do
-        }
-        
-        // Find the message that's currently showing the latest regeneration
-        // Look for message bubbles and find the one with a version counter showing the highest version
-        const versionCounters = document.querySelectorAll('p.text-label-md');
-        let targetBubble = null;
-        let highestVersion = 0;
-        
-        for (const counter of versionCounters) {
-            const match = counter.textContent.trim().match(/^(\d+)\/(\d+)$/);
-            if (match) {
-                const currentVer = parseInt(match[1]);
-                const totalVer = parseInt(match[2]);
-                // We want the one showing the LATEST version (currentVer === totalVer)
-                if (currentVer === totalVer && totalVer > highestVersion) {
-                    highestVersion = totalVer;
-                    targetBubble = counter.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!targetBubble) {
-                        targetBubble = counter.closest('div[class*="px-\\[13px\\]"]');
-                    }
-                }
-            }
-        }
-        
-        // FALLBACK: If no version counter found (brand new message, not a regeneration),
-        // find the LAST bot message bubble in the chat (the newest one)
-        // First, try to find a message that matches our messageId directly
-        if (!targetBubble) {
-            debugLog('[Stats REGEN] No version counter found, trying to find last bot message bubble');
-            
-            // Try to find the message by data-message-id first (most reliable)
-            const messageByIdElement = document.querySelector(`[data-message-id="${messageId}"]`);
-            if (messageByIdElement) {
-                const wrapper = messageByIdElement.closest('div.w-full.flex.mb-lg');
-                if (wrapper) {
-                    targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!targetBubble) {
-                        targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
-                    }
-                    if (targetBubble) {
-                        debugLog('[Stats REGEN] Found message bubble by data-message-id:', messageId?.substring(0, 8));
-                    }
-                }
-            }
-            
-            // If still not found, fall back to last bot message
-            if (!targetBubble) {
-                // Find all message wrappers and get the last bot message
-                const allMessageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
-                for (let i = allMessageWrappers.length - 1; i >= 0; i--) {
-                    const wrapper = allMessageWrappers[i];
-                    // Check if this is a bot message (has character link)
-                    const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
-                    if (characterLink) {
-                        // This is a bot message - find its bubble
-                        targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
-                        if (!targetBubble) {
-                            targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
-                        }
-                        if (targetBubble) {
-                            debugLog('[Stats REGEN] Found last bot message bubble via fallback');
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        if (!targetBubble) {
-            debugLog('[Stats REGEN] Could not find target message bubble (neither version counter nor fallback worked)');
-            // Remove from in-progress so later retry attempts can try again
-            statsInsertionInProgress.delete(messageId);
-            return false;
-        }
-        
-        debugLog('[Stats REGEN] Found target bubble for message');
-
-        // Mark the message wrapper with the message ID so extractMessageId can find it
-        const messageWrapper = targetBubble.closest('div.w-full.flex.mb-lg');
-        if (messageWrapper) {
-            messageWrapper.dataset.messageId = messageId;
-            debugLog('[Stats REGEN] Marked message wrapper with data-message-id');
-        }
-
-        // Find the header container (supports both gap-md and gap-0)
-        const headerContainer = targetBubble.querySelector('div.flex.justify-between.items-center.gap-md, div.flex.justify-between.items-center.gap-0, div.flex.justify-between.items-center');
-        if (!headerContainer) {
-            debugLog('[Stats REGEN] Could not find header container');
-            // Remove from in-progress so later retry attempts can try again
-            statsInsertionInProgress.delete(messageId);
-            return false;
-        }
-        
-        // Check if stats already exist in DOM
-        let statsDiv = headerContainer.querySelector('.generation-stats');
-        
-        // Build display lines
-        let displayLines = [];
-        
-        // Get full stats from storage (has the flattened settings)
-        const fullStats = await getStatsForMessage(messageId);
-        debugLog('[Stats REGEN] Full stats from storage:', fullStats);
-        
-        const hasSettings = fullStats?.max_tokens !== null && fullStats?.max_tokens !== undefined;
-        const hasModel = fullStats?.model || model;
-        const hasTimestamp = fullStats?.timestamp || createdAt;
-        
-        if (statsEnabled && hasModel) {
-            let modelDisplay = fullStats?.model || model;
-            if (!showModelDetails && modelDisplay && modelDisplay.includes('→')) {
-                modelDisplay = modelDisplay.split('→')[0].trim();
-            }
-            
-            if (hasSettings) {
-                displayLines.push(modelDisplay);
-                displayLines.push(`Tokens: ${fullStats.max_tokens} | Temp: ${fullStats.temperature.toFixed(2)} | Top P: ${fullStats.top_p} | Top K: ${fullStats.top_k}`);
-            } else if (modelDisplay) {
-                displayLines.push(modelDisplay);
-            }
-        }
-        
-        if (timestampEnabled && hasTimestamp) {
-            const timestamp = await formatTimestamp(fullStats?.timestamp || createdAt);
-            if (timestamp) {
-                displayLines.push(timestamp);
-            }
-        }
-
-        if (showMessageIds && messageId) {
-            displayLines.push(`ID: ${messageId}`);
-        }
-
-        if (displayLines.length === 0) {
-            debugLog('[Stats REGEN] No displayable data');
-            // Remove from in-progress, allow retries (data might not be in storage yet)
-            statsInsertionInProgress.delete(messageId);
-            return false;
-        }
-        
-        const displayText = displayLines.join('<br>');
-        
-        if (!statsDiv) {
-            // Create new stats div
-            statsDiv = document.createElement('div');
-            statsDiv.className = 'generation-stats';
-            
-            // Check if we're in story mode for different positioning
-            const inStoryMode = isStoryMode();
-            
-            if (inStoryMode) {
-                // In story mode: position above the message, inside the container
-                statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                // Find the inner flex-col container and insert inside it
-                const innerContainer = headerContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
-                if (innerContainer) {
-                    // Insert stats as first child inside the container
-                    innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
-                } else {
-                    // Fallback: insert at the top of header
-                    headerContainer.insertBefore(statsDiv, headerContainer.firstChild);
-                }
-            } else {
-                // Normal mode: position to the right in the header
-                statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                
-                // Insert before the menu button container
-                const menuButtonContainer = headerContainer.querySelector('.relative');
-                if (menuButtonContainer) {
-                    headerContainer.insertBefore(statsDiv, menuButtonContainer);
-                    headerContainer.style.setProperty('gap', '4px', 'important');
-                } else {
-                    headerContainer.appendChild(statsDiv);
-                }
-            }
-        }
-        
-        // Set the content and version ID
-        statsDiv.dataset.versionId = messageId;
-        safeSetHTML(statsDiv, displayText);
-        
-        // Mark as successfully inserted (prevents future retries)
-        statsInsertedForMessageIds.add(messageId);
-        limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
-        // Remove from in-progress
-        statsInsertionInProgress.delete(messageId);
-        // Decrement pending count since insertion is complete
-        if (pendingNewMessageCount > 0) {
-            pendingNewMessageCount--;
-            debugLog('[Stats REGEN] Decremented pendingNewMessageCount to:', pendingNewMessageCount);
-        }
-
-        debugLog('[Stats REGEN] Successfully inserted/updated stats for regenerated message');
-        return true;
-    }
-
-    // Separate function to process messages (can be called multiple times)
-    // This unified function handles all stats injection to avoid duplication and inconsistency
-    // skipVersionCounterMessages: if true, skip messages with version counters (for new message handling)
-    //                             if false, process all messages (for initial page load)
-    async function processMessagesForStats(skipVersionCounterMessages = false) {
-        debugLog('[Stats DISPLAY] ========== processMessagesForStats CALLED ==========');
-        debugLog('[Stats DISPLAY] skipVersionCounterMessages:', skipVersionCounterMessages);
-        debugLog('[Stats DISPLAY] Call stack:', new Error().stack);
-        
-        // Use cached storage reads to reduce I/O (Issue #13)
-        const cache = window.__toolkitStorageCache;
-        const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
-        const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
-        const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-        const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-
-        debugLog('[Stats DISPLAY] Stats enabled:', statsEnabled, 'Timestamp enabled:', timestampEnabled, 'Model details:', showModelDetails, 'Message IDs:', showMessageIds);
-
-
-        // If none are enabled, no need to process
-        if (!statsEnabled && !timestampEnabled && !showMessageIds) return;
-        
-        const messageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
-
-        debugLog('[Stats] Found message wrappers:', messageWrappers.length);
-
-        // Calculate total messages in the combined index map
-        const totalMessages = Object.keys(messageIdToIndexMap).length;
-        debugLog('[Stats] Total messages in combined index map:', totalMessages);
-
-        // Calculate offset: if page shows fewer messages than stored, offset to the end
-        const messagesOnPage = messageWrappers.length;
-        const storageOffset = Math.max(0, totalMessages - messagesOnPage);
-        debugLog('[Stats] Messages on page:', messagesOnPage, 'Storage offset:', storageOffset);
-
-        // Process messages in reverse order (bottom to top, newest first)
-        // This ensures the most recent messages get correct stats even if there's an index issue
-        const wrappersArray = Array.from(messageWrappers).reverse();
-        let messageIndex = messagesOnPage - 1; // Start from the last message
-
-        for (const wrapper of wrappersArray) {
-            // Skip wrappers that we've already failed to extract IDs from
-            // This prevents endless retries on messages that don't have IDs yet
-            if (statsFailedForWrappers.has(wrapper)) {
-                debugLog('[Stats] Skipping wrapper that previously failed ID extraction');
-                messageIndex--;
-                continue;
-            }
-
-            // Check if this is a bot message (has character link) or user message
-            // In Story Mode, there's no chatbot link, so we need alternative detection
-            const characterLink = wrapper.querySelector('a[href^="/chatbot/"]');
-            let isBotMessage = !!characterLink;
-            
-            // Story Mode fallback: check for bot-specific UI elements or message styling
-            // Bot messages in Story Mode have different styling (e.g., rounded corners)
-            if (!isBotMessage && isStoryMode()) {
-                // In Story Mode, check message bubble styling to detect bot vs user
-                // Bot messages typically have left-aligned rounded corners, user has right-aligned
-                const messageBubble = wrapper.querySelector('.rounded-\\[4px_20px_20px_20px\\]');
-                if (messageBubble) {
-                    isBotMessage = true;
-                }
-            }
-            debugLog('[Stats] Processing message, isBotMessage:', isBotMessage, 'messageIndex:', messageIndex);
-
-            // Skip messages with version counters when processing new messages
-            // (they're handled by insertStatsForRegeneratedMessage in that case)
-            // But on initial page load, we need to process them here
-            const versionCounter = wrapper.querySelector('p.text-label-md');
-            const hasVersionCounter = versionCounter && /^\d+\/\d+$/.test(versionCounter.textContent.trim());
-            if (skipVersionCounterMessages && hasVersionCounter) {
-                debugLog('[Stats] Skipping message with version counter (handled by insertStatsForRegeneratedMessage)');
-                messageIndex--;
-                continue;
-            }
-            
-            // Update selector to match new DOM structure - action container has gap-0 and may have flex-row-reverse
-            const actionContainer = wrapper.querySelector('.flex.justify-between.items-center.gap-0, .flex.justify-between.items-center');
-            
-            if (!actionContainer) {
-                debugLog('[Stats] No action container found!');
-                messageIndex--;
-                continue;
-            }
-            
-            // Check if stats already exist
-            const existingStatsDiv = actionContainer.querySelector('.generation-stats');
-            if (existingStatsDiv) {
-                debugLog('[Stats] Found existing stats div');
-                
-                // OPTIMIZATION: If stats are marked as finalized (with arrow format), skip entirely
-                // This prevents unnecessary storage reads for every message on every mutation
-                if (actionContainer.dataset.statsFinalized === 'true') {
-                    debugLog('[Stats] Stats already finalized, skipping without storage check');
-                    messageIndex--;
-                    continue;
-                }
-                
-                // Check if we need to update the stats (e.g., from partial to full model format)
-                if (isBotMessage) {
-                    let messageId = extractMessageId(wrapper);
-                    debugLog('[Stats] Bot message, messageId:', messageId);
-                    
-                    // Try fallback to index map if extraction failed
-                    if (!messageId) {
-                        // Calculate the correct index: page shows newest messages, so offset from end of storage
-                        // Use cached storageOffset calculated at start of function
-                        const correctedIndex = storageOffset + messageIndex;
-                        
-                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
-                            messageId = messageIdToIndexMap[correctedIndex];
-                            debugLog('[Stats] Using fallback messageId from index map:', messageId);
-                        }
-                    }
-                    
-                    if (messageId) {
-                        const latestStats = await getStatsForMessage(messageId);
-                        debugLog('[Stats] Latest stats from storage:', latestStats);
-                        if (latestStats?.model && latestStats.model.includes('→')) {
-                            // We have full format in storage but need to check if it's displayed
-                            const existingText = existingStatsDiv.textContent;
-                            if (DEBUG_MODE) {
-                                console.log('[Stats] Storage has arrow format:', latestStats.model);
-                                console.log('[Stats] Display shows:', existingText);
-                            }
-                            if (!existingText.includes('→')) {
-                                // Stats are outdated - remove and re-insert
-                                debugLog('[Stats] OUTDATED! Removing old stats div and re-inserting...');
-                                existingStatsDiv.remove();
-                                // Don't skip - let it fall through to re-insert
-                            } else {
-                                // Mark as finalized so we don't check again
-                                actionContainer.dataset.statsFinalized = 'true';
-                                debugLog('[Stats] Stats already up-to-date, marking as finalized');
-                                messageIndex--;
-                                continue;
-                            }
-                        } else {
-                            debugLog('[Stats] Storage does not have arrow format, skipping update');
-                            debugLog('[Stats] Stats already present, skipping');
-                            messageIndex--;
-                            continue;
-                        }
-                    } else {
-                        debugLog('[Stats] No messageId extracted, skipping');
-                        debugLog('[Stats] Stats already present, skipping');
-                        messageIndex--;
-                        continue;
-                    }
-                } else {
-                    debugLog('[Stats] User message, skipping');
-                    debugLog('[Stats] Stats already present, skipping');
-                    messageIndex--;
-                    continue;
-                }
-            }
-            
-            if (actionContainer.dataset.statsProcessing) {
-                debugLog('[Stats] Already being processed (race condition), skipping');
-                messageIndex--;
-                continue;
-            }
-            
-            // Mark as processing immediately to prevent race conditions
-            actionContainer.dataset.statsProcessing = 'true';
-            
-            // Wrap entire processing in try/catch to ensure cleanup on errors
-            try {
-                // In Story Mode, we may misdetect bot messages as user messages due to DOM differences
-                // We'll do a preliminary check here and potentially correct isBotMessage later based on stored role
-                let effectiveIsBotMessage = isBotMessage;
-                
-                // Story Mode: If we can extract a messageId and check its role, use that for detection
-                if (!isBotMessage && isStoryMode()) {
-                    let preCheckMessageId = extractMessageId(wrapper);
-                    if (!preCheckMessageId) {
-                        const correctedIndex = storageOffset + messageIndex;
-                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
-                            preCheckMessageId = messageIdToIndexMap[correctedIndex];
-                        }
-                    }
-                    if (preCheckMessageId) {
-                        const preCheckStats = await getStatsForMessage(preCheckMessageId);
-                        // If role is 'bot' OR we have generation settings (max_tokens), treat as bot message
-                        if (preCheckStats?.role === 'bot' || (preCheckStats?.max_tokens !== null && preCheckStats?.max_tokens !== undefined)) {
-                            effectiveIsBotMessage = true;
-                            debugLog('[Stats] Story Mode: Corrected isBotMessage to true based on stored role/stats');
-                        }
-                    }
-                }
-                
-                if (effectiveIsBotMessage) {
-                // Bot message - show full stats
-                let messageId = extractMessageId(wrapper);
-                
-                if (DEBUG_MODE) {
-                    console.log('[Stats DISPLAY] ========== PROCESSING BOT MESSAGE ==========');
-                    console.log('[Stats DISPLAY] Extracted messageId:', messageId);
-                    console.log('[Stats DISPLAY] messageIndex:', messageIndex);
-                    console.log('[Stats DISPLAY] hasVersionCounter:', hasVersionCounter);
-                }
-                
-                // For messages with version counters, find the correct message ID from alternativeMessageGroups
-                // based on which version is currently being displayed
-                if (hasVersionCounter && versionCounter) {
-                    const versionMatch = versionCounter.textContent.trim().match(/^(\d+)\/(\d+)$/);
-                    if (versionMatch) {
-                        const currentVersion = parseInt(versionMatch[1]);
-                        const totalVersions = parseInt(versionMatch[2]);
-                        debugLog('[Stats] Message has version counter:', currentVersion, '/', totalVersions);
-                        
-                        // Find the alternative group that matches this total version count
-                        for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
-                            if (alternatives.length === totalVersions) {
-                                // Found matching group - get the message ID for the current version
-                                const targetIndex = currentVersion - 1; // versions are 1-indexed
-                                if (targetIndex >= 0 && targetIndex < alternatives.length) {
-                                    messageId = alternatives[targetIndex].id;
-                                    debugLog('[Stats] Found message ID from alternativeMessageGroups:', messageId?.substring(0, 8));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                // Calculate the correct index: page shows newest messages, so offset from end of storage
-                if (!messageId) {
-                    // Use cached storageOffset calculated at start of function
-                    const correctedIndex = storageOffset + messageIndex;
-                    
-                    if (DEBUG_MODE) {
-                        console.log('[Stats DISPLAY] Fallback - correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
-                    }
-                    debugLog('[Stats] Extracted messageId:', messageId, 'messageIndex:', messageIndex, 'correctedIndex:', correctedIndex, 'map has:', messageIdToIndexMap[correctedIndex]);
-                    if (messageIdToIndexMap[correctedIndex] !== undefined) {
-                        messageId = messageIdToIndexMap[correctedIndex];
-                        if (DEBUG_MODE) {
-                            console.log('[Stats DISPLAY] Using mapped messageId:', messageId);
-                        }
-                        debugLog('[Stats] Using mapped messageId:', messageId);
-                    }
-                }
-                
-                if (DEBUG_MODE) {
-                    console.log('[Stats DISPLAY] Final messageId to lookup:', messageId);
-                }
-                
-                // Skip if this message was already handled or is being handled by insertStatsWithRetry
-                // This prevents duplicate stats when both paths try to insert
-                if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
-                    debugLog('[Stats DISPLAY] Message already handled or in progress by insertStatsForRegeneratedMessage, skipping');
-                    delete actionContainer.dataset.statsProcessing;
-                    messageIndex--;
-                    continue;
-                }
-                
-                let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                if (DEBUG_MODE) {
-                    console.log('[Stats DISPLAY] Retrieved from storage:', generationStats);
-                    console.log('[Stats DISPLAY] Timestamp from storage:', generationStats?.timestamp);
-                    console.log('[Stats DISPLAY] Timestamp as Date:', generationStats?.timestamp ? new Date(generationStats.timestamp).toISOString() : 'null');
-                }
-                debugLog('[Stats] Got stats from storage:', generationStats);
-                if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
-                if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
-                debugLog('[Stats] Final stats:', generationStats);
-                
-                if (!generationStats) {
-                    debugLog('[Stats] No stats found, skipping message');
-                    // If we couldn't extract a messageId, mark this wrapper as failed
-                    // to prevent endless retries on every mutation
-                    // BUT: Only mark as failed if there are no pending new messages
-                    // New messages may not have their data-message-id set yet
-                    if (!messageId && pendingNewMessageCount === 0) {
-                        statsFailedForWrappers.add(wrapper);
-                        debugLog('[Stats] Marked wrapper as failed (no message ID)');
-                    } else if (!messageId) {
-                        debugLog('[Stats] Not marking wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
-                    }
-                    // Clear the processing flag so it can be retried later if messageId becomes available
-                    delete actionContainer.dataset.statsProcessing;
-                    messageIndex--;
-                    continue;
-                }
-                
-                debugLog('[Stats] Creating stats div...');
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'generation-stats';
-                
-                // Check if we're in story mode for different positioning
-                const inStoryMode = isStoryMode();
-                
-                if (inStoryMode) {
-                    // In story mode: position above the message
-                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                } else {
-                    // Normal mode: position to the right in the header
-                    statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                }
-                
-                // Add data-version-id to prevent being hidden by the regeneration switcher CSS
-                if (messageId) {
-                    statsDiv.dataset.versionId = messageId;
-                }
-                
-                debugLog('[Stats] Checking stats content:', generationStats);
-                
-                // Check for model and settings (new flat format with max_tokens)
-                const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
-                const hasModel = generationStats.model;
-                const hasTimestamp = generationStats.timestamp;
-                
-                // Build display components based on settings
-                let displayLines = [];
-                
-                if (statsEnabled && hasSettings && hasModel) {
-                    debugLog('[Stats] Has full stats with settings');
-                    const maxTokens = generationStats.max_tokens;
-                    const temperature = generationStats.temperature;
-                    const topP = generationStats.top_p;
-                    const topK = generationStats.top_k;
-                    
-                    // Process model name based on showModelDetails setting
-                    let modelDisplay = generationStats.model;
-                    if (!showModelDetails && modelDisplay.includes('→')) {
-                        // Truncate to just the requested model (before the arrow)
-                        modelDisplay = modelDisplay.split('→')[0].trim();
-                    }
-
-                    displayLines.push(modelDisplay);
-                    displayLines.push(`Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`);
-                }
-                
-                if (timestampEnabled && hasTimestamp) {
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    if (DEBUG_MODE) {
-                        console.log('[Stats DISPLAY] Formatted timestamp:', timestamp);
-                        console.log('[Stats DISPLAY] Input to formatTimestamp was:', generationStats.timestamp);
-                    }
-                    if (timestamp) {
-                        displayLines.push(timestamp);
-                    }
-                }
-
-                if (showMessageIds && messageId) {
-                    displayLines.push(`ID: ${messageId}`);
-                }
-
-                // If we have nothing to display, skip
-                if (displayLines.length === 0) {
-                    debugLog('[Stats] No displayable data, skipping');
-                    delete actionContainer.dataset.statsProcessing;
-                    messageIndex--;
-                    continue;
-                }
-                
-                // Join lines with <br>
-                const displayText = displayLines.join('<br>');
-                safeSetHTML(statsDiv, displayText);
-                if (DEBUG_MODE) {
-                    console.log('[Stats DISPLAY] Stats div content:', statsDiv.textContent);
-                }
-                debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
-                
-                // Insert positioning based on story mode
-                if (inStoryMode) {
-                    // In story mode: insert INSIDE the message container as first child
-                    // This keeps the stats within the same width constraints as the message
-                    const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
-                    if (innerContainer) {
-                        // Insert stats as first child inside the flex-col container
-                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%;';
-                        innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
-                        if (DEBUG_MODE) {
-                            console.log('[Stats DISPLAY] ========== INSERTING STATS DIV (STORY MODE) ==========');
-                            console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
-                            console.log('[Stats DISPLAY] Inserted inside message container as first child');
-                        }
-                    } else {
-                        // Fallback: insert in action container
-                        actionContainer.appendChild(statsDiv);
-                    }
-                } else {
-                    // Normal mode: insert in the action container header
-                    const menuButtonContainer = actionContainer.querySelector('.relative');
-                    debugLog('[Stats] Menu button container:', menuButtonContainer);
-                    if (menuButtonContainer) {
-                        if (DEBUG_MODE) {
-                            console.log('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
-                            console.log('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
-                            console.log('[Stats DISPLAY] Inserting into action container');
-                        }
-                        debugLog('[Stats] Inserting stats div...');
-                        actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                        actionContainer.style.setProperty('gap', '4px', 'important');
-                    } else {
-                        actionContainer.appendChild(statsDiv);
-                    }
-                }
-                
-                // Mark this message as having stats inserted to prevent duplicates
-                if (messageId) {
-                    statsInsertedForMessageIds.add(messageId);
-                    limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
-                    debugLog('[Stats] Added messageId to statsInsertedForMessageIds:', messageId);
-                }
-                
-                // OPTIMIZATION: Mark stats as finalized if they have arrow format
-                // This prevents unnecessary storage checks on future mutations
-                if (generationStats.model && generationStats.model.includes('→')) {
-                    actionContainer.dataset.statsFinalized = 'true';
-                    debugLog('[Stats] Marked stats as finalized (has arrow format)');
-                }
-                
-                delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                if (DEBUG_MODE) {
-                    console.log('[Stats DISPLAY] Stats div inserted! Final content:', statsDiv.textContent);
-                    console.log('[Stats DISPLAY] Stats div is in DOM:', document.contains(statsDiv));
-                    console.log('[Stats DISPLAY] ===========================================');
-                }
-                debugLog('[Stats] Stats div inserted successfully!');
-
-                messageIndex--;
-            } else {
-                // User message - show only timestamp if enabled
-                if (!timestampEnabled) {
-                    delete actionContainer.dataset.statsProcessing;
-                    messageIndex--;
-                    continue;
-                }
-                
-                let messageId = extractMessageId(wrapper);
-                debugLog('[Stats] User message - extracted messageId:', messageId, 'messageIndex:', messageIndex);
-                    
-                    // Fallback to combined index map if extraction failed
-                    if (!messageId) {
-                        const correctedIndex = storageOffset + messageIndex;
-                        if (messageIdToIndexMap[correctedIndex] !== undefined) {
-                            messageId = messageIdToIndexMap[correctedIndex];
-                            debugLog('[Stats] User message - using fallback from combined index map:', messageId);
-                        }
-                    }
-                    
-                    let generationStats = messageId ? await getStatsForMessage(messageId) : null;
-                    debugLog('[Stats] User message - generationStats:', generationStats);
-                    
-                    // Skip if this message was already handled or is being handled
-                    if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
-                        debugLog('[Stats] User message already handled or in progress, skipping');
-                        delete actionContainer.dataset.statsProcessing;
-                        messageIndex--;
-                        continue;
-                    }
-
-                    // Only display if we have a valid timestamp
-                    if (!generationStats?.timestamp) {
-                        debugLog('[Stats] User message - no timestamp, skipping');
-                        // If we couldn't extract a messageId, mark this wrapper as failed
-                        // BUT: Only mark as failed if there are no pending new messages
-                        if (!messageId && pendingNewMessageCount === 0) {
-                            statsFailedForWrappers.add(wrapper);
-                            debugLog('[Stats] Marked user message wrapper as failed (no message ID)');
-                        } else if (!messageId) {
-                            debugLog('[Stats] Not marking user wrapper as failed - there are', pendingNewMessageCount, 'pending new messages');
-                        }
-                        delete actionContainer.dataset.statsProcessing;
-                        messageIndex--;
-                        continue;
-                    }
-
-                    const timestamp = await formatTimestamp(generationStats.timestamp);
-                    if (!timestamp) {
-                        delete actionContainer.dataset.statsProcessing;
-                        messageIndex--;
-                        continue;
-                    }
-
-                    // Create timestamp div for user messages
-                    const statsDiv = document.createElement('div');
-                    statsDiv.className = 'generation-stats';
-                    
-                    // Check if we're in story mode for different positioning
-                    const inStoryMode = isStoryMode();
-                    
-                    if (inStoryMode) {
-                        // In story mode: position above the message
-                        statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 8px; width: 100%; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                    } else {
-                        // Normal mode: position to the right in the header
-                        statsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                    }
-                    
-                    // Add data-version-id to prevent being hidden by the regeneration switcher CSS
-                    if (messageId) {
-                        statsDiv.dataset.versionId = messageId;
-                    }
-
-                    // Build display content for user messages
-                    let displayLines = [timestamp];
-
-                    // Add message ID if enabled
-                    if (showMessageIds && messageId) {
-                        displayLines.push(`ID: ${messageId}`);
-                    }
-
-                    safeSetHTML(statsDiv, displayLines.join('<br>'));
-                    
-                    // Insert positioning based on story mode
-                    if (inStoryMode) {
-                        // In story mode: insert INSIDE the message container as first child
-                        const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
-                        if (innerContainer) {
-                            // Insert stats as first child inside the container
-                            innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
-                            // Mark this message as having stats inserted
-                            if (messageId) {
-                                statsInsertedForMessageIds.add(messageId);
-                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
-                            }
-                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                            debugLog('[Stats] User message - timestamp inserted successfully (story mode)');
-                        } else {
-                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                        }
-                    } else {
-                        // Normal mode: insert in the action container header
-                        const menuButtonContainer = actionContainer.querySelector('.relative');
-                        if (menuButtonContainer) {
-                            actionContainer.insertBefore(statsDiv, menuButtonContainer);
-                            actionContainer.style.setProperty('gap', '4px', 'important');
-                            // Mark this message as having stats inserted
-                            if (messageId) {
-                                statsInsertedForMessageIds.add(messageId);
-                                limitSetSize(statsInsertedForMessageIds, MAX_STATS_TRACKING); // Memory optimization
-                            }
-                            delete actionContainer.dataset.statsProcessing; // Remove flag after successful insertion
-                            debugLog('[Stats] User message - timestamp inserted successfully');
-                        } else {
-                            delete actionContainer.dataset.statsProcessing; // Remove flag if insertion fails
-                        }
-                    }
-                    messageIndex--;
-                }
-            } catch (error) {
-                // Ensure cleanup on any error during stats processing
-                console.error('[Toolkit] Error processing message stats:', error);
-                delete actionContainer.dataset.statsProcessing;
-                messageIndex--;
-            }
-        }
-    }
-
-    // Initialize: Build index map from stored stats for imported/old messages
-    debugLog('[Stats] About to call buildIndexMapFromStats...');
-    buildIndexMapFromStats()
-        .then(() => {
-            debugLog('[Stats] Initialization complete, starting message observer');
-        })
-        .catch((error) => {
-            console.error('[Stats] Error building index map:', error);
-        });
-
-    // Wait for body before starting message observer (fixes middle-click new tab issue)
-    waitForBody().then((body) => {
-        debugLog('[Stats] document.body available, starting message observer');
-        messageObserver.observe(body, {
-            childList: true,
-            subtree: true
-        });
-    }).catch((err) => {
-        console.error('[Stats] Failed to wait for body:', err);
-        // Retry after a delay
-        setTimeout(() => {
-            if (document.body) {
-                debugLog('[Stats] Retrying message observer setup after error');
-                messageObserver.observe(document.body, { childList: true, subtree: true });
-            }
-        }, 2000);
-    });
-
-    // Periodic check to ensure stats are inserted even if mutations are missed
-    // DISABLED FOR DEBUGGING - flooding logs
-    /*
-    setInterval(async () => {
-        const statsEnabled = await storage.get('showGenerationStats', false);
-        if (statsEnabled) {
-            processMessagesForStats();
-        }
-    }, 2000); // Check every 2 seconds
-    */
-
-    // Alias for backward compatibility - both names call the same unified function
-    const insertStatsForAllMessages = processMessagesForStats;
-
-    // Initial check for existing messages after page load
-    debugLog('[Stats] Scheduling initial check at', TIMING.INITIAL_STATS_CHECK, 'ms');
-    setTimeout(insertStatsForAllMessages, TIMING.INITIAL_STATS_CHECK);
-    
-    // Also check again after a longer delay in case messages load slowly
-    debugLog('[Stats] Scheduling delayed check at', TIMING.DELAYED_STATS_CHECK, 'ms');
-    setTimeout(insertStatsForAllMessages, TIMING.DELAYED_STATS_CHECK);
-
-    // =============================================================================
-    // ===          REGENERATION SWITCHER HANDLER (Stats Update)               ===
-    // =============================================================================
-    // When user switches between message regenerations (< 1/2 > buttons or arrow keys),
-    // update the displayed stats to match the currently visible version
-    
-    // Shared function to handle version switch stats update
-    async function handleVersionSwitch(currentVersion, totalVersions, isNext) {
-        // Calculate the NEW version number after the switch
-        let newVersion;
-        if (isNext) {
-            newVersion = currentVersion < totalVersions ? currentVersion + 1 : currentVersion;
-        } else {
-            newVersion = currentVersion > 1 ? currentVersion - 1 : currentVersion;
-        }
-        
-        debugLog('[Toolkit] Version change:', currentVersion, '->', newVersion);
-        
-        // If version didn't change (button was disabled), do nothing
-        if (newVersion === currentVersion) {
-            debugLog('[Toolkit] Version unchanged, skipping');
-            return;
-        }
-        
-        // IMMEDIATELY inject CSS to hide any stats div that React might create
-        // This prevents flicker by hiding React's stats divs at the CSS level
-        let hideStyle = document.getElementById('sai-hide-react-stats');
-        if (!hideStyle) {
-            hideStyle = document.createElement('style');
-            hideStyle.id = 'sai-hide-react-stats';
-            document.head.appendChild(hideStyle);
-        }
-        hideStyle.textContent = '.generation-stats:not([data-version-id]) { display: none !important; }';
-        
-        // Wait for React to update the DOM with the new message version
-        // Use a shorter delay for faster response
-        setTimeout(async () => {
-            debugLog('[Toolkit] === INSIDE SETTIMEOUT - STARTING VERSION SWITCH HANDLER ===');
-            
-            // The counter element is likely detached by React after the version switch
-            // Instead, we search the LIVE DOM for the version switcher showing the NEW version
-            const versionText = `${newVersion}/${totalVersions}`;
-            debugLog('[Toolkit] Searching for version text:', versionText);
-            
-            let liveStatsDiv = null;
-            let liveHeaderContainer = null;
-            let messageBubble = null;
-            
-            // Find the paragraph showing our target version (e.g., "2/2")
-            const allParagraphs = document.querySelectorAll('p.text-label-md');
-            for (const p of allParagraphs) {
-                if (p.textContent.trim() === versionText) {
-                    debugLog('[Toolkit] Found version text paragraph in LIVE DOM');
-                    
-                    // Navigate up to the message bubble
-                    // The bubble has classes: flex flex-col ... gap-md ... px-[13px] ... rounded-[...]  bg-gray-4
-                    messageBubble = p.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!messageBubble) {
-                        // Fallback: try finding by px-[13px] which is unique to message bubbles
-                        messageBubble = p.closest('div[class*="px-\\[13px\\]"]');
-                    }
-                    
-                    if (messageBubble) {
-                        debugLog('[Toolkit] Message bubble found:', messageBubble.className.substring(0, 80));
-                        
-                        // Find the header container (has gap-md AND justify-between items-center)
-                        liveHeaderContainer = messageBubble.querySelector('div.flex.justify-between.items-center.gap-md');
-                        debugLog('[Toolkit] Header container found:', !!liveHeaderContainer);
-                        
-                        if (liveHeaderContainer) {
-                            liveStatsDiv = liveHeaderContainer.querySelector('.generation-stats');
-                            debugLog('[Toolkit] Stats div in header:', !!liveStatsDiv);
-                        }
-                    }
-                    break;
-                }
-            }
-            
-            // If we couldn't find the header container, we can't proceed
-            if (!liveHeaderContainer) {
-                debugLog('[Toolkit] Could not find header container, aborting');
-                return;
-            }
-            
-            // Try to find the message ID from our alternative groups
-            let newMessageId = null;
-            
-            // Method 3: Fall back to matching by version count (works if counts are unique)
-            // alternativeMessageGroups[prev_id] contains ALL versions including the original (v1)
-            // so alternatives.length === totalVersions
-            if (!newMessageId) {
-                debugLog('[Toolkit] Trying to match by version count:', totalVersions);
-                debugLog('[Toolkit] Available groups:', Object.entries(alternativeMessageGroups).map(([k, v]) => 
-                    `${k.substring(0, 8)}: ${v.length} versions [${v.map(m => m.id.substring(0, 8)).join(', ')}]`
-                ));
-                for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
-                    if (alternatives.length === totalVersions) {
-                        const targetIndex = newVersion - 1;
-                        debugLog('[Toolkit] Found group by count match! prev_id:', prevId.substring(0, 8));
-                        debugLog('[Toolkit] Alternatives in group:', alternatives.map((m, i) => `v${i+1}=${m.id.substring(0, 8)}`));
-                        debugLog('[Toolkit] Target index:', targetIndex, 'for newVersion:', newVersion);
-                        if (targetIndex >= 0 && targetIndex < alternatives.length) {
-                            newMessageId = alternatives[targetIndex].id;
-                            debugLog('[Toolkit] Selected message ID:', newMessageId.substring(0, 8));
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            if (!newMessageId) {
-                debugLog('[Toolkit] Could not determine message ID after version switch');
-                return;
-            }
-            
-            debugLog('[Toolkit] Final message ID for lookup:', newMessageId.substring(0, 8));
-            debugLog('[Toolkit] messageTimestamps has this ID?', !!messageTimestamps[newMessageId]);
-            debugLog('[Toolkit] messageTimestamps[newMessageId]:', messageTimestamps[newMessageId]);
-            debugLog('[Toolkit] All messageTimestamps keys:', Object.keys(messageTimestamps).map(k => k.substring(0, 8)));
-            
-            // Get the stats for this specific message version
-            // Note: getStatsForMessage automatically uses the API timestamp from messageTimestamps
-            const generationStats = await getStatsForMessage(newMessageId);
-            debugLog('[Toolkit] Stats lookup result:', generationStats ? 'found' : 'not found', generationStats);
-            debugLog('[Toolkit] Stats timestamp after getStatsForMessage:', generationStats?.timestamp, '→', generationStats?.timestamp ? new Date(generationStats.timestamp).toLocaleString() : 'null');
-            
-            if (!generationStats) {
-                debugLog('[Toolkit] No stats found for message:', newMessageId);
-                // Clear existing stats if present
-                if (liveStatsDiv) {
-                    liveStatsDiv.textContent = '';
-                }
-                return;
-            }
-            
-            // Get current settings
-            const cache = window.__toolkitStorageCache;
-            const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
-            const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
-            const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-            const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-
-            debugLog('[Toolkit] Settings:', { statsEnabled, timestampEnabled, showModelDetails, showMessageIds });
-            
-            // Build updated display
-            let displayLines = [];
-            
-            const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
-            const hasModel = generationStats.model;
-            const hasTimestamp = generationStats.timestamp;
-            
-            if (statsEnabled && hasSettings && hasModel) {
-                let modelDisplay = generationStats.model;
-                if (!showModelDetails && modelDisplay.includes('→')) {
-                    modelDisplay = modelDisplay.split('→')[0].trim();
-                }
-                displayLines.push(modelDisplay);
-                displayLines.push(`Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`);
-            }
-            
-            if (timestampEnabled && hasTimestamp) {
-                const timestamp = await formatTimestamp(generationStats.timestamp);
-                if (timestamp) {
-                    displayLines.push(timestamp);
-                }
-            }
-
-            if (showMessageIds && newMessageId) {
-                displayLines.push(`ID: ${newMessageId}`);
-            }
-
-            debugLog('[Toolkit] Display lines:', displayLines);
-            
-            if (displayLines.length > 0) {
-                const displayText = displayLines.join('<br>');
-                
-                // Use the liveStatsDiv and liveHeaderContainer we found earlier via versionCounterElement
-                // These were found by navigating from the clicked version counter
-                
-                // FIRST: Remove any stats divs that React created (they don't have our data-version-id)
-                // This prevents flicker by cleaning up before we add/update ours
-                if (liveHeaderContainer) {
-                    const reactStatsDivs = liveHeaderContainer.querySelectorAll('.generation-stats:not([data-version-id])');
-                    reactStatsDivs.forEach(div => div.remove());
-                }
-                
-                // If no stats div exists but we have a header container, create one
-                if (!liveStatsDiv && liveHeaderContainer) {
-                    debugLog('[Toolkit] No stats div found, creating new one in header container');
-                    liveStatsDiv = document.createElement('div');
-                    liveStatsDiv.className = 'generation-stats';
-                    liveStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                    
-                    // Insert before the menu button container
-                    const menuButtonContainer = liveHeaderContainer.querySelector('.relative');
-                    if (menuButtonContainer) {
-                        liveHeaderContainer.insertBefore(liveStatsDiv, menuButtonContainer);
-                        liveHeaderContainer.style.setProperty('gap', '4px', 'important');
-                    } else {
-                        liveHeaderContainer.appendChild(liveStatsDiv);
-                    }
-                }
-                
-                if (!liveStatsDiv) {
-                    debugLog('[Toolkit] ERROR: Could not find or create any live stats div to update!');
-                    return;
-                }
-                
-                debugLog('[Toolkit] BEFORE update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
-                debugLog('[Toolkit] Stats div is in document:', document.body.contains(liveStatsDiv));
-                
-                // Apply the update
-                liveStatsDiv.dataset.versionId = newMessageId;
-                safeSetHTML(liveStatsDiv, displayText);
-                
-                // IMPORTANT: Remove any duplicate stats divs in this header
-                // React might have created another one, or we might have created a duplicate
-                const allStatsDivsInHeader = liveHeaderContainer.querySelectorAll('.generation-stats');
-                debugLog('[Toolkit] Stats divs in header after update:', allStatsDivsInHeader.length);
-                if (allStatsDivsInHeader.length > 1) {
-                    // Keep only the first one (ours), remove the rest
-                    for (let i = 1; i < allStatsDivsInHeader.length; i++) {
-                        debugLog('[Toolkit] Removing duplicate stats div');
-                        allStatsDivsInHeader[i].remove();
-                    }
-                }
-                
-                debugLog('[Toolkit] AFTER update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
-                debugLog('[Toolkit] Updated stats display!');
-                
-                // React re-renders aggressively, so we need to keep re-applying our update
-                // Use a MutationObserver to watch for React replacing the stats div
-                const reapplyStats = () => {
-                    // Find the message bubble containing our version switcher
-                    const allVersionSwitchers = document.querySelectorAll('p.text-label-md');
-                    for (const switcher of allVersionSwitchers) {
-                        if (switcher.textContent.trim() === `${newVersion}/${totalVersions}`) {
-                            // Found the switcher, find the message bubble
-                            const msgBubble = switcher.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                            if (msgBubble) {
-                                const headerContainer = msgBubble.querySelector('div.flex.justify-between.items-center.gap-md');
-                                if (headerContainer) {
-                                    // First, remove any React-created stats divs (without our data-version-id)
-                                    const reactStatsDivs = headerContainer.querySelectorAll('.generation-stats:not([data-version-id])');
-                                    reactStatsDivs.forEach(div => div.remove());
-                                    
-                                    let allStatsDivs = headerContainer.querySelectorAll('.generation-stats');
-                                    
-                                    // If no stats div exists AT ALL, CREATE one
-                                    if (allStatsDivs.length === 0) {
-                                        debugLog('[Toolkit] reapplyStats: No stats div found, creating new one');
-                                        const newStatsDiv = document.createElement('div');
-                                        newStatsDiv.className = 'generation-stats';
-                                        newStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                                        newStatsDiv.dataset.versionId = newMessageId;
-                                        safeSetHTML(newStatsDiv, displayText);
-                                        
-                                        // Insert before the menu button container
-                                        const menuButtonContainer = headerContainer.querySelector('.relative');
-                                        if (menuButtonContainer) {
-                                            headerContainer.insertBefore(newStatsDiv, menuButtonContainer);
-                                            headerContainer.style.setProperty('gap', '4px', 'important');
-                                        } else {
-                                            headerContainer.appendChild(newStatsDiv);
-                                        }
-                                    } else {
-                                        // Stats div exists - update it if needed
-                                        const statsDiv = allStatsDivs[0];
-                                        if (statsDiv.dataset.versionId !== newMessageId) {
-                                            debugLog('[Toolkit] reapplyStats: Updating existing stats div');
-                                            statsDiv.dataset.versionId = newMessageId;
-                                            safeSetHTML(statsDiv, displayText);
-                                        }
-                                        
-                                        // Remove any duplicates
-                                        for (let i = 1; i < allStatsDivs.length; i++) {
-                                            allStatsDivs[i].remove();
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                };
-                
-                // Set up a temporary MutationObserver to catch React re-renders
-                const observer = new MutationObserver((mutations) => {
-                    reapplyStats();
-                });
-                
-                // Watch the entire chat container for changes
-                const chatContainer = document.querySelector('[class*="flex-col"][class*="items-center"]') || document.body;
-                observer.observe(chatContainer, { 
-                    childList: true, 
-                    subtree: true,
-                    characterData: true
-                });
-                
-                // Also do periodic checks for the next 2 seconds (longer duration)
-                const checkInterval = setInterval(reapplyStats, 50); // More frequent checks
-                
-                // Clean up after 2 seconds
-                setTimeout(() => {
-                    observer.disconnect();
-                    clearInterval(checkInterval);
-                    // Remove the hide-React-stats CSS rule - our stats div is stable now
-                    const hideStyle = document.getElementById('sai-hide-react-stats');
-                    if (hideStyle) {
-                        hideStyle.textContent = '';
-                    }
-                    debugLog('[Toolkit] Stopped watching for React re-renders');
-                }, 2000);
-            } else {
-                // No displayable content, clear stats div
-                if (liveStatsDiv) {
-                    liveStatsDiv.textContent = '';
-                }
-                // Remove the hide-React-stats CSS rule
-                const hideStyle = document.getElementById('sai-hide-react-stats');
-                if (hideStyle) {
-                    hideStyle.textContent = '';
-                }
-                debugLog('[Toolkit] No displayable content, cleared stats div');
-            }
-        }, 50); // Reduced from 200ms to 50ms for faster response
-    }
-    
-    // Click handler for regeneration switcher buttons
-    document.addEventListener('click', async (e) => {
-        // Check if click was on a regeneration switcher button (prev/next chevron)
-        const button = e.target.closest('button[aria-label="previous"], button[aria-label="next"]');
-        if (!button) return;
-        
-        // Verify it's the regeneration switcher (has sibling with X/Y format)
-        const container = button.closest('.flex.items-center');
-        if (!container) return;
-        
-        const counterText = container.querySelector('p');
-        if (!counterText || !/^\d+\/\d+$/.test(counterText.textContent.trim())) return;
-        
-        // Parse the CURRENT version before the click updates the UI
-        const [currentVersion, totalVersions] = counterText.textContent.trim().split('/').map(Number);
-        const isNext = button.getAttribute('aria-label') === 'next';
-        
-        debugLog('[Toolkit] Regeneration switcher clicked!', {
-            button: button.getAttribute('aria-label'),
-            currentVersion,
-            totalVersions,
-            alternativeGroupsCount: Object.keys(alternativeMessageGroups).length
-        });
-        
-        await handleVersionSwitch(currentVersion, totalVersions, isNext);
-    }, true); // Use capture phase to catch event early
-    
-    // Keyboard handler for arrow keys (left/right) to switch regeneration versions
-    document.addEventListener('keydown', async (e) => {
-        // Only handle left/right arrow keys
-        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-        
-        // Don't interfere if user is typing in an input or textarea
-        const activeElement = document.activeElement;
-        if (activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.isContentEditable)) {
-            return;
-        }
-        
-        // Find all version switchers on the page
-        const versionSwitchers = document.querySelectorAll('p.text-label-md');
-        let foundSwitcher = null;
-        let currentVersion = 0;
-        let totalVersions = 0;
-        
-        for (const switcher of versionSwitchers) {
-            const match = switcher.textContent.trim().match(/^(\d+)\/(\d+)$/);
-            if (match) {
-                currentVersion = parseInt(match[1]);
-                totalVersions = parseInt(match[2]);
-                foundSwitcher = switcher;
-                break; // Use the first version switcher found
-            }
-        }
-        
-        if (!foundSwitcher || totalVersions <= 1) {
-            return; // No version switcher or only one version
-        }
-        
-        const isNext = e.key === 'ArrowRight';
-        
-        // Check if the version would actually change
-        if (isNext && currentVersion >= totalVersions) return;
-        if (!isNext && currentVersion <= 1) return;
-        
-        debugLog('[Toolkit] Arrow key pressed for version switch!', {
-            key: e.key,
-            currentVersion,
-            totalVersions,
-            alternativeGroupsCount: Object.keys(alternativeMessageGroups).length
-        });
-        
-        await handleVersionSwitch(currentVersion, totalVersions, isNext);
-    }, true); // Use capture phase
-
-    // Initial check in case modal is already open
-    setTimeout(createProfileControls, 1000);
-
-    // =============================================================================
-    // ===                   MEMORY MANAGER AUTO-REFRESH                        ===
-    // =============================================================================
-    
-    let memoryRefreshInterval = null;
-    
-    /**
-     * Extracts conversation ID from current URL
-     */
-    function getConversationId() {
-        // Use the conversation ID captured from the messages GET request
-        // This is more reliable than parsing the URL
-        return currentConversationId;
-    }
-    
-    /**
-     * Fetches fresh memory data from the API by injecting into page context
-     */
-    async function refreshMemoryContent() {
-        debugLog('[S.AI] Refreshing Memory Manager content via API...');
-        
-        // Find the Memories modal specifically by its unique z-index
-        // Use Array.from to check all modals and find the one with "Memories" heading
-        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
-        let memoryModal = null;
-        
-        for (const modal of allModals) {
-            const heading = modal.querySelector('p.text-heading-6');
-            if (heading && heading.textContent.trim() === 'Memories') {
-                memoryModal = modal;
-                break;
-            }
-        }
-        
-        if (!memoryModal) {
-            debugLog('[S.AI] Memory modal not found');
-            return false;
-        }
-        
-        // Get conversation ID from captured API data
-        const conversationId = getConversationId();
-        if (!conversationId) {
-            debugLog('[S.AI] Could not get conversation ID (not yet captured from messages API)');
-            return false;
-        }
-        debugLog('[S.AI] Using conversation ID:', conversationId);
-        
-        try {
-            // Inject a script into the page context to make the fetch request
-            // This bypasses CORS restrictions that content scripts face
-            // We need to get the auth token from localStorage or the page's fetch interceptor
-            const script = document.createElement('script');
-            script.textContent = `
-                (async function() {
-                    try {
-                        // Try to get the auth token and other required headers
-                        let authToken = null;
-                        let guestUserId = null;
-                        let country = null;
-                        
-                        try {
-                            // Method 1: Check if we captured the Kinde access token from OAuth refresh
-                            if (window.__kindeAccessToken) {
-                                authToken = window.__kindeAccessToken;
-                                debugLog('[S.AI] Using captured Kinde access token');
-                            }
-                            
-                            // Method 2: Check intercepted headers from API calls
-                            if (window.__lastAuthHeaders) {
-                                if (!authToken && window.__lastAuthHeaders.Authorization) {
-                                    authToken = window.__lastAuthHeaders.Authorization.replace('Bearer ', '');
-                                    debugLog('[S.AI] Using intercepted Authorization header');
-                                }
-                                if (!guestUserId && window.__lastAuthHeaders['X-Guest-UserId']) {
-                                    guestUserId = window.__lastAuthHeaders['X-Guest-UserId'];
-                                }
-                                if (!country && window.__lastAuthHeaders['X-Country']) {
-                                    country = window.__lastAuthHeaders['X-Country'];
-                                }
-                            }
-                            
-                            // Method 3: Search localStorage for token (fallback)
-                            if (!authToken) {
-                                for (const key of Object.keys(localStorage)) {
-                                    try {
-                                        const value = localStorage.getItem(key);
-                                        if (!value) continue;
-                                        
-                                        // Try parsing as JSON
-                                        if (value.startsWith('{') || value.startsWith('[')) {
-                                            const parsed = JSON.parse(value);
-                                            
-                                            // Look for auth token
-                                            if (!authToken && (parsed.access_token || parsed.accessToken || parsed.token)) {
-                                                authToken = parsed.access_token || parsed.accessToken || parsed.token;
-                                            }
-                                            
-                                            // Look for user ID
-                                            if (!guestUserId && (parsed.userId || parsed.user_id || parsed.id)) {
-                                                guestUserId = parsed.userId || parsed.user_id || parsed.id;
-                                            }
-                                        } else if (!authToken && value.startsWith('eyJ')) {
-                                            // Raw JWT token
-                                            authToken = value;
-                                        }
-                                    } catch (e) {}
-                                }
-                            }
-                            
-                            debugLog('[S.AI] Auth check - Token:', !!authToken, 'UserId:', !!guestUserId, 'Country:', !!country);
-                            
-                        } catch (e) {
-                            console.warn('[S.AI] Could not retrieve auth data:', e);
-                        }
-                        
-                        const headers = {
-                            'Accept': 'application/json, text/plain, */*',
-                            'X-App-Id': 'spicychat'
-                        };
-                        
-                        if (authToken) {
-                            headers['Authorization'] = \`Bearer \${authToken}\`;
-                        }
-                        
-                        if (guestUserId) {
-                            headers['X-Guest-UserId'] = guestUserId;
-                        }
-                        
-                        if (country) {
-                            headers['X-Country'] = country;
-                        }
-                        
-                        const response = await fetch('https://prod.nd-api.com/conversations/${conversationId}/memories', {
-                            method: 'GET',
-                            headers: headers,
-                            credentials: 'include'
-                        });
-                        
-                        if (response.ok) {
-                            const memories = await response.json();
-                            window.dispatchEvent(new CustomEvent('memoryDataFetched', {
-                                detail: { success: true, memories: memories, count: memories.length }
-                            }));
-                        } else {
-                            window.dispatchEvent(new CustomEvent('memoryDataFetched', {
-                                detail: { 
-                                    success: false, 
-                                    status: response.status, 
-                                    hasAuth: !!authToken,
-                                    hasUserId: !!guestUserId,
-                                    hasCountry: !!country
-                                }
-                            }));
-                        }
-                    } catch (error) {
-                        window.dispatchEvent(new CustomEvent('memoryDataFetched', {
-                            detail: { success: false, error: error.message }
-                        }));
-                    }
-                })();
-            `;
-            
-            // Set up listener for the response
-            const responsePromise = new Promise((resolve) => {
-                const handler = (event) => {
-                    window.removeEventListener('memoryDataFetched', handler);
-                    resolve(event.detail);
-                };
-                window.addEventListener('memoryDataFetched', handler);
-                
-                // Timeout after 10 seconds
-                setTimeout(() => {
-                    window.removeEventListener('memoryDataFetched', handler);
-                    resolve({ success: false, error: 'timeout' });
-                }, 10000);
-            });
-            
-            // Inject and execute the script
-            document.documentElement.appendChild(script);
-            script.remove();
-            
-            // Wait for the response
-            const result = await responsePromise;
-            
-            if (!result.success) {
-                console.error('[S.AI] Failed to fetch memories:', result.status || result.error);
-                if (result.status === 401) {
-                    console.error('[S.AI] Authentication failed - token may be invalid or expired. Auth token present:', result.hasAuth);
-                }
-                return false;
-            }
-            
-            debugLog(`[S.AI] Fetched ${result.count} memories from API`);
-            
-            // Try multiple approaches to trigger React re-render
-            debugLog('[S.AI] Attempting to trigger React re-render...');
-            debugLog('[S.AI] Memory modal element:', memoryModal);
-            
-            // NEW Approach: Try to find and click the "Load More Memories" button
-            const loadMoreButton = Array.from(memoryModal.querySelectorAll('button'))
-                .find(btn => btn.textContent?.includes('Load More'));
-            
-            if (loadMoreButton) {
-                debugLog('[S.AI] Found Load More button, clicking it');
-                loadMoreButton.click();
-                await new Promise(resolve => setTimeout(resolve, 500));
-                debugLog('[S.AI] Load More clicked, checking if memories updated');
-                // The button click might trigger a refetch which would update the UI
-                // Fall through to close/reopen if this doesn't work
-            }
-            
-            // Approach 1: Find React component and manipulate state directly
-            try {
-                // Try the modal itself first
-                let elementToCheck = memoryModal;
-                let depth = 0;
-                
-                while (elementToCheck && depth < 5) {
-                    const allKeys = Object.keys(elementToCheck);
-                    const reactKeys = allKeys.filter(key => 
-                        key.startsWith('__react') || key.includes('react') || key.includes('fiber')
-                    );
-                    
-                    if (reactKeys.length > 0) {
-                        debugLog('[S.AI] Found React keys at depth', depth, ':', reactKeys);
-                        
-                        const reactKey = reactKeys[0];
-                        const reactObj = elementToCheck[reactKey];
-                        
-                        // Walk the fiber tree
-                        let current = reactObj;
-                        let attempts = 0;
-                        while (current && attempts < 30) {
-                            if (current.stateNode && typeof current.stateNode.forceUpdate === 'function') {
-                                debugLog('[S.AI] Found forceUpdate at level', attempts, '- calling it');
-                                current.stateNode.forceUpdate();
-                                await new Promise(resolve => setTimeout(resolve, 1000));
-                                debugLog('[S.AI] Memory refresh completed (via forceUpdate)');
-                                return true;
-                            }
-                            current = current.return;
-                            attempts++;
-                        }
-                        break;
-                    }
-                    
-                    elementToCheck = elementToCheck.parentElement;
-                    depth++;
-                }
-                
-                debugLog('[S.AI] No React fiber found after checking', depth, 'parent levels');
-            } catch (e) {
-                console.error('[S.AI] React manipulation failed:', e);
-            }
-            
-            // Approach 2: Close and reopen (most reliable)
-            debugLog('[S.AI] Attempting close/reopen approach...');
-            
-            // Try multiple close button selectors - use aria-label="X-button"
-            let closeButton = memoryModal.querySelector('button[aria-label="X-button"]');
-            if (!closeButton) {
-                closeButton = memoryModal.querySelector('button[aria-label="Close"]');
-            }
-            if (!closeButton) {
-                // Look for button with X icon
-                const buttons = Array.from(memoryModal.querySelectorAll('button'));
-                debugLog('[S.AI] Searching through', buttons.length, 'buttons for close button');
-                closeButton = buttons.find(btn => {
-                    const svg = btn.querySelector('svg');
-                    if (!svg) return false;
-                    // Close buttons typically have an X icon with crossing paths
-                    const paths = svg.querySelectorAll('path');
-                    return paths.length >= 2;
-                });
-            }
-            
-            if (closeButton) {
-                debugLog('[S.AI] Found close button, closing modal...');
-                
-                // TRICK: Create a simple invisible placeholder div to hold the sidebar space
-                // This is cleaner than opening Generation Settings
-                let placeholderDiv = null;
-                
-                // Check if Generation Settings is already open
-                const allModals = Array.from(document.querySelectorAll('div.fixed'));
-                const hasGenerationSettings = allModals.some(modal => {
-                    const heading = modal.querySelector('p.text-heading-6');
-                    return heading && heading.textContent.includes('Generation Settings');
-                });
-                
-                if (!hasGenerationSettings) {
-                    debugLog('[S.AI] Creating invisible placeholder to hold sidebar space');
-                    
-                    // Create a simple placeholder that looks like a sidebar to the layout engine
-                    placeholderDiv = document.createElement('div');
-                    placeholderDiv.id = 'sai-sidebar-placeholder';
-                    placeholderDiv.style.cssText = `
-                        position: fixed;
-                        top: 0;
-                        right: 0;
-                        width: 400px;
-                        height: 100vh;
-                        pointer-events: none;
-                        z-index: 1;
-                        background: transparent;
-                    `;
-                    
-                    document.body.appendChild(placeholderDiv);
-                    debugLog('[S.AI] Placeholder div created');
-                }
-                
-                // Now close the Memories modal
-                closeButton.click();
-                closeButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                closeButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-                closeButton.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-                
-                // Wait just long enough for close
-                await new Promise(resolve => setTimeout(resolve, 50));
-                
-                // Reopen quickly - search more thoroughly for the Memory Manager button
-                debugLog('[S.AI] Looking for Memory Manager button to reopen...');
-                
-                // First, try to find and open the chat dropdown menu
-                const menuButton = document.querySelector('button[aria-label="chat-dropdown"]');
-                if (menuButton) {
-                    debugLog('[S.AI] Found chat dropdown menu button, opening it...');
-                    menuButton.click();
-                    await new Promise(resolve => setTimeout(resolve, 30));
-                } else {
-                    debugLog('[S.AI] Chat dropdown button not found');
-                }
-                
-                // Try multiple selectors for the Manage Memories button
-                debugLog('[S.AI] Looking for Manage Memories button...');
-                let memoryButton = document.querySelector('button[aria-label="Manage Memories"]');
-                debugLog('[S.AI] Direct selector result:', !!memoryButton);
-                
-                if (!memoryButton) {
-                    // Look through all buttons for one with "Manage Memories" text
-                    const allButtons = Array.from(document.querySelectorAll('button'));
-                    debugLog('[S.AI] Searching through', allButtons.length, 'buttons on page');
-                    
-                    const memoryButtons = allButtons.filter(btn => {
-                        const text = btn.textContent || '';
-                        const ariaLabel = btn.getAttribute('aria-label') || '';
-                        return text.toLowerCase().includes('manage memor') || ariaLabel.toLowerCase().includes('manage memor');
-                    });
-                    
-                    debugLog('[S.AI] Found', memoryButtons.length, 'buttons with "manage memor" in text/aria-label');
-                    if (memoryButtons.length > 0) {
-                        memoryButtons.forEach((btn, i) => {
-                            debugLog(`[S.AI] Memory button ${i}:`, {
-                                text: btn.textContent?.substring(0, 50),
-                                ariaLabel: btn.getAttribute('aria-label'),
-                                visible: btn.offsetParent !== null,
-                                displayed: window.getComputedStyle(btn).display !== 'none'
-                            });
-                        });
-                    }
-                    
-                    // Use the first one found
-                    memoryButton = memoryButtons[0];
-                }
-                
-                if (memoryButton) {
-                    debugLog('[S.AI] Found Memory Manager button:', memoryButton.textContent || memoryButton.getAttribute('aria-label'));
-                    memoryButton.click();
-                    
-                    // Wait a moment for the modal to reopen and re-style the Load More button
-                    setTimeout(() => {
-                        // Find the reopened Memories modal by checking all modals
-                        const allModals = document.querySelectorAll('div.fixed.left-1\\/2.top-1\\/2');
-                        let reopenedModal = null;
-                        
-                        for (const modal of allModals) {
-                            const heading = modal.querySelector('p.text-heading-6');
-                            if (heading && heading.textContent.trim() === 'Memories') {
-                                reopenedModal = modal;
-                                break;
-                            }
-                        }
-                        
-                        if (reopenedModal) {
-                            styleLoadMoreButton(reopenedModal);
-                        }
-                        
-                        // Remove the placeholder div if we created one
-                        if (placeholderDiv) {
-                            placeholderDiv.remove();
-                            debugLog('[S.AI] Removed placeholder div');
-                        }
-                    }, 500);
-                    
-                    debugLog('[S.AI] Memory refresh completed (via close/reopen)');
-                    return true;
-                } else {
-                    debugLog('[S.AI] Could not find Memory Manager button to reopen');
-                    debugLog('[S.AI] Tried aria-label and text content searches');
-                }
-            } else {
-                debugLog('[S.AI] Could not find close button');
-                // Log the modal structure to help debug
-                debugLog('[S.AI] Modal HTML structure:', memoryModal.outerHTML.substring(0, 500));
-            }
-            
-            // Clean up overlay and spacer if they still exist
-            const overlay = document.getElementById('sai-refresh-overlay');
-            const spacer = document.getElementById('sai-refresh-spacer');
-            if (overlay) overlay.remove();
-            if (spacer) spacer.remove();
-            
-            debugLog('[S.AI] All refresh approaches attempted');
-            return true;
-            
-        } catch (error) {
-            console.error('[S.AI] Error refreshing memories:', error);
-            
-            // Clean up placeholder div if it exists
-            if (placeholderDiv) {
-                placeholderDiv.remove();
-                debugLog('[S.AI] Removed placeholder div after error');
-            }
-            
-            return false;
-        }
-    }
-    
-    /**
-     * Starts the auto-refresh interval for the Memory Manager modal
-     * DISABLED: Auto-refresh is currently disabled to prevent issues
-     */
-    function startMemoryRefresh() {
-        // Auto-refresh disabled - use manual refresh button instead
-        debugLog('[S.AI] Memory Manager auto-refresh is disabled');
-        return;
-        
-        // Clear any existing interval first
-        if (memoryRefreshInterval) {
-            clearInterval(memoryRefreshInterval);
-        }
-        
-        debugLog('[S.AI] Memory Manager auto-refresh started (120 seconds)');
-        
-        // Set up interval to refresh every 120 seconds
-        memoryRefreshInterval = setInterval(() => {
-            // Check if modal is still open
-            const memoryModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2[class*="z-\\[900000\\]"]');
-            if (memoryModal) {
-                const memoryHeading = memoryModal.querySelector('p.text-heading-6');
-                if (memoryHeading && memoryHeading.textContent.trim() === 'Memories') {
-                    refreshMemoryContent();
-                } else {
-                    // Modal is open but it's not the Memory Manager, stop the interval
-                    debugLog('[S.AI] Memory Manager closed, stopping auto-refresh');
-                    clearInterval(memoryRefreshInterval);
-                    memoryRefreshInterval = null;
-                }
-            } else {
-                // Modal is no longer open, stop the interval
-                debugLog('[S.AI] Memory Manager closed, stopping auto-refresh');
-                clearInterval(memoryRefreshInterval);
-                memoryRefreshInterval = null;
-            }
-        }, 120000); // 120 seconds = 120000 milliseconds
-    }
-    
-    /**
-     * Stops the auto-refresh interval
-     */
-    function stopMemoryRefresh() {
-        if (memoryRefreshInterval) {
-            clearInterval(memoryRefreshInterval);
-            memoryRefreshInterval = null;
-            debugLog('[S.AI] Memory Manager auto-refresh stopped');
-        }
-    }
-    
-    /**
-     * Adds a manual refresh button to the Memory Manager modal
-     */
-    function addManualRefreshButton(modal) {
-        // Mark modal as being processed to prevent duplicate calls
-        if (modal.dataset.saiButtonProcessing) {
-            debugLog('[S.AI] Refresh button already being added');
-            return;
-        }
-        modal.dataset.saiButtonProcessing = 'true';
-        
-        // Check if button already exists
-        if (modal.querySelector('[data-sai-refresh-button]')) {
-            debugLog('[S.AI] Refresh button already exists');
-            delete modal.dataset.saiButtonProcessing;
-            return;
-        }
-        
-        // Wait a bit for React to fully render the modal buttons
-        setTimeout(() => {
-            // Find the button container (with the + and ... buttons)
-            const buttonContainer = modal.querySelector('.flex.justify-end.items-undefined.m-0');
-            if (!buttonContainer) {
-                debugLog('[S.AI] Could not find button container in Memory Manager');
-                debugLog('[S.AI] Trying alternate selectors...');
-                
-                // Try finding any flex container with buttons
-                const altContainer = modal.querySelector('.flex.justify-end');
-                if (altContainer) {
-                    debugLog('[S.AI] Found alternate container:', altContainer.className);
-                } else {
-                    debugLog('[S.AI] No button container found at all');
-                }
-                return;
-            }
-            
-            debugLog('[S.AI] Found button container:', buttonContainer.className);
-            debugLog('[S.AI] Container children:', buttonContainer.children.length);
-            
-            // Find the + button (first button with lucide-square-plus SVG)
-            let addButton = buttonContainer.querySelector('svg.lucide-square-plus')?.closest('button');
-            
-            // If not found, try alternate approach
-            if (!addButton) {
-                debugLog('[S.AI] Trying alternate add button selector...');
-                // Look for any button in the container
-                const buttons = buttonContainer.querySelectorAll('button');
-                debugLog('[S.AI] Found buttons:', buttons.length);
-                
-                if (buttons.length > 0) {
-                    // Assume first button is the add button
-                    addButton = buttons[0];
-                    debugLog('[S.AI] Using first button as reference');
-                } else {
-                    debugLog('[S.AI] No buttons found in container');
-                    debugLog('[S.AI] Container HTML:', buttonContainer.outerHTML.substring(0, 500));
-                    return;
-                }
-            }
-            
-            debugLog('[S.AI] Found reference button, creating refresh button');
-            
-            // Create refresh button with the same styling as existing buttons
-            const refreshButton = document.createElement('button');
-            refreshButton.setAttribute('data-sai-refresh-button', 'true');
-            refreshButton.className = addButton.className; // Copy exact classes from add button
-            refreshButton.type = 'button';
-            refreshButton.title = 'Refresh memories';
-            refreshButton.setAttribute('default', '');
-            refreshButton.innerHTML = `
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-refresh-cw inline-flex items-center justify-center">
-                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                    <path d="M21 3v5h-5"></path>
-                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                    <path d="M3 21v-5h5"></path>
-                </svg>
-                <span class="flex items-center justify-center text-center gap-1.5"></span>
-            `;
-            
-            // Add click handler
-            refreshButton.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                
-                debugLog('[S.AI] Manual refresh triggered');
-                
-                // Visual feedback - spin the icon
-                const svg = refreshButton.querySelector('svg');
-                if (svg) {
-                    svg.style.transition = 'transform 0.5s ease';
-                    svg.style.transform = 'rotate(360deg)';
-                    setTimeout(() => {
-                        svg.style.transform = 'rotate(0deg)';
-                    }, 500);
-                }
-                
-                // Trigger refresh
-                await refreshMemoryContent();
-            });
-            
-            // Insert before the add button
-            buttonContainer.insertBefore(refreshButton, addButton);
-            
-            debugLog('[S.AI] Manual refresh button added to Memory Manager');
-            debugLog('[S.AI] Button visible in DOM:', !!modal.querySelector('[data-sai-refresh-button]'));
-            delete modal.dataset.saiButtonProcessing;
-        }, 500); // Wait 500ms for React to render
-    }
-    
-    /**
-     * Styles the "Load More Memories" button when sidebar layout is enabled
-     */
-    function styleLoadMoreButton(memoryModal) {
-        if (!memoryModal) return;
-        
-        const applyStyles = () => {
-            // Find the Load More Memories button
-            const buttons = memoryModal.querySelectorAll('button');
-            const loadMoreButton = Array.from(buttons).find(btn => 
-                btn.textContent?.includes('Load More Memories')
-            );
-            
-            if (loadMoreButton && !loadMoreButton.dataset.saiStyled) {
-                // Use !important to override React's inline styles
-                loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
-                loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
-                loadMoreButton.dataset.saiStyled = 'true';
-                debugLog('[S.AI] Styled Load More Memories button for sidebar layout');
-                
-                // Watch for attribute changes in case React resets the style
-                const buttonObserver = new MutationObserver(() => {
-                    if (!loadMoreButton.style.marginTop || !loadMoreButton.style.marginBottom) {
-                        loadMoreButton.style.setProperty('margin-top', '0.5rem', 'important');
-                        loadMoreButton.style.setProperty('margin-bottom', '1.5rem', 'important');
-                    }
-                });
-                
-                buttonObserver.observe(loadMoreButton, {
-                    attributes: true,
-                    attributeFilter: ['style']
-                });
-                
-                return true; // Success
-            }
-            return false; // Button not found yet
-        };
-        
-        // Try immediately
-        if (!applyStyles()) {
-            // Button not rendered yet, wait and try again
-            setTimeout(() => {
-                if (!applyStyles()) {
-                    // Still not found, set up observer to watch for it
-                    const modalObserver = new MutationObserver((mutations) => {
-                        if (applyStyles()) {
-                            modalObserver.disconnect();
-                        }
-                    });
-                    
-                    modalObserver.observe(memoryModal, {
-                        childList: true,
-                        subtree: true
-                    });
-                    
-                    // Disconnect after 5 seconds to avoid memory leak
-                    setTimeout(() => modalObserver.disconnect(), 5000);
-                }
-            }, 500);
-        }
-    }
-    
-    /**
-     * Monitors for Memory Manager modal opening
-     */
-    // Store observer reference to prevent duplicate observers (memory leak fix)
-    let memoryModalObserver = null;
-
-    function monitorMemoryModal() {
-        // Disconnect existing observer if any to prevent accumulation
-        if (memoryModalObserver) {
-            memoryModalObserver.disconnect();
-        }
-
-        memoryModalObserver = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        let foundModal = null;
-                        
-                        // Check if this is the Memory Manager modal
-                        if (node.classList && node.classList.contains('fixed')) {
-                            const heading = node.querySelector('p.text-heading-6');
-                            if (heading && heading.textContent.trim() === 'Memories') {
-                                foundModal = node;
-                            }
-                        }
-                        
-                        // Also check children in case modal was added in a container
-                        if (!foundModal) {
-                            const memoryModal = node.querySelector?.('div.fixed p.text-heading-6');
-                            if (memoryModal && memoryModal.textContent.trim() === 'Memories') {
-                                foundModal = node.querySelector('div.fixed');
-                            }
-                        }
-                        
-                        // If we found the modal, add button and start refresh
-                        if (foundModal) {
-                            debugLog('[S.AI] Memory Manager detected, starting auto-refresh');
-                            addManualRefreshButton(foundModal);
-                            styleLoadMoreButton(foundModal);
-                            startMemoryRefresh();
-                            break; // Stop processing this mutation batch
-                        }
-                    }
-                }
-                
-                // Check for removed nodes to stop the interval if modal is closed
-                for (const node of mutation.removedNodes) {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        if (node.classList && node.classList.contains('fixed')) {
-                            const heading = node.querySelector?.('p.text-heading-6');
-                            if (heading && heading.textContent.trim() === 'Memories') {
-                                debugLog('[S.AI] Memory Manager removed from DOM');
-                                stopMemoryRefresh();
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        memoryModalObserver.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
-
-        debugLog('[S.AI] Memory Manager auto-refresh monitor initialized');
-    }
-    
-    // Initialize the memory modal monitor
-    monitorMemoryModal();
-    
-    // Check if Memory Manager is already open on page load
-    setTimeout(() => {
-        const existingModal = document.querySelector('div.fixed.left-1\\/2.top-1\\/2');
-        if (existingModal) {
-            const heading = existingModal.querySelector('p.text-heading-6');
-            if (heading && heading.textContent.trim() === 'Memories') {
-                debugLog('[S.AI] Memory Manager already open on page load');
-                addManualRefreshButton(existingModal);
-                styleLoadMoreButton(existingModal);
-                startMemoryRefresh();
-            }
-        }
-    }, 2000);
-
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-    // ===                                                                       ===
-    // ===                      END OF INITIALIZATION                           ===
-    // ===                                                                       ===
-    // =============================================================================
-    // =============================================================================
-    // =============================================================================
-    
-    } // End of initializeMainCode function
-    
-    // =============================================================================
-    // NEW TAB AUTO-RELOAD - Handle race condition
-    // =============================================================================
-    // When middle-clicking to open a bot in a new tab, sometimes the page loads
-    // before our extension fully initializes. Detect this and auto-reload once.
-    // =============================================================================
-    
-    const RELOAD_FLAG_KEY = 'sai-toolkit-reloaded-for-init';
-    const hasAlreadyReloaded = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
-
     // =============================================================================
     // ===                 UPDATE NOTIFICATION CHECK                            ===
     // =============================================================================
     // Check for update notification on page load
     async function checkForUpdateNotification() {
         try {
-            const showUpdate = await storage.get('showUpdateNotification', false);
+            // Read directly from storage (bypass cache) to get fresh values set by background script
+            const result = await (typeof browser !== 'undefined' ? browser : chrome).storage.local.get({
+                'showUpdateNotification': false,
+                'updatedToVersion': null,
+                'lastSeenVersion': null
+            });
+            
+            const showUpdate = result.showUpdateNotification;
+            const newVersion = result.updatedToVersion;
+            const lastSeenVersion = result.lastSeenVersion;
+
+            debugLog('[Core] Update check - showUpdate:', showUpdate, 'newVersion:', newVersion, 'lastSeenVersion:', lastSeenVersion);
 
             if (showUpdate) {
-                const newVersion = await storage.get('updatedToVersion', null);
-                const lastSeenVersion = await storage.get('lastSeenVersion', null);
-
-                debugLog('[Toolkit] Update check - showUpdate:', showUpdate, 'newVersion:', newVersion, 'lastSeenVersion:', lastSeenVersion);
-
                 // Only show if user hasn't seen this version yet
                 if (newVersion && newVersion !== lastSeenVersion) {
                     // Small delay to let page load first
                     setTimeout(() => showUpdateNotificationModal(newVersion), 1000);
                 } else {
-                    debugLog('[Toolkit] User has already seen version:', newVersion);
+                    debugLog('[Core] User has already seen version:', newVersion);
                 }
 
                 // Clear the flag regardless
                 await storage.remove('showUpdateNotification');
             } else {
-                debugLog('[Toolkit] No update notification pending');
+                debugLog('[Core] No update notification pending');
+                
+                // Retry check after a short delay in case background script is still writing
+                // This handles the race condition when extension just updated
+                setTimeout(async () => {
+                    try {
+                        const retryResult = await (typeof browser !== 'undefined' ? browser : chrome).storage.local.get({
+                            'showUpdateNotification': false,
+                            'updatedToVersion': null,
+                            'lastSeenVersion': null
+                        });
+                        
+                        if (retryResult.showUpdateNotification) {
+                            debugLog('[Core] Retry: Found update notification on second check');
+                            const retryVersion = retryResult.updatedToVersion;
+                            const retryLastSeen = retryResult.lastSeenVersion;
+                            
+                            if (retryVersion && retryVersion !== retryLastSeen) {
+                                showUpdateNotificationModal(retryVersion);
+                            }
+                            
+                            await storage.remove('showUpdateNotification');
+                        }
+                    } catch (err) {
+                        // Ignore retry errors
+                    }
+                }, 2000);
             }
         } catch (err) {
-            console.error('[Toolkit] Error checking for update notification:', err);
+            console.error('[Core] Error checking for update notification:', err);
         }
     }
 
@@ -12871,46 +15653,46 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     const navigationType = getNavigationType();
     const isNewTab = !hasAlreadyReloaded && navigationType === 'navigate';
     
-    debugLog('[Toolkit] ==== NEW TAB CHECK ====');
-    debugLog('[Toolkit] URL:', location.href);
-    debugLog('[Toolkit] hasAlreadyReloaded:', hasAlreadyReloaded);
-    debugLog('[Toolkit] navigationType:', navigationType);
-    debugLog('[Toolkit] isNewTab:', isNewTab);
-    debugLog('[Toolkit] readyState:', document.readyState);
+    debugLog('[Core] ==== NEW TAB CHECK ====');
+    debugLog('[Core] URL:', location.href);
+    debugLog('[Core] hasAlreadyReloaded:', hasAlreadyReloaded);
+    debugLog('[Core] navigationType:', navigationType);
+    debugLog('[Core] isNewTab:', isNewTab);
+    debugLog('[Core] readyState:', document.readyState);
     
     async function checkAndReloadIfNeeded() {
         await initializeMainCode();
 
-        debugLog('[Toolkit] initializeMainCode completed');
+        debugLog('[Core] initializeMainCode completed');
 
         // Check for update notification after initialization
         await checkForUpdateNotification();
 
         // Only check on chat pages
         const isChatPage = location.href.includes('/chat') || location.href.includes('/messages');
-        debugLog('[Toolkit] isChatPage:', isChatPage);
+        debugLog('[Core] isChatPage:', isChatPage);
         
         if (!isChatPage) {
-            debugLog('[Toolkit] Not a chat page, skipping reload check');
+            debugLog('[Core] Not a chat page, skipping reload check');
             return;
         }
         
         // Check if our toolkit UI was actually injected
         const toolkitInjected = document.querySelector('sai-toolkit-modal') !== null;
-        debugLog('[Toolkit] toolkitInjected:', toolkitInjected);
+        debugLog('[Core] toolkitInjected:', toolkitInjected);
         
         // If this is a new tab (fresh navigation) and we haven't reloaded yet, do it
         // OR if the toolkit wasn't injected properly
         if ((isNewTab || !toolkitInjected) && !hasAlreadyReloaded) {
-            debugLog('[Toolkit] NEW TAB DETECTED or toolkit not injected - Setting reload flag and reloading...');
+            debugLog('[Core] NEW TAB DETECTED or toolkit not injected - Setting reload flag and reloading...');
             sessionStorage.setItem(RELOAD_FLAG_KEY, 'true');
             // Use a small delay to ensure sessionStorage is written
             setTimeout(() => {
-                debugLog('[Toolkit] RELOADING NOW');
+                debugLog('[Core] RELOADING NOW');
                 location.reload();
             }, 100);
         } else {
-            debugLog('[Toolkit] Not a new tab or already reloaded, proceeding normally');
+            debugLog('[Core] Not a new tab or already reloaded, proceeding normally');
         }
     }
     
@@ -12922,14 +15704,14 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         
         if (document.visibilityState === 'visible') {
             hasInitialized = true;
-            debugLog('[Toolkit] Page is visible, initializing...');
+            debugLog('[Core] Page is visible, initializing...');
             await checkAndReloadIfNeeded();
         } else {
-            debugLog('[Toolkit] Page not visible yet, waiting...');
+            debugLog('[Core] Page not visible yet, waiting...');
             document.addEventListener('visibilitychange', async function onVisible() {
                 if (document.visibilityState === 'visible' && !hasInitialized) {
                     hasInitialized = true;
-                    debugLog('[Toolkit] Page became visible, initializing...');
+                    debugLog('[Core] Page became visible, initializing...');
                     document.removeEventListener('visibilitychange', onVisible);
                     await checkAndReloadIfNeeded();
                 }

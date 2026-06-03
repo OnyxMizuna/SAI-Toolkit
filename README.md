@@ -14,6 +14,7 @@ Enhanced features for SpicyChat including generation profiles, sidebar layout, t
 - **Toolkit Settings**: Access all features through a unified settings modal
 - **Chat Export**: Export your current conversation as JSON or HTML (with images embedded)
 - **NSFW Mode Toggle**: Toggle NSFW image mode directly from the chat UI; state is stored locally and never transmitted
+- **Message Recovery** *(opt-in, off by default)*: When SpicyChat's chat backend fails (502, CORS, network drop, timeout) the message you typed is normally lost — the input clears the moment you press Send and only an "Oops!" banner remains. With this enabled, the extension captures the outgoing text at send time, persists it locally **only if the send fails**, and shows a "Recover message" button next to SpicyChat's "Resubmit" button so you can restore your message into the input field. Captured text never leaves your browser. Toggle in the Features tab of the S.AI Settings modal.
 - **Import/Export Statistics**: Backup or restore your generation statistics and settings with one click
 
 

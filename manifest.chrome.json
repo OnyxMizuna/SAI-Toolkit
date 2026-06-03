@@ -1,26 +1,16 @@
 {
   "manifest_version": 3,
   "name": "S.AI Toolkit",
-  "version": "1.0.42",
+  "version": "1.0.65",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
   "homepage_url": "https://github.com/CLedebur/Spicychat.ai-Mods",
   "permissions": [
     "storage",
-    "unlimitedStorage",
-    "declarativeNetRequest"
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "*://spicychat.ai/*"
   ],
-  "declarative_net_request": {
-    "rule_resources": [
-      {
-        "id": "ruleset_1",
-        "enabled": true,
-        "path": "rules.json"
-      }
-    ]
-  },
   "content_scripts": [
     {
       "matches": [

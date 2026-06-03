@@ -7,10 +7,10 @@
 const storageAPI = typeof browser !== 'undefined' ? browser : chrome;
 
 // Log extension installation or update
-storageAPI.runtime.onInstalled.addListener((details) => {
+storageAPI.runtime.onInstalled.addListener(async (details) => {
     if (details.reason === 'install') {
         // Set default values on first install
-        storageAPI.storage.local.set({
+        await storageAPI.storage.local.set({
             'enableSidebarLayout': false,
             'enableThemeCustomization': true,
             'enableHideForYou': true,
@@ -21,16 +21,19 @@ storageAPI.runtime.onInstalled.addListener((details) => {
         });
 
         // First install complete
-        console.log('[Toolkit] Extension installed');
+        console.log('[Core] Extension installed');
     } else if (details.reason === 'update') {
         // Extension was updated - set flag to show update notification
         const currentVersion = storageAPI.runtime.getManifest().version;
-        console.log('[Toolkit] Extension updated to version:', currentVersion);
+        console.log('[Core] Extension updated to version:', currentVersion);
 
-        storageAPI.storage.local.set({
+        // IMPORTANT: await the storage write to ensure it completes before any content scripts check
+        await storageAPI.storage.local.set({
             'showUpdateNotification': true,
             'updatedToVersion': currentVersion
         });
+        
+        console.log('[Core] Update notification flag set successfully');
     }
 });
 
