@@ -1,12 +1,17 @@
 {
   "manifest_version": 2,
-  "name": "S.AI Toolkit",
-  "version": "1.0.65",
+  "name": "S.AI Toolkit (DIAG)",
+  "version": "1.0.69.29",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
   "permissions": [
     "storage",
     "unlimitedStorage",
-    "*://spicychat.ai/*"
+    "identity",
+    "alarms",
+    "tabs",
+    "*://spicychat.ai/*",
+    "https://www.googleapis.com/*",
+    "https://oauth2.googleapis.com/*"
   ],
   "content_scripts": [
     {
@@ -40,10 +45,11 @@
   ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "sai-toolkit@spicychat.ai",
+      "id": "sai-toolkit-diag@spicychat.ai",
       "strict_min_version": "142.0",
       "data_collection_permissions": {
-        "required": ["none"]
+        "required": ["none"],
+        "optional": ["technicalAndInteraction"]
       }
     }
   }

@@ -77,7 +77,7 @@ if (typeof storage !== 'undefined') {
 }
 
 // Debug log category filters - controls which log categories are shown
-// Categories: Core, Stats, Memories, Export, NSFW, ChatTitle, WYSIWYG, WYSIWYG-Text, Profile, Model, Cache, Migration
+// Categories: Core, Stats, Memories, Export, NSFW, ChatTitle, WYSIWYG, WYSIWYG-Text, Profile, Model, Cache, Migration, Custom, Compact, Sync, AutoRegen, MsgRecovery
 let debugLogFilters = {
     Core: true,
     Stats: true,
@@ -92,12 +92,21 @@ let debugLogFilters = {
     Cache: true,
     Migration: true,
     Custom: true,
-    Compact: true
+    Compact: true,
+    Sync: true,
+    AutoRegen: true,
+    MsgRecovery: true
 };
 
 // Track sidebar width to detect transitions - prevents injection during React re-renders
 let lastKnownSidebarWidth = null;
 let sidebarWidthTransitionPending = false;
+
+// Drive auth error state — set when auto-sync detects an expired token
+let driveAuthErrorMessage = null;
+
+// Callback to push sync progress updates into the settings modal UI when it's open
+let syncProgressCallback = null;
 
 // Load debug filters from storage
 if (typeof storage !== 'undefined' && storage.get) {
@@ -123,7 +132,8 @@ function getLogCategory(message) {
     if (fullCategory === 'Change Model' || fullCategory === 'Model Change') return 'Model';
     if (fullCategory === 'Custom Style') return 'Custom';
     if (fullCategory === 'Compact') return 'Compact';
-    
+    if (fullCategory === 'Sync' || fullCategory === 'Drive Sync') return 'Sync';
+
     return fullCategory;
 }
 
@@ -156,7 +166,16 @@ function debugLog(...args) {
             }
             return arg;
         });
-        console.log('[Core]', ...sanitized);
+        // The message already carries its own [Category] prefix, so log it as-is —
+        // that's what the category filter and the console reader key off of. Only
+        // stamp the default [Core] namespace on genuinely uncategorized logs.
+        // (Previously every line was hard-prefixed '[Core]', which mislabeled
+        // Stats/WYSIWYG/Model/Export/NSFW/etc. as "Core" in the console.)
+        if (category) {
+            console.log(...sanitized);
+        } else {
+            console.log('[Core]', ...sanitized);
+        }
     }
 }
 
@@ -181,6 +200,36 @@ if (runtimeAPI && runtimeAPI.runtime && runtimeAPI.runtime.onMessage) {
         if (message.type === 'ping') {
             sendResponse({ pong: true });
             return true;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Stats store RPC — content <-> background messaging for the IndexedDB stats
+// store. The store lives at the EXTENSION origin (owned by background.js);
+// content scripts run at the page origin and cannot open it, so every stats
+// read/write goes through these messages. Modeled on sendDriveMessage: one
+// retry on the MV3 service-worker "Could not establish connection" cold start.
+// Defined at module scope so both the page-context debug bridge (below) and the
+// IIFE stats engine can call it.
+// ---------------------------------------------------------------------------
+function sendStatsMessage(type, payload, _retries = 1) {
+    return new Promise((resolve, reject) => {
+        try {
+            runtimeAPI.runtime.sendMessage({ type, ...(payload || {}) }, (res) => {
+                const err = runtimeAPI.runtime.lastError;
+                if (err) {
+                    if (_retries > 0 && err.message && err.message.includes('Could not establish connection')) {
+                        setTimeout(() => sendStatsMessage(type, payload, _retries - 1).then(resolve).catch(reject), 300);
+                    } else {
+                        reject(new Error(err.message));
+                    }
+                } else {
+                    resolve(res);
+                }
+            });
+        } catch (e) {
+            reject(e);
         }
     });
 }
@@ -231,101 +280,53 @@ window.addEventListener('message', async (event) => {
     // Retrieves all message generation stats from local storage and returns
     // them to the debug function for console display
     if (event.data.type === 'SAI_DEBUG_STATS_REQUEST') {
-        // Get storage API (Chrome or Firefox compatible)
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            // No storage available - return empty stats
-            window.postMessage({ type: 'SAI_DEBUG_STATS_RESPONSE', stats: {} }, '*');
-            return;
-        }
-        
-        // Fetch stored message stats from chrome.storage.local
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        // Parse JSON string to object (stats are stored as JSON string)
-        const stats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
+        // Stats now live in the background's IndexedDB store; ask for the full
+        // nested wire-format snapshot for console display.
+        let stats = {};
+        try {
+            const res = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
+            if (res && res.success) stats = res.stats || {};
+        } catch (_) { /* return empty on failure */ }
         // Send stats back to page context for console display
         window.postMessage({ type: 'SAI_DEBUG_STATS_RESPONSE', stats }, '*');
     }
-    
+
     // -------------------------------------------------------------------------
     // CLEAR STATS REQUEST - Delete all stored statistics
     // -------------------------------------------------------------------------
     // Wipes all message generation stats from storage (useful for testing)
     if (event.data.type === 'SAI_CLEAR_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_CLEAR_STATS_RESPONSE' }, '*');
-            return;
-        }
-        
-        // Reset stats to empty object
-        await new Promise((resolve) => {
-            storage.set({ messageGenerationStats: '{}' }, () => resolve());
-        });
-        
+        try { await sendStatsMessage('SAI_STATS_CLEAR'); } catch (_) { /* ignore */ }
         // Confirm deletion to page context
         window.postMessage({ type: 'SAI_CLEAR_STATS_RESPONSE' }, '*');
     }
-    
+
     // -------------------------------------------------------------------------
     // EXPORT STATS REQUEST - Export statistics to downloadable JSON file
     // -------------------------------------------------------------------------
     // Allows user to backup or share their generation statistics
     if (event.data.type === 'SAI_EXPORT_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_EXPORT_STATS_RESPONSE', stats: {} }, '*');
-            return;
-        }
-        
-        // Fetch all stats from storage
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        let stats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
-        
-        // Optional: Filter to specific conversation if requested
-        // This allows exporting stats for just one chat instead of all chats
-        if (event.data.conversationId && stats[event.data.conversationId]) {
-            stats = { [event.data.conversationId]: stats[event.data.conversationId] };
-        }
-        
+        // The per-conversation filter is gone — conversationId is no longer part
+        // of the stats model — so this always exports the full nested snapshot.
+        let stats = {};
+        try {
+            const res = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
+            if (res && res.success) stats = res.stats || {};
+        } catch (_) { /* return empty on failure */ }
         // Return stats to page context which will trigger download
         window.postMessage({ type: 'SAI_EXPORT_STATS_RESPONSE', stats }, '*');
     }
-    
+
     // -------------------------------------------------------------------------
     // IMPORT STATS REQUEST - Import statistics from JSON file
     // -------------------------------------------------------------------------
     // Allows user to restore backed up statistics or merge from another browser
     if (event.data.type === 'SAI_IMPORT_STATS_REQUEST') {
-        const storage = typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-        if (!storage) {
-            window.postMessage({ type: 'SAI_IMPORT_STATS_RESPONSE' }, '*');
-            return;
-        }
-        
-        // Get current stats from storage
-        const result = await new Promise((resolve) => {
-            storage.get(['messageGenerationStats'], (items) => resolve(items));
-        });
-        
-        let existingStats = result.messageGenerationStats ? JSON.parse(result.messageGenerationStats) : {};
-        const importedStats = event.data.jsonData;
-        
-        // Merge strategy: Imported stats overwrite existing stats for same keys
-        // This allows updating specific conversations without losing others
-        const mergedStats = { ...existingStats, ...importedStats };
-        
-        // Save merged stats back to storage
-        await new Promise((resolve) => {
-            storage.set({ messageGenerationStats: JSON.stringify(mergedStats) }, () => resolve());
-        });
-        
+        // Background performs the authoritative merge into IndexedDB (collapsing
+        // the conversation level, never overwriting richer entries).
+        try {
+            await sendStatsMessage('SAI_STATS_IMPORT_MERGE', { stats: event.data.jsonData });
+        } catch (_) { /* ignore */ }
         // Confirm import completion to page context
         window.postMessage({ type: 'SAI_IMPORT_STATS_RESPONSE' }, '*');
     }
@@ -409,6 +410,38 @@ window.addEventListener('message', async (event) => {
         }
     }
 });
+
+// Stats merging is now owned by the background (IndexedDB store): the import/restore
+// paths and the SAI_IMPORT_STATS_REQUEST handler delegate to it via
+// sendStatsMessage('SAI_STATS_IMPORT_MERGE', …). The old content-side
+// pruneStatsObject/mergeMessageEntry/mergeStatsDeep copies were removed to avoid a
+// misleading second source of merge truth. normalizeImportPayload (below) is still used
+// to un-nest v2 backup files before applying their non-stats settings.
+
+// Normalize a backup/import payload to the flat key layout the import logic expects.
+// v2 backups nest keys under settings/style and store stats under `stats`; v1/flat
+// payloads already have everything at the top level (passed through unchanged).
+// Without this, importing a v2 file (e.g. the Drive sync file) silently drops every
+// grouped setting — including the Custom Style group (enableCustomStyle/customStyleValues).
+function normalizeImportPayload(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const isV2 = data._format === 'v2' ||
+                 (data.settings && typeof data.settings === 'object') ||
+                 (data.style && typeof data.style === 'object');
+    if (!isV2) return data;
+    const flat = { ...data };
+    if (data.settings && typeof data.settings === 'object') Object.assign(flat, data.settings);
+    if (data.style && typeof data.style === 'object') Object.assign(flat, data.style);
+    // v2 keeps the stats object under `stats`; the apply logic reads messageGenerationStats.
+    if (data.stats !== undefined && flat.messageGenerationStats === undefined) {
+        flat.messageGenerationStats = data.stats;
+    }
+    delete flat.settings;
+    delete flat.style;
+    delete flat.stats;
+    delete flat._format;
+    return flat;
+}
 
 'use strict';
 
@@ -1741,7 +1774,18 @@ div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: co
 
 div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
   position: relative;
-  padding-right: 16px !important;
+  /* No right padding: the real scrollbar lives on the absolutely-positioned
+     .custom-scroll child, whose containing block sits inside this element's
+     content box. Any right padding here insets that scroller and pushes its
+     scrollbar inward, leaving a gutter between the scrollbar and the viewport
+     edge (its apparent width varies by browser because the scrollbar's own
+     reserved track stacks on top of the padding). Keep it 0 so the scrollbar
+     sits flush against the right edge. Messages/composer stay readable because
+     they're centered via max-width + margin:auto, not via this padding.
+     NOTE: the sidebar-modal-open override (below) and the <1000px rule
+     deliberately re-add 16px — there the gap separates the chat from the
+     pinned right panel / screen edge, which is wanted. */
+  padding-right: 0 !important;
   padding-left: 16px !important;
   padding-top: 0px !important;
   align-items: flex-start;
@@ -2505,7 +2549,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
     const PROFILES_KEY = 'generationProfiles';
     const LAST_PROFILE_KEY = 'lastSelectedProfile';
-    const MESSAGE_STATS_KEY = 'messageGenerationStats';
+    // NOTE: message stats no longer live in storage.local — they are owned by the
+    // background IndexedDB store and accessed via SAI_STATS_* messages (sendStatsMessage).
     let lastGenerationSettings = null;
     let pendingMessageStats = null; // Store stats temporarily until message appears in DOM
     let loadedMessageIds = []; // Store message IDs from GET /messages response
@@ -2524,6 +2569,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Store message timestamps from API responses (source of truth for timestamps)
     // Structure: { messageId: createdAt (unix ms) }
     let messageTimestamps = {};
+
+    // In-memory set of bot message IDs — used by story mode to classify messages
+    // without requiring a stored stats entry (which won't exist for null-inference messages)
+    const botMessageIds = new Set();
 
     // Track which message IDs have already had stats inserted to prevent duplicates
     // Note: We clear these sets when navigating conversations to allow re-insertion
@@ -2855,110 +2904,129 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Build index map from stored message stats (for imported/old messages)
     async function buildIndexMapFromStats() {
         debugLog('[Stats] buildIndexMapFromStats starting...');
-        
-        const messageStats = await loadMessageStats();
-        debugLog('[Stats] Loaded message stats, top-level keys (characters):', Object.keys(messageStats));
-        
-        // Get current character and conversation IDs
+
+        // The index map is scoped to messages currently in view (those with an API
+        // timestamp). At startup messageTimestamps is empty and SAI_MESSAGES_LOADED
+        // rebuilds the map directly anyway, so skip the background round-trip entirely
+        // until timestamps exist — avoids a wasted SAI_STATS_GET_CHARACTER on every load.
+        if (!Object.keys(messageTimestamps).length) {
+            debugLog('[Stats] buildIndexMapFromStats - no timestamps yet, skipping (rebuilt by MESSAGES_LOADED)');
+            return;
+        }
+
         const characterId = getCurrentCharacterId();
-        // Use the conversation ID from API, fallback to URL, then '_default'
-        let conversationId = currentConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID in URL, use '_default'
-        if (!conversationId) {
-            conversationId = '_default';
-        }
-        
-        debugLog('[Stats] Current character ID:', characterId, 'conversation ID:', conversationId, '(from API:', currentConversationId, ')');
-        
-        let messageIds = [];
-        let messageData = {};
-        
-        // Navigate character → conversation → messages
-        if (characterId && messageStats[characterId]?.[conversationId]) {
-            debugLog('[Stats] Found messages for character/conversation');
-            messageData = messageStats[characterId][conversationId];
-            messageIds = Object.keys(messageData);
-            debugLog('[Stats] Found', messageIds.length, 'messages in conversation');
-        } else {
-            debugLog('[Stats] No messages found for current character/conversation');
-        }
-        
-        debugLog('[Stats] Found message IDs:', messageIds.length, messageIds.slice(0, 5));
-        
-        // Sort messages by timestamp (oldest first)
+        // Stats are keyed by messageId (conversationId dropped); this returns ALL of
+        // the character's stat records. Scope to the messages currently in view — i.e.
+        // those with an API timestamp in messageTimestamps — which mirrors the old
+        // per-conversation scoping (messageTimestamps is rebuilt per loaded conversation).
+        const charStats = await loadCharacterStats(characterId);
+        const messageIds = Object.keys(charStats).filter(id => messageTimestamps[id]);
+        debugLog('[Stats] buildIndexMapFromStats - character:', characterId,
+            '| records:', Object.keys(charStats).length, '| in-view:', messageIds.length);
+
+        // Sort messages by API timestamp (oldest first). Records carry no timestamp,
+        // so order by the in-memory messageTimestamps map.
         const sortedIds = messageIds.sort((a, b) => {
-            const aTime = messageData[a]?.timestamp || 0;
-            const bTime = messageData[b]?.timestamp || 0;
+            const aTime = messageTimestamps[a] || 0;
+            const bTime = messageTimestamps[b] || 0;
             return aTime - bTime;
         });
-        
+
         // Build index map - this maps sequential index to message IDs
         // This is only used as a fallback when extractMessageId() fails
         sortedIds.forEach((id, index) => {
             messageIdToIndexMap[index] = id;
         });
-        
+
         debugLog('[Stats] Built index map from storage:', Object.keys(messageIdToIndexMap).length, 'messages');
-        debugLog('[Stats] First 5 mappings:', Object.keys(messageIdToIndexMap).slice(0, 5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
     }
 
-    // Load message stats from storage
-    // PERFORMANCE: Cache parsed stats to avoid repeated JSON parsing during batch processing
-    let cachedMessageStats = null;
-    let cachedMessageStatsTime = 0;
+    // Stats live in the background's IndexedDB store (extension origin). Content
+    // requests the CURRENT character's records and caches them briefly for the
+    // display passes. cachedCharStatsId tracks which character the cache is for so
+    // navigating between bots refetches.
+    // PERFORMANCE: one indexed query per character view instead of parsing an 11 MB blob.
+    let cachedCharStats = null;
+    let cachedCharStatsId = null;
+    let cachedCharStatsTime = 0;
     const STATS_CACHE_TTL = 2000; // 2 seconds - short TTL since stats can change
-    
-    async function loadMessageStats() {
+
+    // Serialises content-side write messages so concurrent MESSAGES_LOADED handlers
+    // (rapid chat navigation) keep their send ordering. The background owns the store
+    // and applies each PUT/DELETE in an atomic transaction, so the old whole-blob
+    // clobber race (the 1,836-entry incident) is structurally impossible now.
+    let statsWriteQueue = Promise.resolve();
+
+    // Load the current character's stats as { [messageId]: {model,max_tokens,temperature,top_p,top_k,role} }
+    // from the background store, cached for STATS_CACHE_TTL.
+    async function loadCharacterStats(characterId) {
         const now = Date.now();
-        // Use cache if recent (within TTL)
-        if (cachedMessageStats && (now - cachedMessageStatsTime) < STATS_CACHE_TTL) {
-            return cachedMessageStats;
+        if (cachedCharStats && cachedCharStatsId === characterId && (now - cachedCharStatsTime) < STATS_CACHE_TTL) {
+            return cachedCharStats;
         }
-        
-        const stored = await storage.get(MESSAGE_STATS_KEY, '{}');
-        cachedMessageStats = JSON.parse(stored);
-        cachedMessageStatsTime = now;
-        return cachedMessageStats;
+        let map = {};
+        if (characterId) {
+            try {
+                const res = await sendStatsMessage('SAI_STATS_GET_CHARACTER', { characterId });
+                if (res && res.success && res.stats) map = res.stats;
+            } catch (e) {
+                debugLog('[Stats] loadCharacterStats failed:', e && e.message);
+            }
+        }
+        cachedCharStats = map;
+        cachedCharStatsId = characterId;
+        cachedCharStatsTime = now;
+        return map;
     }
-    
-    // Invalidate stats cache (call after saving)
+
+    // Invalidate stats cache (call after writes, and on SAI_DRIVE_SYNC_COMPLETE)
     function invalidateStatsCache() {
-        cachedMessageStats = null;
-        cachedMessageStatsTime = 0;
+        cachedCharStats = null;
+        cachedCharStatsId = null;
+        cachedCharStatsTime = 0;
     }
 
-    // Save message stats to storage
-    async function saveMessageStats(messageStats) {
-        await storage.set(MESSAGE_STATS_KEY, JSON.stringify(messageStats));
-        // Invalidate cache after saving
-        invalidateStatsCache();
+    // Remove a single stored entry (used to evict corrupted records).
+    // explicitConversationId is retained for call-site compatibility but ignored —
+    // the store is keyed by globally-unique messageId.
+    async function deleteStatsEntry(messageId, explicitConversationId = null) {
+        await (statsWriteQueue = statsWriteQueue.catch(() => {}).then(async () => {
+            try {
+                await sendStatsMessage('SAI_STATS_DELETE', { messageId });
+                invalidateStatsCache();
+                debugLog('[Stats] deleteStatsEntry: removed entry for', messageId.substring(0, 8));
+            } catch (e) {
+                debugLog('[Stats] deleteStatsEntry failed:', e && e.message);
+            }
+        }));
     }
 
-    // Get stats for a specific message ID
-    async function getStatsForMessage(messageId) {
-        const messageStats = await loadMessageStats();
-        const characterId = getCurrentCharacterId();
-        // Use the conversation ID from API, fallback to URL, then '_default'
-        let conversationId = currentConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID, use '_default'
-        if (!conversationId) {
-            conversationId = '_default';
+    // Startup cleanup: ask the background to drop null-only records from the store.
+    // (Can also be called after import.) Background serialises this against writes.
+    async function pruneNullStats() {
+        try {
+            const res = await sendStatsMessage('SAI_STATS_PRUNE');
+            if (res && res.success && res.removed) {
+                debugLog('[Stats] pruneNullStats: removed', res.removed, 'null entries');
+            }
+        } catch (e) {
+            debugLog('[Stats] pruneNullStats failed:', e && e.message);
         }
-        
-        debugLog('[Stats] getStatsForMessage - characterId:', characterId, 'conversationId:', conversationId, '(from API:', currentConversationId, ') messageId:', messageId);
-        debugLog('[Stats] getStatsForMessage - messageTimestamps populated?', Object.keys(messageTimestamps).length > 0, 'keys:', Object.keys(messageTimestamps).length);
-        debugLog('[Stats] getStatsForMessage - messageTimestamps has this ID?', !!messageTimestamps[messageId], 'value:', messageTimestamps[messageId]);
-        
+    }
+
+    // Get stats for a specific message ID.
+    // Keyed by globally-unique messageId, so cloned chats resolve directly (no
+    // conversation scan needed). Timestamp is always overlaid from messageTimestamps.
+    async function getStatsForMessage(messageId) {
+        const characterId = getCurrentCharacterId();
+        const charStats = await loadCharacterStats(characterId);
+
         // Start with an empty stats object
         let stats = null;
-        
-        // New format: character -> conversation -> message
-        if (characterId && messageStats[characterId]?.[conversationId]?.[messageId]) {
-            debugLog('[Stats] getStatsForMessage - found stored stats');
+
+        const storedStats = charStats[messageId] || null;
+        if (storedStats) {
             // Only copy generation settings, not timestamp
-            const storedStats = messageStats[characterId][conversationId][messageId];
             stats = {
                 model: storedStats.model,
                 max_tokens: storedStats.max_tokens,
@@ -2968,7 +3036,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 role: storedStats.role
             };
         }
-        
+
         // ALWAYS get timestamp from messageTimestamps (API source of truth)
         // This works even if no other stats are stored (e.g., user messages)
         if (messageTimestamps[messageId]) {
@@ -2976,16 +3044,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 stats = {};
             }
             stats.timestamp = messageTimestamps[messageId];
-            debugLog('[Stats] getStatsForMessage - using API timestamp:', stats.timestamp);
-        } else {
-            debugLog('[Stats] getStatsForMessage - WARNING: No API timestamp available for', messageId);
         }
-        
+
         if (stats) {
             return stats;
         }
-        
-        debugLog('[Stats] getStatsForMessage - not found (no stored stats and no API timestamp)');
+
+        debugLog('[Stats] getStatsForMessage - not found (no stored stats and no API timestamp) for', messageId);
         return null;
     }
     
@@ -3058,53 +3123,55 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         return null;
     }
     
-    // Migrate old format to new format
-    // Store stats for a specific message ID (character → conversation → message hierarchy)
+    // Store stats for a specific message ID.
+    // Keyed by messageId in the background IndexedDB store; characterId rides on the
+    // record for the by_character index. explicitConversationId is retained for
+    // call-site compatibility but ignored — conversationId is no longer part of the model.
     async function storeStatsForMessage(messageId, stats, explicitConversationId = null) {
-        const messageStats = await loadMessageStats();
+        // Never store user-role messages — timestamps come from messageTimestamps map
+        if (stats.role === 'user') return;
+
+        // Skip if there is no meaningful generation data to store
+        const hasData = stats.model
+            || stats.settings?.max_new_tokens != null
+            || stats.settings?.temperature != null
+            || stats.settings?.top_p != null
+            || stats.settings?.top_k != null
+            || stats.max_tokens != null
+            || stats.temperature != null
+            || stats.top_p != null
+            || stats.top_k != null;
+        if (!hasData) return;
+
         const characterId = getCurrentCharacterId();
-        let conversationId = explicitConversationId || getCurrentConversationId();
-        
-        // If still no conversation ID, use '_default' as fallback
-        if (!conversationId) {
-            conversationId = '_default';
-            debugLog('[Stats] No conversation ID provided, using _default');
-        }
-        
         if (!characterId) {
             debugLog('[Stats] Warning: Missing character ID - cannot store stats');
             return;
         }
-        
-        debugLog('[Stats] Storing stats - character:', characterId, 'conversation:', conversationId, 'message:', messageId);
-        debugLog('[Stats] Input stats object:', stats);
-        debugLog('[Stats] Extracted - model:', stats.model, 'settings:', stats.settings);
-        
-        // Ensure character object exists
-        if (!messageStats[characterId]) {
-            messageStats[characterId] = {};
-        }
-        
-        // Ensure conversation object exists
-        if (!messageStats[characterId][conversationId]) {
-            messageStats[characterId][conversationId] = {};
-        }
-        
-        // Store generation settings only - timestamps come from messageTimestamps map
-        // This keeps storage clean and ensures timestamps always come from API
-        messageStats[characterId][conversationId][messageId] = {
+
+        // Build the record — generation settings only (timestamp comes from messageTimestamps).
+        // Flatten both stats.settings.* and flat stats.* shapes (settings wins via ||).
+        const record = {
+            messageId: messageId,
+            characterId: characterId,
             model: stats.model || null,
             max_tokens: stats.settings?.max_new_tokens || stats.max_tokens || null,
             temperature: stats.settings?.temperature || stats.temperature || null,
             top_p: stats.settings?.top_p || stats.top_p || null,
             top_k: stats.settings?.top_k || stats.top_k || null,
             role: stats.role || null
-            // Note: timestamp is NOT stored here - it comes from messageTimestamps map
         };
-        
-        debugLog('[Stats] Stored data:', messageStats[characterId][conversationId][messageId]);
-        debugLog('[Stats] Stored for character:', characterId, 'conversation:', conversationId, 'message:', messageId);
-        await saveMessageStats(messageStats);
+
+        // Serialise through the write queue so concurrent handlers keep send ordering.
+        await (statsWriteQueue = statsWriteQueue.catch(() => {}).then(async () => {
+            try {
+                await sendStatsMessage('SAI_STATS_PUT', { record });
+                invalidateStatsCache();
+                debugLog('[Stats] Stored stats for character:', characterId, 'message:', messageId, record);
+            } catch (e) {
+                debugLog('[Stats] storeStatsForMessage failed:', e && e.message);
+            }
+        }));
     }
 
     // Extract message ID from DOM element
@@ -3582,6 +3649,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Store stats for bot messages
             for (const msg of botMessages) {
                 if (msg.id) {
+                    botMessageIds.add(msg.id);
+
                     // Check if stats already exist in storage (to preserve POST data)
                     const existingStats = await getStatsForMessage(msg.id);
                     
@@ -3630,12 +3699,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         // get full repair; otherwise role-only repair, which still
                         // routes the display through the correct code branches.
                         debugLog('[Stats MESSAGES_LOADED] Repairing corrupted user-marker on bot message:', msg.id.substring(0, 8));
-                        const repaired = {
-                            role: 'bot',
-                            model: msg.inference_model || null,
-                            settings: msg.inference_settings || null
-                        };
-                        await storeStatsForMessage(msg.id, repaired, conversationId);
+                        if (msg.inference_model || msg.inference_settings) {
+                            // We have real inference data — overwrite the corrupted entry
+                            await storeStatsForMessage(msg.id, {
+                                role: 'bot',
+                                model: msg.inference_model || null,
+                                settings: msg.inference_settings || null
+                            }, conversationId);
+                        } else {
+                            // No inference data — delete the corrupted entry entirely.
+                            // botMessageIds.has() handles story-mode detection without a stored entry.
+                            await deleteStatsEntry(msg.id, conversationId);
+                        }
                     } else {
                         debugLog('[Stats MESSAGES_LOADED] Existing stats preserved - no update');
                         // Existing stats preserved - no update needed
@@ -3643,27 +3718,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }
             
-            // Store timestamps for user messages
-            for (const msg of userMessages) {
-                if (msg.id) {
-                    const existingStats = await getStatsForMessage(msg.id);
-                    if (!existingStats) {
-                        const stats = {
-                            role: 'user',
-                            model: null,
-                            settings: null
-                            // Timestamp is handled by messageTimestamps map
-                        };
-                        await storeStatsForMessage(msg.id, stats, conversationId);
-                    } else if (!existingStats.role) {
-                        // Add role if missing
-                        existingStats.role = 'user';
-                        await storeStatsForMessage(msg.id, existingStats, conversationId);
-                    }
-                }
-            }
-            
-            debugLog('[Stats] Stored stats for', botMessages.length, 'bot messages and', userMessages.length, 'user messages');
+            debugLog('[Stats] Stored stats for', botMessages.length, 'bot messages (user messages no longer stored)');
             
             // Don't rebuild index map - we already built it from GET /messages order above
             // await buildIndexMapFromStats();
@@ -3813,30 +3868,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 // can leave lastUserMessageTimestamp populated across the regen, which
                 // historically masked this distinction and corrupted records.
                 if ((role === 'bot' || !role) && prevId && lastUserMessageTimestamp && !isRegenerationDetected) {
-                    debugLog('[Stats] Bot message has prevId - storing user message:', prevId.substring(0, 8));
+                    debugLog('[Stats] Bot message has prevId - recording user message timestamp:', prevId.substring(0, 8));
 
-                    // Store the user message timestamp in messageTimestamps
+                    // Record the user message timestamp (source of truth for display)
                     messageTimestamps[prevId] = lastUserMessageTimestamp;
                     debugLog('[Stats] Added user message to messageTimestamps:', prevId.substring(0, 8), '→', lastUserMessageTimestamp);
-
-                    // Store stats for the user message
-                    const userStats = {
-                        role: 'user'
-                        // Timestamp comes from messageTimestamps map
-                    };
-                    await storeStatsForMessage(prevId, userStats, conversationId);
-                    debugLog('[Stats] Stored stats for user message:', prevId.substring(0, 8));
 
                     // Add to index map (user message comes before bot message)
                     if (!isRegenerationDetected) {
                         const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
-                        const userIndex = currentMaxIndex + 1; // Next available index
+                        const userIndex = currentMaxIndex + 1;
                         messageIdToIndexMap[userIndex] = prevId;
                         debugLog('[Stats SAVE] Added user message to index map at index:', userIndex, 'messageId:', prevId.substring(0, 8));
                     }
 
-                    // Trigger stats insertion for the user message
-                    // Use processMessagesForStats to insert the timestamp
+                    // Trigger stats insertion for the user message timestamp display
                     setTimeout(() => processMessagesForStats(true), 200);
                     setTimeout(() => processMessagesForStats(true), 600);
 
@@ -3848,6 +3894,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 // This is more reliable than index-based matching in processMessagesForStats
                 // processMessagesForStats will skip messages with version counters
                 if (role === 'bot' || !role) {
+                    botMessageIds.add(messageId);
                     debugLog('[Stats] Bot message - will insert stats directly via insertStatsForRegeneratedMessage');
                     // Increment pending count - this tells processMessagesForStats to skip the newest messages
                     pendingNewMessageCount++;
@@ -3924,35 +3971,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Store the timestamp for when we detect the user message in the DOM
             lastUserMessageTimestamp = timestamp;
             
-            // Try to find and tag the user message after a short delay
-            setTimeout(async () => {
-                debugLog('[Stats] Looking for new user message to store role');
-                
-                // Find all user messages (role="user")
-                const allMessages = document.querySelectorAll('[data-message-id]');
-                debugLog('[Stats] Found', allMessages.length, 'total messages with data-message-id');
-                
-                // Find user messages without stats
-                for (const msgEl of allMessages) {
-                    const msgId = msgEl.getAttribute('data-message-id');
-                    const role = msgEl.getAttribute('data-role') || 'unknown';
-                    
-                    if (role === 'user') {
-                        // Check if this message already has stats
-                        const existingStats = await getStatsForMessage(msgId);
-                        if (!existingStats) {
-                            debugLog('[Stats] Found user message without stats:', msgId);
-                            await storeStatsForMessage(msgId, {
-                                role: 'user'
-                                // No timestamp stored - comes from messageTimestamps
-                            }, conversationId);
-                            
-                            // Insert stats for this message
-                            setTimeout(() => processMessagesForStats(true), 100);
-                        }
-                    }
-                }
-            }, 500);
+            // Trigger stats display for the newly sent user message (shows timestamp)
+            setTimeout(() => processMessagesForStats(true), 500);
+            setTimeout(() => processMessagesForStats(true), 1000);
         }
     });
     
@@ -5412,6 +5433,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let wysiwygObserver = null;
     let wysiwygActive = false;
     const WYSIWYG_EDITOR_CLASS = 'sai-wysiwyg-editor';
+
+    // Robust Apple-touch-device detection. iOS browser wrappers like Orion do
+    // NOT put iPhone/iPad/iPod in navigator.userAgent, so a UA-only check misses
+    // them and silently skips the iOS-specific React #185 guards (remove editor
+    // before send, backspace-in-empty-editor). Mirror the detection already used
+    // by the send interceptor and setup paths so it can't drift out of sync again.
+    function isAppleTouchDevice() {
+        return /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+               /iPhone|iPad|iPod/i.test(navigator.platform) ||
+               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    }
     
     // CSS for the WYSIWYG contenteditable editor
     // Uses a contenteditable div that syncs back to the hidden textarea
@@ -5918,6 +5950,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         textarea.dataset.wysiwygSetup = 'true';
+
+        // ── TEMP DIAGNOSTIC (React #185 bisection) — remove once root-caused ──────
+        // Five send-path fixes produced identical crash stacks, so the trigger is
+        // structural. Bisect it from the page console, then RELOAD between each:
+        //   localStorage.setItem('saiWysiwygDiag','off')            → no overlay at all (baseline: native textarea, no editor, no hiding)
+        //   localStorage.setItem('saiWysiwygDiag','editor-no-hide') → insert the editor but DON'T squash the textarea to 0×0
+        //   localStorage.setItem('saiWysiwygDiag','no-observers')   → normal, but the 3 textarea watchers are disabled
+        //   localStorage.removeItem('saiWysiwygDiag')               → back to normal
+        // Type + send in each mode and note which ones still crash with #185.
+        let __saiDiagMode = 'normal';
+        try { __saiDiagMode = (localStorage.getItem('saiWysiwygDiag') || 'normal').trim(); } catch (_) {}
+        if (__saiDiagMode !== 'normal') {
+            console.log('%c[WYSIWYG DIAG] active mode = ' + __saiDiagMode, 'color:#0bf;font-weight:bold;font-size:14px');
+        }
+        if (__saiDiagMode === 'off') {
+            console.log('%c[WYSIWYG DIAG] off — overlay skipped, native textarea left intact', 'color:#0bf;font-weight:bold');
+            return;
+        }
+
         debugLog('[WYSIWYG] Marked textarea as setup, creating editor element');
         debugLog('[WYSIWYG] Textarea:', textarea);
         debugLog('[WYSIWYG] isMessageEditor:', isMessageEditor, 'isGroupChatEdit:', isGroupChatEdit);
@@ -5929,8 +5980,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         editor.contentEditable = 'true';
         editor.setAttribute('data-placeholder', textarea.placeholder || 'Enter something');
         
-        // Apply custom style colors if enabled (async, applied to editor directly)
-        (async () => {
+        // Apply Custom/Classic style colors to this editor. Defined as a named closure
+        // (and exposed on the editor element) so it can be re-run LIVE when the style
+        // settings change — see the storage.onChanged listener in toggleWysiwygEditor().
+        async function applyEditorColors() {
+            // Reset the variables this function manages first, so toggling a style OFF
+            // reverts the editor to its built-in WYSIWYG defaults instead of leaving
+            // stale overrides behind.
+            [
+                '--wysiwyg-body-color', '--wysiwyg-body-font-weight', '--wysiwyg-body-font-style', '--wysiwyg-body-text-decoration',
+                '--wysiwyg-dialogue-color', '--wysiwyg-dialogue-font-weight', '--wysiwyg-dialogue-font-style', '--wysiwyg-dialogue-text-decoration',
+                '--wysiwyg-narration-color', '--wysiwyg-narration-font-weight', '--wysiwyg-narration-font-style', '--wysiwyg-narration-text-decoration',
+                '--wysiwyg-highlight-bg', '--wysiwyg-highlight-text', '--wysiwyg-highlight-font-weight', '--wysiwyg-highlight-font-style', '--wysiwyg-highlight-text-decoration'
+            ].forEach(v => editor.style.removeProperty(v));
+
             const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
             if (customStyleEnabled) {
                 const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
@@ -6004,8 +6067,27 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 
                 debugLog('[WYSIWYG] Applied custom style settings:', customStyleValues);
+            } else {
+                // No Custom Style — if Classic Style is on, mirror ITS fixed palette onto
+                // the live editor so the composer matches what Classic Style renders in sent
+                // messages. (Custom and Classic are mutually exclusive; Custom wins above.)
+                // Source of truth: getClassicStyleCSSEarly() — body/quote #fff, narration
+                // (em/i) #06B7DB italic. Highlight is left at the editor default (Classic
+                // doesn't restyle highlights). Without this the editor fell back to the
+                // WYSIWYG default narration #7dd3fc, which doesn't match Classic's #06B7DB.
+                const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
+                if (classicStyleEnabled) {
+                    editor.style.setProperty('--wysiwyg-body-color', '#ffffff');
+                    editor.style.setProperty('--wysiwyg-dialogue-color', '#ffffff');
+                    editor.style.setProperty('--wysiwyg-narration-color', '#06B7DB');
+                    editor.style.setProperty('--wysiwyg-narration-font-style', 'italic');
+                    debugLog('[WYSIWYG] Applied Classic Style colors to editor');
+                }
             }
-        })();
+        }
+        // Expose for live re-application (storage.onChanged) and run once now.
+        editor._wysiwygApplyColors = applyEditorColors;
+        applyEditorColors();
         
         // Get computed styles from textarea
         const computedStyle = window.getComputedStyle(textarea);
@@ -6074,22 +6156,27 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         
         // Hide the original textarea visually but keep it in its original DOM position
-        // Apply inline styles directly to ensure it's hidden on all pages
-        textarea.classList.add('sai-wysiwyg-hidden');
-        textarea.style.setProperty('position', 'absolute', 'important');
-        textarea.style.setProperty('opacity', '0', 'important');
-        textarea.style.setProperty('pointer-events', 'none', 'important');
-        textarea.style.setProperty('width', '0', 'important');
-        textarea.style.setProperty('height', '0', 'important');
-        textarea.style.setProperty('min-width', '0', 'important');
-        textarea.style.setProperty('min-height', '0', 'important');
-        textarea.style.setProperty('max-width', '0', 'important');
-        textarea.style.setProperty('max-height', '0', 'important');
-        textarea.style.setProperty('padding', '0', 'important');
-        textarea.style.setProperty('margin', '0', 'important');
-        textarea.style.setProperty('border', 'none', 'important');
-        textarea.style.setProperty('overflow', 'hidden', 'important');
-        textarea.style.setProperty('z-index', '-1', 'important');
+        // Apply inline styles directly to ensure it's hidden on all pages.
+        // DIAG: 'editor-no-hide' skips this squashing so we can tell whether the
+        // invasive 0×0 !important hiding (which fights SpicyChat's auto-grow textarea)
+        // is what triggers #185, vs. the foreign contenteditable sibling itself.
+        if (__saiDiagMode !== 'editor-no-hide') {
+            textarea.classList.add('sai-wysiwyg-hidden');
+            textarea.style.setProperty('position', 'absolute', 'important');
+            textarea.style.setProperty('opacity', '0', 'important');
+            textarea.style.setProperty('pointer-events', 'none', 'important');
+            textarea.style.setProperty('width', '0', 'important');
+            textarea.style.setProperty('height', '0', 'important');
+            textarea.style.setProperty('min-width', '0', 'important');
+            textarea.style.setProperty('min-height', '0', 'important');
+            textarea.style.setProperty('max-width', '0', 'important');
+            textarea.style.setProperty('max-height', '0', 'important');
+            textarea.style.setProperty('padding', '0', 'important');
+            textarea.style.setProperty('margin', '0', 'important');
+            textarea.style.setProperty('border', 'none', 'important');
+            textarea.style.setProperty('overflow', 'hidden', 'important');
+            textarea.style.setProperty('z-index', '-1', 'important');
+        }
         
         // For message editors: Register as active so global arrow key blocker knows
         // This allows blocking arrow keys even when editor is not focused
@@ -6290,17 +6377,48 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             isUpdating = false;
         }
         
-        // Sync editor content to textarea
+        // Sync editor content to textarea.
+        // ROOT-CAUSE FIX for the iOS/WebKit React #185 send crash: write through React's
+        // NATIVE prototype value setter, not `textarea.value =`.
+        //
+        // React installs a tracker-wrapping setter on the textarea INSTANCE; a plain
+        // `textarea.value = x` runs that wrapper and updates React's _valueTracker to x
+        // BEFORE we dispatch 'input'. React's ChangeEventPlugin then compares tracker(x)
+        // === node.value(x), sees "no change", and SUPPRESSES onChange. So React's
+        // controlled state never learns the typed text — its prop stays "" while the DOM
+        // holds the text. That standing prop↔DOM desync is the one invariant behind every
+        // observed #185 crash (tap and Enter, editor mounted or removed, observers live or
+        // suspended): during the send commit React's controlled-input restore-state
+        // machinery keeps trying to reconcile the mismatch and recurses past its
+        // nested-update limit (50) on WebKit.
+        //
+        // Calling the native prototype setter writes the DOM WITHOUT touching the tracker,
+        // so the dispatched 'input' registers as a real change, React's onChange fires, and
+        // React's state tracks the typed text on every keystroke. By send time prop === DOM,
+        // so restore short-circuits (updateWrapper's `if (newValue !== node.value)` guard)
+        // and the recursion has no fuel. The `if (isUpdating) return` guard below prevents
+        // the resulting onChange-driven re-render from recursing back into this function.
+        const nativeTextareaValueSetter = (() => {
+            try {
+                return Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set || null;
+            } catch (_) {
+                return null;
+            }
+        })();
         function syncToTextarea() {
             if (isUpdating) return;
-            
+
             const plainText = getPlainText();
             if (textarea.value !== plainText) {
-                textarea.value = plainText;
-                
-                // Trigger input event so the site knows the value changed
+                if (nativeTextareaValueSetter) {
+                    nativeTextareaValueSetter.call(textarea, plainText);
+                } else {
+                    textarea.value = plainText;
+                }
+
+                // Single 'input' only — React derives a textarea's onChange from 'input',
+                // so a 'change' dispatch is redundant and just adds re-entrancy pressure.
                 textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                textarea.dispatchEvent(new Event('change', { bubbles: true }));
             }
         }
         
@@ -6348,7 +6466,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Detect Android mobile for performance optimization (glitch prevention)
         const isAndroidMobile = /Android/i.test(navigator.userAgent) && /Mobile/i.test(navigator.userAgent);
         // Detect iOS for backspace fix (separate issue from Android glitching)
-        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+        // NOTE: use the robust detector — Orion (iOS) is absent from the UA string,
+        // and a UA-only check here was leaving the editor mounted during send on
+        // Orion, which crashed the page with React #185 (max update depth).
+        const isIOS = isAppleTouchDevice();
         const debounceDelay = isAndroidMobile ? 1000 : 150; // 1s for Android mobile, 150ms for desktop/iOS
         
         editor.addEventListener('compositionstart', () => {
@@ -6397,8 +6518,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Handle paste - strip formatting and paste as plain text
         editor.addEventListener('paste', (e) => {
             e.preventDefault();
-            const text = e.clipboardData.getData('text/plain');
+            const text = (e.clipboardData || window.clipboardData)?.getData('text/plain') || '';
             document.execCommand('insertText', false, text);
+            // iOS/WebKit FIX: execCommand('insertText') after preventDefault does NOT
+            // reliably fire the editor's 'input' event, so the live re-format never ran
+            // after a paste until a later blur/focus. Drive the same sync + debounced
+            // re-format the 'input' handler does. (Harmless if 'input' also fires — the
+            // shared debounce timer coalesces to a single updateEditorDisplay.)
+            if (!isComposing) {
+                lastInputTime = Date.now();
+                syncToTextarea();
+                lastKnownValue = textarea.value;
+                clearTimeout(inputDebounceTimer);
+                inputDebounceTimer = setTimeout(() => {
+                    if (!isComposing) updateEditorDisplay();
+                }, debounceDelay);
+            }
         });
         
         // Handle keydown for special keys
@@ -6447,12 +6582,30 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     // Sync to textarea first
                     syncToTextarea();
                     
-                    // CRITICAL: Remove WYSIWYG editor before sending to prevent React Error 185
-                    // On iOS: ALWAYS remove editor before send - iOS React is very sensitive to foreign DOM elements
-                    // On Desktop: Only remove in danger zone (700-850px around 768px breakpoint)
+                    // Send-time editor handling differs by platform (see the iOS block below):
+                    // - iOS/WebKit: keep the editor mounted + suspend its watchers, defer the click.
+                    // - Desktop: only remove the editor in the narrow 700-850px danger zone.
                     const windowWidth = window.innerWidth;
                     const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
-                    const shouldRemoveBeforeSend = isIOS || inDangerZone;
+                    // iOS (incl. Orion) React #185 fix: do NOT remove the editor before
+                    // send. Removing it blurs the focused contenteditable mid-event which,
+                    // together with the synchronous synthesized click below, drove React's
+                    // controlled-input restore/commit past its nested-update limit (#185) on
+                    // WebKit. Instead, suspend this editor's watchers for the send window
+                    // (same as the tap path) and defer the click out of the keydown stack
+                    // (see below). Desktop keeps the narrow danger-zone removal — note isIOS
+                    // is always false on desktop, so this is behavior-identical there.
+                    const shouldRemoveBeforeSend = inDangerZone;
+                    if (isIOS) {
+                        editor._wysiwygSending = true;
+                        setTimeout(() => {
+                            editor._wysiwygSending = false;
+                            if (textarea.value === '' || textarea.value !== getPlainText()) {
+                                editor.replaceChildren();
+                                lastKnownValue = '';
+                            }
+                        }, WYSIWYG_SEND_SUSPEND_MS);
+                    }
                     
                     if (shouldRemoveBeforeSend) {
                         debugLog('[WYSIWYG] Removing editor before send - isIOS:', isIOS, 'inDangerZone:', inDangerZone, 'width:', windowWidth);
@@ -6490,8 +6643,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         // Remove editor from DOM
                         editor.remove();
                         
-                        // Clear wysiwygSetup flag so it can be recreated later
-                        textarea.wysiwygSetup = '';
+                        // Clear wysiwygSetup flag so it can be recreated later.
+                        // Must clear dataset.wysiwygSetup (the marker setupWysiwygOverlay
+                        // actually checks) — the old `textarea.wysiwygSetup` set a stray
+                        // property and left the dataset flag at 'true', so after one send
+                        // the editor was never rebuilt until a full page reload.
+                        textarea.dataset.wysiwygSetup = '';
                     }
                     
                     // Find and click the send button - try multiple selectors for different layouts
@@ -6554,8 +6711,23 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             ariaLabel: sendButton.getAttribute('aria-label'),
                             className: sendButton.className
                         });
-                        sendButton.click();
-                        
+                        if (isIOS) {
+                            // Defer the click out of the keydown call stack so it runs as
+                            // its own top-level discrete event rather than nested inside this
+                            // keydown. The nested synchronous click is what let React's send
+                            // commit interleave with the still-open keydown batch and trip
+                            // #185 on WebKit. Re-query the button inside the frame in case a
+                            // render swapped it. (Editor clear is handled by the suspend
+                            // timeout above, so the 50ms clear below is a desktop concern.)
+                            const btn = sendButton;
+                            requestAnimationFrame(() => {
+                                const fresh = document.querySelector('button[aria-label="send-message"]') || btn;
+                                if (fresh && !fresh.disabled) fresh.click();
+                            });
+                        } else {
+                            sendButton.click();
+                        }
+
                         // Clear the editor after a short delay (after message is sent)
                         setTimeout(() => {
                             if (textarea.value === '' || textarea.value !== getPlainText()) {
@@ -6597,6 +6769,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Watch for external changes to textarea (e.g., from undo/redo or message send clearing)
         const activeTypingThreshold = isAndroidMobile ? 1500 : 500; // Longer threshold for Android mobile only
         const textareaObserver = new MutationObserver(() => {
+            // React #185 guard: stay silent while a send is in flight (flag set by
+            // the send interceptor). React's controlled-value restore wakes this
+            // observer; calling initializeEditor() here would re-enter React mid-
+            // flush and form the observer<->restore loop that throws #185 on iOS.
+            if (__saiDiagMode === 'no-observers') return; // DIAG
+            if (editor._wysiwygSending) return;
             debugLog('[WYSIWYG] Textarea MutationObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending, 'isUpdating:', isUpdating);
             // Skip during resize to prevent React 185 error
             if (isResizing || sidebarWidthTransitionPending) {
@@ -6620,6 +6798,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Watch for value property changes (polling as backup)
         const valueCheckInterval = setInterval(() => {
+            // React #185 guard: see textareaObserver. Suspended during send so the
+            // post-send textarea clear doesn't drive initializeEditor() into React's
+            // restore flush. The interceptor clears the editor itself, and this
+            // interval self-heals once the suspend flag lifts.
+            if (__saiDiagMode === 'no-observers') return; // DIAG
+            if (editor._wysiwygSending) return;
             // Skip during resize to prevent React 185 error
             if (isResizing || sidebarWidthTransitionPending) {
                 // Don't log every skip or it will flood the console
@@ -6659,6 +6843,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // CRITICAL: Skip during window resize to prevent React 185 error
         let resizeDebounceTimer = null;
         const resizeObserver = new ResizeObserver(() => {
+            // React #185 guard: see textareaObserver. Suspended during send.
+            if (__saiDiagMode === 'no-observers') return; // DIAG
+            if (editor._wysiwygSending) return;
             debugLog('[WYSIWYG] ResizeObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
             // Skip entirely during window resize to prevent React 185 error
             if (isResizing || sidebarWidthTransitionPending) {
@@ -6845,6 +7032,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Global send button interceptor reference (for cleanup)
     let wysiwygSendInterceptor = null;
+    // Installed once: re-applies editor colors live when Custom/Classic style settings change.
+    let wysiwygStyleListenerInstalled = false;
+    // Timestamp of the last handled send tap. iOS/WebKit fires touchend AND click
+    // for one tap, so the interceptor runs twice; we coalesce within this window.
+    let lastWysiwygSendTime = 0;
+    // How long to suspend an editor's watchers while React commits the send. Must
+    // outlast React's synchronous restore-state flush; the send teardown is fast
+    // (well under this), and a user cannot realistically send again within it.
+    const WYSIWYG_SEND_SUSPEND_MS = 500;
     
     /**
      * Toggle WYSIWYG editor feature
@@ -6861,15 +7057,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             wysiwygActive = true;
             injectWysiwygCSS();
             
-            // iOS FIX: Install global send button interceptor
-            // On iOS, users tap the send button directly (not Enter key)
-            // We need to sync WYSIWYG content to textarea before React processes the send
-            // But we DON'T remove the editor - that causes React Error 185
+            // iOS FIX: Install global send button interceptor.
+            // On iOS, users tap the send button directly (not the Enter key), so this
+            // capture-phase listener runs BEFORE React handles the send. Its job is to
+            // open a brief "suspend" window that quiets this editor's watchers while
+            // React commits the send — preventing the observer<->restore-state loop
+            // that throws React #185 on iOS. It does NOT sync the value (already synced
+            // on each keystroke) and does NOT remove the editor.
+
+            // Live style reaction: when Custom/Classic style settings change (toggle,
+            // import, or Drive sync), re-apply colors to every mounted editor without
+            // requiring a reload. Installed once.
+            if (!wysiwygStyleListenerInstalled && typeof storage.onChanged === 'function') {
+                wysiwygStyleListenerInstalled = true;
+                storage.onChanged((changes) => {
+                    if (!changes) return;
+                    if (changes[CUSTOM_STYLE_KEY] || changes[CLASSIC_STYLE_KEY] || changes[CUSTOM_STYLE_VALUES_KEY]) {
+                        document.querySelectorAll('.sai-wysiwyg-editor').forEach((el) => {
+                            if (typeof el._wysiwygApplyColors === 'function') el._wysiwygApplyColors();
+                        });
+                        debugLog('[WYSIWYG] Style setting changed — re-applied editor colors live');
+                    }
+                });
+            }
+
             if (!wysiwygSendInterceptor) {
-                const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-                                    /iPhone|iPad|iPod/i.test(navigator.platform) ||
-                                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-                
+                const isIOSDevice = isAppleTouchDevice();
+
                 wysiwygSendInterceptor = (e) => {
                     // Check if this is a send button being clicked/tapped
                     const clickedElement = e.target;
@@ -6882,20 +7096,47 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     const activeEditors = document.querySelectorAll('.sai-wysiwyg-editor');
                     if (activeEditors.length === 0) return;
                     
-                    debugLog('[WYSIWYG] Send interceptor triggered - syncing content. isIOS:', isIOSDevice);
-                    
-                    // ALWAYS sync all editors to their textareas before send
-                    activeEditors.forEach(editor => {
-                        const textarea = editor.previousElementSibling;
-                        if (textarea && textarea.tagName === 'TEXTAREA') {
-                            // Get plain text from editor
-                            const plainText = editor.textContent || '';
-                            textarea.value = plainText;
-                            // Dispatch input event to notify React
-                            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                        }
+                    // iOS/WebKit fires BOTH touchend and click for a single tap, so
+                    // this handler runs twice per send. Coalesce to one logical send
+                    // to avoid doubling the re-entrancy that contributes to #185.
+                    const nowTs = Date.now();
+                    if (nowTs - lastWysiwygSendTime < WYSIWYG_SEND_SUSPEND_MS) return;
+                    lastWysiwygSendTime = nowTs;
+
+                    debugLog('[WYSIWYG] Send interceptor triggered - opening suspend window. isIOS:', isIOSDevice);
+
+                    // ROOT-CAUSE FIX for React #185 (max update depth) on tap-to-send:
+                    // When React commits the send it synchronously restores the
+                    // controlled textarea's value from props. That write wakes this
+                    // editor's MutationObserver / valueCheckInterval / ResizeObserver,
+                    // each of which calls initializeEditor() -> editor.focus()/safeSetHTML,
+                    // which re-enters React's controlled/selection path during the SAME
+                    // synchronous flush and mutates the textarea again -> re-wakes the
+                    // observers. On iOS WebKit that observer<->restore cycle exceeds
+                    // React's nested-update limit (50) and crashes the page. Suspend
+                    // this editor's watchers for the send window so the cycle can't form.
+                    //
+                    // We deliberately do NOT write textarea.value or dispatch synthetic
+                    // input/change events here: the typed text was already synced on each
+                    // keystroke (syncToTextarea), and dispatching a fresh discrete input
+                    // inside React's own gesture is itself a #185 trigger. (The old code
+                    // read editor.previousElementSibling, which never matched the textarea
+                    // — the editor is inserted BEFORE it — so that block was a dead no-op.)
+                    activeEditors.forEach(editorEl => {
+                        editorEl._wysiwygSending = true;
+                        setTimeout(() => {
+                            editorEl._wysiwygSending = false;
+                            // Reflect the now-sent (cleared) textarea; the resumed
+                            // watchers also self-heal, but clear eagerly for snappy UX.
+                            // The textarea is the editor's NEXT sibling (the editor was
+                            // inserted via insertBefore(editor, textarea)).
+                            const ta = editorEl.nextElementSibling;
+                            if (ta && ta.tagName === 'TEXTAREA' && ta.value === '') {
+                                editorEl.replaceChildren();
+                            }
+                        }, WYSIWYG_SEND_SUSPEND_MS);
                     });
-                    
+
                     // On desktop in danger zone, remove editors to prevent layout issues
                     // On iOS/mobile, NEVER remove - let them stay in place
                     const windowWidth = window.innerWidth;
@@ -6938,10 +7179,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[WYSIWYG] ontouchstart in window:', 'ontouchstart' in window);
             
             // Robust mobile/iOS detection - Orion browser on iOS doesn't include standard iOS UA strings
-            const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent) || 
-                                /iPhone|iPad|iPod/i.test(navigator.platform) ||
-                                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPad with desktop UA
-            const isMobileDevice = isIOSDevice || 
+            const isIOSDevice = isAppleTouchDevice();
+            const isMobileDevice = isIOSDevice ||
                                    /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
                                    (window.innerWidth < 768 && 'ontouchstart' in window);
             
@@ -7187,7 +7426,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // iOS FIX: Delay WYSIWYG initialization on iOS to prevent React 185 during page load
             // On iOS, React is slower and we need to wait for the initial render cycle to fully complete
             // before injecting any DOM elements near React-controlled textareas
-            const isIOSDevice = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+            const isIOSDevice = isAppleTouchDevice();
             if (isIOSDevice) {
                 debugLog('[WYSIWYG] Delaying initialization on iOS by 4s to avoid React conflicts');
                 // Use 4s delay - this ensures React's initial render + any re-renders have completed
@@ -7204,6 +7443,93 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     function injectToolkitMenuItem() {
         // This function is intentionally left empty but kept for compatibility
         // The toolkit settings are now only accessible via the header icon
+    }
+
+    // ---- Drive auth error helpers ----
+
+    function clearDriveAuthError() {
+        driveAuthErrorMessage = null;
+        const sb = document.getElementById('sai-toolkit-sidebar-btn');
+        const mb = document.getElementById('sai-toolkit-mobile-btn');
+        if (sb) sb.style.color = '';
+        if (mb) mb.style.color = '';
+    }
+
+    function showDriveAuthModal() {
+        const existing = document.getElementById('sai-drive-auth-modal');
+        if (existing) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'sai-drive-auth-modal';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:10000010;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;';
+
+        const card = document.createElement('div');
+        card.style.cssText = 'background:#1f2937;border-radius:12px;padding:1.5rem 2rem;display:flex;flex-direction:column;gap:0.75rem;min-width:300px;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,0.5);border:1px solid #dc2626;';
+
+        const titleEl = document.createElement('div');
+        titleEl.textContent = 'Google Drive Sign-in Required';
+        titleEl.style.cssText = 'color:#f9fafb;font-size:14px;font-weight:600;';
+
+        const descEl = document.createElement('div');
+        descEl.textContent = 'Your Drive session has expired. Sign in again to resume auto-sync.';
+        descEl.style.cssText = 'color:#9ca3af;font-size:12px;line-height:1.5;';
+
+        const statusEl = document.createElement('div');
+        statusEl.style.cssText = 'font-size:11px;min-height:1em;color:#9ca3af;';
+
+        const btns = document.createElement('div');
+        btns.style.cssText = 'display:flex;flex-direction:column;gap:0.4rem;margin-top:0.25rem;';
+
+        const signInBtn = document.createElement('button');
+        signInBtn.textContent = 'Sign in to Google Drive';
+        signInBtn.style.cssText = 'padding:0.5rem 1rem;border-radius:6px;border:1px solid #3b82f6;background:#1d4ed8;color:#fff;font-size:12px;cursor:pointer;';
+
+        const laterBtn = document.createElement('button');
+        laterBtn.textContent = 'Later';
+        laterBtn.style.cssText = 'padding:0.25rem;border:none;background:transparent;color:#6b7280;font-size:11px;cursor:pointer;text-align:center;';
+
+        signInBtn.onclick = async () => {
+            signInBtn.disabled = true;
+            signInBtn.textContent = 'Signing in…';
+            statusEl.textContent = '';
+            try {
+                const result = await new Promise((resolve, reject) => {
+                    runtimeAPI.runtime.sendMessage(
+                        { type: 'SAI_DRIVE_SYNC', syncStats: true, syncSettings: false, syncStyle: false },
+                        (res) => {
+                            const err = runtimeAPI.runtime.lastError;
+                            if (err) reject(new Error(err.message));
+                            else resolve(res);
+                        }
+                    );
+                });
+                if (result && result.success) {
+                    clearDriveAuthError();
+                    overlay.remove();
+                } else {
+                    statusEl.textContent = (result && result.error) || 'Sign-in failed.';
+                    statusEl.style.color = '#dc2626';
+                    signInBtn.disabled = false;
+                    signInBtn.textContent = 'Sign in to Google Drive';
+                }
+            } catch (err) {
+                statusEl.textContent = err.message || 'Sign-in failed.';
+                statusEl.style.color = '#dc2626';
+                signInBtn.disabled = false;
+                signInBtn.textContent = 'Sign in to Google Drive';
+            }
+        };
+
+        laterBtn.onclick = () => overlay.remove();
+
+        btns.appendChild(signInBtn);
+        btns.appendChild(laterBtn);
+        card.appendChild(titleEl);
+        card.appendChild(descEl);
+        card.appendChild(statusEl);
+        card.appendChild(btns);
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
     }
 
     // Function to inject toolkit icon on header (left of notification bell)
@@ -7394,8 +7720,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 customTooltip.id = ':r-toolkit:';
                 customTooltip.setAttribute('role', 'tooltip');
                 customTooltip.className = 'react-tooltip core-styles-module_tooltip__3vRRp styles-module_tooltip__mnnfp styles-module_dark__xNqje !px-2.5 !py-1.5 !rounded-[9px] !bg-black !whitespace-nowrap !transition-opacity !duration-300 react-tooltip__place-right core-styles-module_show__Nt9eE react-tooltip__show';
-                customTooltip.style.cssText = 'z-index: 200000; border: 1px solid rgb(71, 71, 71); opacity: 1;';
-                customTooltip.textContent = 'S.AI Toolkit';
+                const authErr = driveAuthErrorMessage;
+                customTooltip.style.cssText = `z-index: 200000; border: 1px solid ${authErr ? '#dc2626' : 'rgb(71, 71, 71)'}; opacity: 1;`;
+                customTooltip.textContent = authErr ? authErr : 'S.AI Toolkit';
                 
                 // Create the arrow element
                 const arrow = document.createElement('div');
@@ -9145,7 +9472,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     border-radius: 12px;
                     width: 420px;
                     max-width: 95vw;
-                    max-height: 85vh;
+                    max-height: 85vh;   /* fallback for browsers without dvh */
+                    max-height: 85dvh;  /* dynamic viewport: excludes iOS toolbars */
                     z-index: 10000004;
                     pointer-events: auto;
                     display: flex;
@@ -9155,9 +9483,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 @media (max-width: 480px) {
                     .modal {
+                        /* Pin to the VISIBLE viewport instead of centering a large-viewport
+                           box. On iOS, vh = the large viewport (ignores the address/tab bars),
+                           so a centered max-height:100vh modal overflowed the visible area top
+                           AND bottom — clipping the tabs and the Save/Close row. Anchoring
+                           top-left at 100dvh fills exactly the visible viewport, and the flex
+                           column (pinned header/tabs + scrolling body + pinned button row)
+                           keeps everything reachable. */
+                        top: 0;
+                        left: 0;
+                        transform: none;
                         width: 100%;
                         max-width: 100vw;
-                        max-height: 100vh;
+                        height: 100vh;       /* fallback */
+                        height: 100dvh;
+                        max-height: 100vh;   /* fallback */
+                        max-height: 100dvh;
                         border-radius: 0;
                         padding: 0.75rem;
                     }
@@ -9170,6 +9511,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     font-size: 1.1rem;
                     font-weight: bold;
                     padding-bottom: 0.5rem;
+                    flex-shrink: 0;
                 }
                 
                 /* Tab Navigation */
@@ -9245,14 +9587,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     display: none;
                     flex-direction: column;
                     gap: 0.5rem;
-                    overflow-y: auto;
-                    flex: 1;
-                    min-height: 0;
                 }
                 .tab-content.active {
                     display: flex;
                 }
-                
+
                 .modal-body {
                     overflow-y: auto;
                     display: flex;
@@ -9260,6 +9599,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     gap: 0.5rem;
                     flex: 1;
                     min-height: 0;
+                    margin-right: -1rem;
+                    padding-right: 1rem;
+                }
+                @media (max-width: 480px) {
+                    .modal-body {
+                        margin-right: -0.75rem;
+                        padding-right: 0.75rem;
+                    }
                 }
                 .setting-row {
                     background: #f3f4f6;
@@ -9360,6 +9707,94 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     color: #6b7280;
                     margin-bottom: 0.5rem;
                 }
+                .drive-sync-status {
+                    font-size: 11px;
+                    color: #9ca3af;
+                    margin-bottom: 0.25rem;
+                    min-height: 1.2em;
+                }
+                .sync-scope-row {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.75rem;
+                    flex-wrap: wrap;
+                    margin-bottom: 0.35rem;
+                }
+                .sync-scope-label {
+                    font-size: 11px;
+                    color: #6b7280;
+                }
+                .sync-scope-item {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.3rem;
+                    font-size: 12px;
+                    color: #374151;
+                    cursor: pointer;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .sync-scope-item { color: #d1d5db; }
+                }
+                .auto-sync-select {
+                    font-size: 11px;
+                    padding: 0.1rem 0.3rem;
+                    border-radius: 4px;
+                    border: 1px solid #d1d5db;
+                    background: transparent;
+                    color: #374151;
+                    cursor: pointer;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .auto-sync-select { border-color: #4b5563; color: #d1d5db; background: #1f2937; }
+                }
+                .drive-backup-header {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    margin-bottom: 0.25rem;
+                }
+                .drive-backup-title {
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: #374151;
+                }
+                .drive-backup-list {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.25rem;
+                    max-height: 168px;
+                    overflow-y: auto;
+                    margin-top: 0.2rem;
+                }
+                .drive-backup-item {
+                    display: flex;
+                    align-items: center;
+                    padding: 0.3rem 0.5rem;
+                    background: #f3f4f6;
+                    border-radius: 6px;
+                    gap: 0.5rem;
+                }
+                .drive-backup-item-date {
+                    font-size: 11px;
+                    color: #374151;
+                    flex: 1;
+                }
+                .drive-backup-item-btns {
+                    display: flex;
+                    gap: 0.25rem;
+                    flex-shrink: 0;
+                }
+                .drive-backup-empty, .drive-backup-loading {
+                    font-size: 11px;
+                    color: #9ca3af;
+                    padding: 0.5rem;
+                    text-align: center;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .drive-backup-title { color: #d1d5db; }
+                    .drive-backup-item { background: #374151; }
+                    .drive-backup-item-date { color: #d1d5db; }
+                }
                 .data-buttons {
                     display: flex;
                     gap: 0.5rem;
@@ -9428,6 +9863,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     gap: 0.5rem;
                     padding-top: 0.5rem;
                     border-top: 1px solid #e5e7eb;
+                    flex-shrink: 0;
                 }
                 @media (prefers-color-scheme: dark) {
                     .button-row { border-color: #404040; }
@@ -10252,6 +10688,59 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </div>
                     
+                    <div class="section-title">Drive Sync</div>
+                    <div class="section-desc">Sync your data across devices via Google Drive. This will automatically save your generation stats across all your devices, enabling you to start a chat on one, and resume on another while carrying over the generation statistics.</div>
+                    <div class="sync-scope-row">
+                        <span class="sync-scope-label">Sync:</span>
+                        <label class="sync-scope-item">
+                            <input type="checkbox" class="setting-checkbox" id="sync-stats-toggle" autocomplete="off">
+                            <span>Stats</span>
+                        </label>
+                        <label class="sync-scope-item">
+                            <input type="checkbox" class="setting-checkbox" id="sync-settings-toggle" autocomplete="off">
+                            <span>Settings</span>
+                        </label>
+                        <label class="sync-scope-item">
+                            <input type="checkbox" class="setting-checkbox" id="sync-style-toggle" autocomplete="off">
+                            <span>Style</span>
+                        </label>
+                    </div>
+                    <div class="sync-scope-row">
+                        <label class="sync-scope-item">
+                            <input type="checkbox" class="setting-checkbox" id="auto-sync-toggle" autocomplete="off">
+                            <span>Auto-sync</span>
+                        </label>
+                        <select id="auto-sync-interval" class="auto-sync-select" style="display:none;">
+                            <option value="5">every 5 min</option>
+                            <option value="10">every 10 min</option>
+                            <option value="15">every 15 min</option>
+                        </select>
+                    </div>
+                    <div id="drive-sync-status" class="drive-sync-status">Checking…</div>
+                    <div class="data-buttons" style="margin-top: 0.5rem;">
+                        <button class="btn-data" id="drive-sync-btn">Sync Now</button>
+                        <button class="btn-data" id="drive-disconnect-btn" style="display: none; color: #dc2626; border-color: #dc2626;">Disconnect</button>
+                    </div>
+                    <div id="sync-progress-section" style="display: none; margin-top: 0.6rem;">
+                        <div id="sync-progress-text" style="font-size: 0.72rem; color: #9ca3af; margin-bottom: 0.35rem; font-style: italic;"></div>
+                        <div style="height: 3px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
+                            <div id="sync-progress-bar" style="height: 100%; background: #6366f1; border-radius: 2px; width: 0%; transition: width 0.4s ease;"></div>
+                        </div>
+                    </div>
+                    <div id="drive-backup-section" style="display: none; margin-top: 0.75rem;">
+                        <div class="drive-backup-header">
+                            <span class="drive-backup-title">Backups</span>
+                            <div style="display: flex; gap: 0.4rem;">
+                                <button class="btn-data" id="drive-create-backup-btn">Create Backup</button>
+                                <button class="btn-data" id="drive-open-folder-btn">Open in Drive ↗</button>
+                            </div>
+                        </div>
+                        <div id="drive-backup-status" class="drive-sync-status"></div>
+                        <div id="drive-backup-list" class="drive-backup-list">
+                            <div class="drive-backup-loading">Loading backups…</div>
+                        </div>
+                    </div>
+
                     <div class="section-title">Custom Style</div>
                     <div class="section-desc">Export or import custom style settings</div>
                     <div class="data-buttons">
@@ -10269,7 +10758,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         <button class="btn-data" id="clear-all-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Clear All Data</button>
                     </div>
                     
-                    <div class="version-text" id="version-text">v1.0.65</div>
+                    <div class="version-text" id="version-text">v1.0.69.29</div>
                     
                     <!-- Debug Log Filters (only visible in debug mode) -->
                     <div id="debug-filters-section" class="hidden" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.1);">
@@ -10317,6 +10806,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             </label>
                             <label class="debug-filter-label">
                                 <input type="checkbox" id="debug-filter-compact" checked> Compact
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-sync" checked> Sync
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-autoregen" checked> AutoRegen
+                            </label>
+                            <label class="debug-filter-label">
+                                <input type="checkbox" id="debug-filter-msgrecovery" checked> MsgRecovery
                             </label>
                         </div>
                         <div class="data-buttons" style="margin-top: 0.75rem;">
@@ -10477,18 +10975,42 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             Cache: shadow.querySelector('#debug-filter-cache'),
             Migration: shadow.querySelector('#debug-filter-migration'),
             Custom: shadow.querySelector('#debug-filter-custom'),
-            Compact: shadow.querySelector('#debug-filter-compact')
+            Compact: shadow.querySelector('#debug-filter-compact'),
+            Sync: shadow.querySelector('#debug-filter-sync'),
+            AutoRegen: shadow.querySelector('#debug-filter-autoregen'),
+            MsgRecovery: shadow.querySelector('#debug-filter-msgrecovery')
         };
         
-        // Initialize debug filter checkboxes from current state
+        // Refresh in-memory filters from storage (source of truth) before initializing the
+        // checkboxes — so reopening the modal reflects what was actually persisted, not a
+        // possibly-stale in-memory object.
+        try {
+            const storedFilters = await storage.get('debugLogFilters', null);
+            if (storedFilters && typeof storedFilters === 'object') {
+                debugLogFilters = { ...debugLogFilters, ...storedFilters };
+            }
+        } catch (_) { /* keep in-memory */ }
+
+        // Initialize debug filter checkboxes from current state.
+        // NOTE: persistence binds BOTH 'change' AND 'click'. On WebKit/Orion the synthesized
+        // `change` from a <label>-nested checkbox inside a shadow root is unreliable (same
+        // event-synthesis fragility as the WYSIWYG iOS issue), and — unlike every other
+        // setting — debug filters have no Save-time fallback (Save & Refresh never reads
+        // them). `click` fires reliably on tap/keyboard after the native toggle; the de-dupe
+        // guard makes binding both harmless.
         for (const [category, checkbox] of Object.entries(debugFilterCheckboxes)) {
             if (checkbox) {
                 checkbox.checked = debugLogFilters[category] !== false;
-                checkbox.addEventListener('change', async () => {
-                    debugLogFilters[category] = checkbox.checked;
+                const applyDebugFilter = async () => {
+                    if (debugLogFilters[category] === checkbox.checked) return; // de-dupe (both events / no real change)
+                    debugLogFilters[category] = checkbox.checked;               // flips the live debugLog() check immediately
                     await storage.set('debugLogFilters', debugLogFilters);
                     console.log(`[Core] Debug filter "${category}" ${checkbox.checked ? 'enabled' : 'disabled'}`);
-                });
+                };
+                checkbox.addEventListener('change', applyDebugFilter);
+                // WebKit/Orion fallback: defer one tick so checkbox.checked has settled to its
+                // post-toggle value before we read it.
+                checkbox.addEventListener('click', () => { setTimeout(applyDebugFilter, 0); });
             }
         }
         
@@ -10883,7 +11405,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
         const clearAllBtn = shadow.querySelector('#clear-all-btn');
-        
+        const driveSyncBtn = shadow.querySelector('#drive-sync-btn');
+        const driveDisconnectBtn = shadow.querySelector('#drive-disconnect-btn');
+        const driveSyncStatus = shadow.querySelector('#drive-sync-status');
+        const syncStatsToggle = shadow.querySelector('#sync-stats-toggle');
+        const syncSettingsToggle = shadow.querySelector('#sync-settings-toggle');
+        const syncStyleToggle = shadow.querySelector('#sync-style-toggle');
+        const driveBackupSection = shadow.querySelector('#drive-backup-section');
+        const driveCreateBackupBtn = shadow.querySelector('#drive-create-backup-btn');
+        const driveOpenFolderBtn = shadow.querySelector('#drive-open-folder-btn');
+        const driveBackupStatus = shadow.querySelector('#drive-backup-status');
+        const driveBackupList = shadow.querySelector('#drive-backup-list');
+        const autoSyncToggle = shadow.querySelector('#auto-sync-toggle');
+        const autoSyncIntervalSelect = shadow.querySelector('#auto-sync-interval');
+
         // Check if this is first run (onboarding) - disable cancel if so
         const hasSeenOnboarding = await storage.get('hasSeenOnboarding', false);
         if (!hasSeenOnboarding) {
@@ -11404,6 +11939,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Close modal function
         const closeModal = () => {
+            syncProgressCallback = null;
             debugLog('[Core] ===== CLOSE MODAL CALLED =====');
             debugLog('[Core] Current time:', Date.now());
             debugLog('[Core] Backdrop element:', backdrop);
@@ -11550,6 +12086,563 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             };
         };
         
+        // Drive Sync UI
+        (async () => {
+            let driveBackupFolderUrl = null;
+
+            // ---- keepalive: pin the (Orion/MV2) background page for the duration of ANY
+            // Drive RPC. Drive operations (sync, backup list/restore, status) can trigger
+            // an interactive Google sign-in tab flow lasting many seconds; without a held
+            // port the background page is OS-suspended on WebKit, which silently kills its
+            // in-flight IndexedDB connection and later hangs the resync ("Merging data…").
+            // Ref-counted so concurrent/nested calls (incl. the retry) share one port and
+            // it closes only when the last in-flight call finishes.
+            let _driveKeepalivePort = null;
+            let _driveKeepaliveRefs = 0;
+            const acquireDriveKeepalive = () => {
+                _driveKeepaliveRefs++;
+                if (!_driveKeepalivePort) {
+                    try {
+                        _driveKeepalivePort = runtimeAPI.runtime.connect({ name: 'sai-sync-keepalive' });
+                        _driveKeepalivePort.onDisconnect.addListener(() => { _driveKeepalivePort = null; });
+                    } catch (_) { _driveKeepalivePort = null; }
+                }
+            };
+            const releaseDriveKeepalive = () => {
+                _driveKeepaliveRefs = Math.max(0, _driveKeepaliveRefs - 1);
+                if (_driveKeepaliveRefs === 0 && _driveKeepalivePort) {
+                    try { _driveKeepalivePort.disconnect(); } catch (_) {}
+                    _driveKeepalivePort = null;
+                }
+            };
+
+            // ---- shared Drive message helper ----
+            // Retries once on "Receiving end does not exist" — Chrome MV3 SW may not be ready on first modal open.
+            // Holds a keepalive port for each call so an interactive auth tab flow can't be suspended mid-flight.
+            const sendDriveMessage = (type, payload, _retries = 1) => {
+                acquireDriveKeepalive();
+                return new Promise((resolve, reject) => {
+                    runtimeAPI.runtime.sendMessage({ type, ...payload }, (res) => {
+                        const err = runtimeAPI.runtime.lastError;
+                        if (err) {
+                            if (_retries > 0 && err.message && err.message.includes('Could not establish connection')) {
+                                setTimeout(() => sendDriveMessage(type, payload, _retries - 1).then(resolve).catch(reject), 300);
+                            } else {
+                                reject(new Error(err.message));
+                            }
+                        } else {
+                            resolve(res);
+                        }
+                    });
+                }).finally(() => releaseDriveKeepalive());
+            };
+
+            // ---- status display ----
+            const updateDriveStatus = async () => {
+                const { driveLastSync, driveFileId } = await storage.getMultiple(['driveLastSync', 'driveFileId']);
+                if (driveLastSync) {
+                    driveSyncStatus.textContent = `Last synced: ${new Date(driveLastSync).toLocaleString()}`;
+                    driveSyncStatus.style.color = '#10b981';
+                    driveDisconnectBtn.style.display = '';
+                } else if (driveFileId) {
+                    driveSyncStatus.textContent = 'Connected — not yet synced this session.';
+                    driveSyncStatus.style.color = '#9ca3af';
+                    driveDisconnectBtn.style.display = '';
+                } else {
+                    driveSyncStatus.textContent = 'Not connected to Google Drive.';
+                    driveSyncStatus.style.color = '#9ca3af';
+                    driveDisconnectBtn.style.display = 'none';
+                }
+                const isConnected = !!(driveLastSync || driveFileId);
+                driveBackupSection.style.display = isConnected ? '' : 'none';
+                if (isConnected) loadDriveBackupList();
+            };
+
+            // ---- backup list renderer ----
+            const loadDriveBackupList = async () => {
+                driveBackupList.replaceChildren();
+                const loading = document.createElement('div');
+                loading.className = 'drive-backup-loading';
+                loading.textContent = 'Loading backups…';
+                driveBackupList.appendChild(loading);
+                try {
+                    const res = await sendDriveMessage('SAI_DRIVE_LIST_BACKUPS');
+                    driveBackupList.replaceChildren();
+                    if (!res || !res.success) {
+                        const errEl = document.createElement('div');
+                        errEl.className = 'drive-backup-empty';
+                        errEl.textContent = (res && res.error) || 'Failed to load backups.';
+                        driveBackupList.appendChild(errEl);
+                        return;
+                    }
+                    if (res.folderId) driveBackupFolderUrl = `https://drive.google.com/drive/folders/${res.folderId}`;
+                    if (!res.backups || res.backups.length === 0) {
+                        const empty = document.createElement('div');
+                        empty.className = 'drive-backup-empty';
+                        empty.textContent = 'No backups yet.';
+                        driveBackupList.appendChild(empty);
+                        return;
+                    }
+                    for (const backup of res.backups) {
+                        const item = document.createElement('div');
+                        item.className = 'drive-backup-item';
+                        const dateEl = document.createElement('div');
+                        dateEl.className = 'drive-backup-item-date';
+                        dateEl.textContent = new Date(backup.createdTime).toLocaleString();
+                        const btns = document.createElement('div');
+                        btns.className = 'drive-backup-item-btns';
+                        const restoreBtn = document.createElement('button');
+                        restoreBtn.className = 'btn-data';
+                        restoreBtn.style.cssText = 'padding:0.15rem 0.45rem;font-size:11px;';
+                        restoreBtn.textContent = 'Restore';
+                        restoreBtn.onclick = async (ev) => {
+                            ev.stopPropagation();
+                            if (!confirm(`Restore from this backup?\n\n${dateEl.textContent}\n\nSettings will be overwritten and stats merged with current data. The page will reload.`)) return;
+                            restoreBtn.disabled = true;
+                            restoreBtn.textContent = 'Restoring…';
+                            try {
+                                const restoreRes = await sendDriveMessage('SAI_DRIVE_RESTORE_BACKUP', { fileId: backup.id });
+                                if (!restoreRes || !restoreRes.success) {
+                                    alert((restoreRes && restoreRes.error) || 'Restore failed.');
+                                    restoreBtn.disabled = false;
+                                    restoreBtn.textContent = 'Restore';
+                                    return;
+                                }
+                                await applyImportedData(restoreRes.data);
+                            } catch (err) {
+                                alert(err.message || 'Restore failed.');
+                                restoreBtn.disabled = false;
+                                restoreBtn.textContent = 'Restore';
+                            }
+                        };
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.className = 'btn-data';
+                        deleteBtn.style.cssText = 'padding:0.15rem 0.45rem;font-size:11px;color:#dc2626;border-color:#dc2626;';
+                        deleteBtn.textContent = 'Delete';
+                        deleteBtn.onclick = async (ev) => {
+                            ev.stopPropagation();
+                            if (!confirm(`Delete this backup?\n\n${dateEl.textContent}\n\nThis cannot be undone.`)) return;
+                            deleteBtn.disabled = true;
+                            deleteBtn.textContent = 'Deleting…';
+                            try {
+                                const delRes = await sendDriveMessage('SAI_DRIVE_DELETE_BACKUP', { fileId: backup.id });
+                                if (!delRes || !delRes.success) {
+                                    alert((delRes && delRes.error) || 'Delete failed.');
+                                    deleteBtn.disabled = false;
+                                    deleteBtn.textContent = 'Delete';
+                                    return;
+                                }
+                                item.remove();
+                                if (!driveBackupList.children.length) {
+                                    const empty = document.createElement('div');
+                                    empty.className = 'drive-backup-empty';
+                                    empty.textContent = 'No backups yet.';
+                                    driveBackupList.appendChild(empty);
+                                }
+                            } catch (err) {
+                                alert(err.message || 'Delete failed.');
+                                deleteBtn.disabled = false;
+                                deleteBtn.textContent = 'Delete';
+                            }
+                        };
+                        btns.appendChild(restoreBtn);
+                        btns.appendChild(deleteBtn);
+                        item.appendChild(dateEl);
+                        item.appendChild(btns);
+                        driveBackupList.appendChild(item);
+                    }
+                } catch (err) {
+                    driveBackupList.replaceChildren();
+                    const errEl = document.createElement('div');
+                    errEl.className = 'drive-backup-empty';
+                    errEl.textContent = err.message || 'Failed to load backups.';
+                    driveBackupList.appendChild(errEl);
+                }
+            };
+
+            // ---- apply imported/restored data (mirrors importAllBtn logic) ----
+            const applyImportedData = async (imported) => {
+                // Un-nest v2 grouped backups (settings/style/stats) so the flat-key reads
+                // below resolve. v1/flat payloads pass through unchanged.
+                imported = normalizeImportPayload(imported);
+                const showProgress = (statusText, pct) => {
+                    let overlay = shadow.getElementById('import-progress-overlay');
+                    if (!overlay) {
+                        overlay = document.createElement('div');
+                        overlay.id = 'import-progress-overlay';
+                        overlay.style.cssText = 'position:fixed;inset:0;z-index:10000005;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;pointer-events:auto;';
+                        const card = document.createElement('div');
+                        card.style.cssText = 'background:#1f2937;border-radius:12px;padding:1.5rem 2rem;display:flex;flex-direction:column;gap:0.75rem;min-width:280px;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+                        const titleEl = document.createElement('div');
+                        titleEl.textContent = 'Restoring…';
+                        titleEl.style.cssText = 'color:#f9fafb;font-size:14px;font-weight:600;';
+                        const statusEl = document.createElement('div');
+                        statusEl.id = 'import-progress-status';
+                        statusEl.style.cssText = 'color:#9ca3af;font-size:12px;min-height:1.2em;';
+                        const track = document.createElement('div');
+                        track.style.cssText = 'height:4px;background:#374151;border-radius:2px;overflow:hidden;';
+                        const fill = document.createElement('div');
+                        fill.id = 'import-progress-fill';
+                        fill.style.cssText = 'height:100%;background:#3b82f6;border-radius:2px;transition:width 0.2s ease;width:0%;';
+                        track.appendChild(fill);
+                        card.appendChild(titleEl); card.appendChild(statusEl); card.appendChild(track);
+                        overlay.appendChild(card);
+                        shadow.appendChild(overlay);
+                    }
+                    shadow.getElementById('import-progress-status').textContent = statusText;
+                    shadow.getElementById('import-progress-fill').style.width = pct + '%';
+                };
+
+                let generationProfilesValue = imported.generationProfiles;
+                let messageGenerationStatsValue = imported.messageGenerationStats;
+                if (typeof generationProfilesValue === 'object' && generationProfilesValue !== null) {
+                    generationProfilesValue = JSON.stringify(generationProfilesValue);
+                }
+                if (typeof messageGenerationStatsValue === 'object' && messageGenerationStatsValue !== null) {
+                    messageGenerationStatsValue = JSON.stringify(messageGenerationStatsValue);
+                }
+
+                const updates = {};
+                if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
+                if (imported.sidebarMinWidth !== undefined) updates.sidebarMinWidth = imported.sidebarMinWidth;
+                if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
+                if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
+                if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
+                if (imported.customStyleValues !== undefined) updates.customStyleValues = imported.customStyleValues;
+                if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
+                    updates.enableClassicLayout = imported.enableThemeCustomization;
+                    updates.enableClassicStyle = imported.enableThemeCustomization;
+                }
+                if (imported.enableCompactGeneration !== undefined) updates.enableCompactGeneration = imported.enableCompactGeneration;
+                if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
+                if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
+                if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
+                if (imported.showModelDetails !== undefined) updates.showModelDetails = imported.showModelDetails;
+                if (imported.showTimestamp !== undefined) updates.showTimestamp = imported.showTimestamp;
+                if (imported.timestampDateFirst !== undefined) updates.timestampDateFirst = imported.timestampDateFirst;
+                if (imported.timestamp24Hour !== undefined) updates.timestamp24Hour = imported.timestamp24Hour;
+                if (imported.showMessageIds !== undefined) updates.showMessageIds = imported.showMessageIds;
+                if (imported.showChatNameInTitle !== undefined) updates.showChatNameInTitle = imported.showChatNameInTitle;
+                if (imported.nsfwToggleEnabled !== undefined) updates.nsfwToggleEnabled = imported.nsfwToggleEnabled;
+                if (imported.messageRecoveryEnabled !== undefined) updates.messageRecoveryEnabled = imported.messageRecoveryEnabled;
+                if (imported.enableWysiwygEditor !== undefined) updates.enableWysiwygEditor = imported.enableWysiwygEditor;
+                if (imported.enableGenerationProfiles !== undefined) updates.enableGenerationProfiles = imported.enableGenerationProfiles;
+                if (imported.enableSmallProfileImages !== undefined) updates.enableSmallProfileImages = imported.enableSmallProfileImages;
+                if (imported.enableRoundedProfileImages !== undefined) updates.enableRoundedProfileImages = imported.enableRoundedProfileImages;
+                if (imported.swapCheckboxPosition !== undefined) updates.swapCheckboxPosition = imported.swapCheckboxPosition;
+                if (imported.squareMessageEdges !== undefined) updates.squareMessageEdges = imported.squareMessageEdges;
+                if (imported.highlightModelChanges !== undefined) updates.highlightModelChanges = imported.highlightModelChanges;
+                if (imported.autoRegenOnMismatch !== undefined) updates.autoRegenOnMismatch = imported.autoRegenOnMismatch;
+                if (imported.autoRegenOnShort !== undefined) updates.autoRegenOnShort = imported.autoRegenOnShort;
+                if (imported.autoRegenMaxAttempts !== undefined) updates.autoRegenMaxAttempts = imported.autoRegenMaxAttempts;
+                if (imported.messageContainerMaxWidth !== undefined) updates[MESSAGE_CONTAINER_MAX_WIDTH_KEY] = imported.messageContainerMaxWidth;
+                if (imported.memoryDotEnabled !== undefined) updates[MEMORY_DOT_ENABLED_KEY] = imported.memoryDotEnabled;
+                if (imported.memoryDotColor !== undefined) updates[MEMORY_DOT_COLOR_KEY] = imported.memoryDotColor;
+                if (imported.hideCreatorName !== undefined) updates[HIDE_CREATOR_KEY] = imported.hideCreatorName;
+                if (generationProfilesValue !== undefined) updates.generationProfiles = generationProfilesValue;
+                if (imported.lastSelectedProfile !== undefined) updates.lastSelectedProfile = imported.lastSelectedProfile;
+
+                const removeProgress = () => {
+                    const ov = shadow.getElementById('import-progress-overlay');
+                    if (ov) ov.remove();
+                };
+
+                try {
+                    showProgress('Restoring settings…', 20);
+                    await new Promise(r => setTimeout(r, 0));
+
+                    if (messageGenerationStatsValue !== undefined) {
+                        const importedStats = JSON.parse(messageGenerationStatsValue);
+                        const botCount = Object.keys(importedStats).length;
+                        showProgress(`Merging stats (${botCount} bots)…`, 45);
+                        await new Promise(r => setTimeout(r, 0));
+                        // Stats live in the background IndexedDB store — merge there (authoritative,
+                        // collapses conversation level, never overwrites richer entries). Not written
+                        // to storage.local, so keep it out of `updates`. (Page reloads after restore,
+                        // so the content-side cache refreshes naturally.) Fail loudly if the merge
+                        // failed — never reload as if a failed stats restore succeeded.
+                        const mergeRes = await sendStatsMessage('SAI_STATS_IMPORT_MERGE', { stats: importedStats });
+                        if (!mergeRes || !mergeRes.success) {
+                            throw new Error('Stats merge failed: ' + ((mergeRes && mergeRes.error) || 'unknown error'));
+                        }
+                    }
+
+                    showProgress('Saving…', 75);
+                    await new Promise(r => setTimeout(r, 0));
+                    await storage.setMultiple(updates);
+                    showProgress('Done! Reloading…', 100);
+                    await new Promise(r => setTimeout(r, 0));
+                    setTimeout(() => { window.location.reload(); }, 800);
+                } catch (err) {
+                    removeProgress();
+                    alert('Restore failed: ' + (err.message || 'Unknown error'));
+                    throw err;
+                }
+            };
+
+            // ---- pre-connect confirmation prompt ----
+            const showPreConnectPrompt = () => new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.style.cssText = 'position:fixed;inset:0;z-index:10000005;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;pointer-events:auto;';
+                const card = document.createElement('div');
+                card.style.cssText = 'background:#1f2937;border-radius:12px;padding:1.5rem 2rem;display:flex;flex-direction:column;gap:0.75rem;min-width:300px;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+                const titleEl = document.createElement('div');
+                titleEl.textContent = 'Connect Google Drive';
+                titleEl.style.cssText = 'color:#f9fafb;font-size:14px;font-weight:600;';
+                // What & why
+                const explainEl = document.createElement('div');
+                explainEl.textContent = 'Back up your settings and generation stats to your own Google Drive and sync them across devices.';
+                explainEl.style.cssText = 'color:#9ca3af;font-size:12px;line-height:1.5;';
+                // Scope reassurance (highlighted) — the single biggest trust concern
+                const scopeEl = document.createElement('div');
+                scopeEl.textContent = 'S.AI Toolkit can only see the one file it creates (sai-toolkit-sync.json) — never the rest of your Drive.';
+                scopeEl.style.cssText = 'color:#bfdbfe;font-size:12px;line-height:1.5;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.35);border-radius:6px;padding:0.5rem 0.6rem;';
+                // Expectation-setting for Google's own consent screen
+                const expectEl = document.createElement('div');
+                expectEl.textContent = 'Google will show its own sign-in screen next. While our app review is pending it may show the developer’s web address instead of “S.AI Toolkit” and note the app isn’t verified — that’s normal for new apps.';
+                expectEl.style.cssText = 'color:#9ca3af;font-size:11px;line-height:1.5;';
+                const descEl = document.createElement('div');
+                descEl.textContent = 'First time connecting — would you like to download a local backup of your data before syncing?';
+                descEl.style.cssText = 'color:#9ca3af;font-size:12px;line-height:1.5;margin-top:0.25rem;';
+                const btns = document.createElement('div');
+                btns.style.cssText = 'display:flex;flex-direction:column;gap:0.4rem;margin-top:0.25rem;';
+                const downloadBtn = document.createElement('button');
+                downloadBtn.textContent = 'Download Local Backup First';
+                downloadBtn.style.cssText = 'padding:0.5rem 1rem;border-radius:6px;border:1px solid #3b82f6;background:#1d4ed8;color:#fff;font-size:12px;cursor:pointer;';
+                const skipBtn = document.createElement('button');
+                skipBtn.textContent = 'Connect Without Backup';
+                skipBtn.style.cssText = 'padding:0.5rem 1rem;border-radius:6px;border:1px solid #4b5563;background:transparent;color:#9ca3af;font-size:12px;cursor:pointer;';
+                const cancelEl = document.createElement('button');
+                cancelEl.textContent = 'Cancel';
+                cancelEl.style.cssText = 'padding:0.25rem;border:none;background:transparent;color:#6b7280;font-size:11px;cursor:pointer;text-align:center;';
+                downloadBtn.onclick = () => { overlay.remove(); resolve('download'); };
+                skipBtn.onclick = () => { overlay.remove(); resolve('connect'); };
+                cancelEl.onclick = () => { overlay.remove(); resolve('cancel'); };
+                btns.appendChild(downloadBtn);
+                btns.appendChild(skipBtn);
+                btns.appendChild(cancelEl);
+                card.appendChild(titleEl);
+                card.appendChild(explainEl);
+                card.appendChild(scopeEl);
+                card.appendChild(expectEl);
+                card.appendChild(descEl);
+                card.appendChild(btns);
+                overlay.appendChild(card);
+                shadow.appendChild(overlay);
+            });
+
+            // ---- init: load sync scope and auto-sync preferences ----
+            const savedPrefs = await storage.getMultiple({
+                driveSyncStats: true,
+                driveSyncSettings: false,
+                driveSyncStyle: true,
+                driveAutoSync: false,
+                driveAutoSyncInterval: 10
+            });
+            syncStatsToggle.checked    = !!savedPrefs.driveSyncStats;
+            syncSettingsToggle.checked = !!savedPrefs.driveSyncSettings;
+            syncStyleToggle.checked    = !!savedPrefs.driveSyncStyle;
+            autoSyncToggle.checked     = !!savedPrefs.driveAutoSync;
+            autoSyncIntervalSelect.value = String(savedPrefs.driveAutoSyncInterval || 10);
+            autoSyncIntervalSelect.style.display = savedPrefs.driveAutoSync ? '' : 'none';
+
+            const persistSyncPrefs = () => storage.setMultiple({
+                driveSyncStats:    syncStatsToggle.checked,
+                driveSyncSettings: syncSettingsToggle.checked,
+                driveSyncStyle:    syncStyleToggle.checked
+            });
+
+            const applyAutoSyncPref = async () => {
+                const enabled = autoSyncToggle.checked;
+                const intervalMinutes = parseInt(autoSyncIntervalSelect.value, 10);
+                autoSyncIntervalSelect.style.display = enabled ? '' : 'none';
+                await storage.setMultiple({ driveAutoSync: enabled, driveAutoSyncInterval: intervalMinutes });
+                await sendDriveMessage('SAI_DRIVE_SET_AUTO_SYNC', { enabled, intervalMinutes });
+            };
+            autoSyncToggle.onchange         = applyAutoSyncPref;
+            autoSyncIntervalSelect.onchange = applyAutoSyncPref;
+            syncStatsToggle.onchange    = persistSyncPrefs;
+            syncSettingsToggle.onchange = persistSyncPrefs;
+            syncStyleToggle.onchange    = persistSyncPrefs;
+
+            await updateDriveStatus();
+
+            // ---- event handlers ----
+            const syncProgressSection = shadow.querySelector('#sync-progress-section');
+            const syncProgressText    = shadow.querySelector('#sync-progress-text');
+            const syncProgressBar     = shadow.querySelector('#sync-progress-bar');
+
+            const showSyncProgress = (msg) => {
+                debugLog(`[Sync] Progress update in UI: [${msg.stepNum}/${msg.totalSteps}] ${msg.step}`);
+                if (syncProgressSection) syncProgressSection.style.display = '';
+                if (syncProgressText) syncProgressText.textContent = msg.step + (msg.detail ? ` — ${msg.detail}` : '');
+                if (syncProgressBar) syncProgressBar.style.width = `${Math.round((msg.stepNum / msg.totalSteps) * 100)}%`;
+            };
+
+            const hideSyncProgress = (delayMs = 1500) => {
+                if (syncProgressBar) syncProgressBar.style.width = '100%';
+                setTimeout(() => {
+                    if (syncProgressSection) syncProgressSection.style.display = 'none';
+                    if (syncProgressBar) { syncProgressBar.style.background = '#6366f1'; syncProgressBar.style.width = '0%'; }
+                    if (syncProgressText) { syncProgressText.textContent = ''; syncProgressText.style.color = '#9ca3af'; }
+                }, delayMs);
+            };
+
+            const showSyncError = (msg) => {
+                if (syncProgressSection) syncProgressSection.style.display = '';
+                if (syncProgressText) { syncProgressText.textContent = msg; syncProgressText.style.color = '#ef4444'; }
+                if (syncProgressBar) { syncProgressBar.style.background = '#ef4444'; syncProgressBar.style.width = '100%'; }
+                setTimeout(() => {
+                    if (syncProgressSection) syncProgressSection.style.display = 'none';
+                    if (syncProgressBar) { syncProgressBar.style.background = '#6366f1'; syncProgressBar.style.width = '0%'; }
+                    if (syncProgressText) { syncProgressText.textContent = ''; syncProgressText.style.color = '#9ca3af'; }
+                }, 4000);
+            };
+
+            driveSyncBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const { driveFileId, driveLastSync } = await storage.getMultiple(['driveFileId', 'driveLastSync']);
+                debugLog('[Sync] Sync Now clicked — driveFileId:', driveFileId, 'driveLastSync:', driveLastSync);
+                if (!driveFileId && !driveLastSync) {
+                    const choice = await showPreConnectPrompt();
+                    if (choice === 'cancel') return;
+                    if (choice === 'download') {
+                        exportAllBtn.click();
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                }
+                driveSyncBtn.disabled = true;
+                driveSyncBtn.textContent = 'Syncing…';
+                driveSyncStatus.textContent = '';
+                driveSyncStatus.style.color = '#9ca3af';
+                // Show progress bar and wire up progress callback
+                if (syncProgressSection) syncProgressSection.style.display = '';
+                if (syncProgressText) syncProgressText.textContent = 'Starting…';
+                if (syncProgressBar) syncProgressBar.style.width = '0%';
+                syncProgressCallback = showSyncProgress;
+                const syncStats    = syncStatsToggle.checked;
+                const syncSettings = syncSettingsToggle.checked;
+                const syncStyle    = syncStyleToggle.checked;
+                debugLog('[Sync] Sending SAI_DRIVE_SYNC — syncStats:', syncStats, 'syncSettings:', syncSettings, 'syncStyle:', syncStyle);
+                // Note: sendDriveMessage now holds the background-keepalive port for the
+                // duration of every Drive RPC (including the auth tab flow), so no separate
+                // sync-scoped keepalive is needed here.
+                let _alreadyRunning = false;
+                try {
+                    const result = await sendDriveMessage('SAI_DRIVE_SYNC', {
+                        syncStats, syncSettings, syncStyle
+                    });
+                    debugLog('[Sync] SAI_DRIVE_SYNC result:', result);
+                    if (result && result.success) {
+                        if (result.syncedSettings) {
+                            hideSyncProgress(0);
+                            driveSyncBtn.textContent = 'Synced! Reloading…';
+                            window.location.reload();
+                            return;
+                        }
+                        hideSyncProgress();
+                        await updateDriveStatus();
+                    } else if (result && result.alreadyRunning) {
+                        // Sync is already running from a previous click — don't show a red error.
+                        // Keep the progress callback live so the running sync's updates show.
+                        _alreadyRunning = true;
+                        syncProgressCallback = showSyncProgress;
+                        if (syncProgressSection) syncProgressSection.style.display = '';
+                        if (syncProgressText) { syncProgressText.textContent = 'Sync in progress — please wait…'; syncProgressText.style.color = '#9ca3af'; }
+                        driveSyncStatus.textContent = 'Sync already in progress…';
+                        driveSyncStatus.style.color = '#9ca3af';
+                        debugLog('[Sync] Already running — reattached progress callback');
+                    } else {
+                        const errMsg = (result && result.error) || 'Sync failed — please try again.';
+                        showSyncError(errMsg);
+                        driveSyncStatus.textContent = errMsg;
+                        driveSyncStatus.style.color = '#dc2626';
+                        debugLog('[Sync] Sync failed with error:', errMsg);
+                    }
+                } catch (err) {
+                    const errMsg = err.message || 'Sync failed — please try again.';
+                    showSyncError(errMsg);
+                    driveSyncStatus.textContent = errMsg;
+                    driveSyncStatus.style.color = '#dc2626';
+                    debugLog('[Sync] Sync threw exception:', err.message);
+                } finally {
+                    if (!_alreadyRunning) syncProgressCallback = null;
+                }
+                driveSyncBtn.disabled = false;
+                driveSyncBtn.textContent = 'Sync Now';
+            };
+
+            driveCreateBackupBtn.onclick = async (e) => {
+                e.stopPropagation();
+                driveCreateBackupBtn.disabled = true;
+                driveCreateBackupBtn.textContent = 'Creating…';
+                driveBackupStatus.textContent = '';
+                try {
+                    const rawStorage = await sendDriveMessage('getSettings');
+                    const exportData = { ...rawStorage };
+                    if (typeof exportData.generationProfiles === 'string') {
+                        try { exportData.generationProfiles = JSON.parse(exportData.generationProfiles); } catch (_) {}
+                    }
+                    // Stats now live in the background IndexedDB store, NOT storage.local.
+                    // Pull the authoritative nested snapshot from the DB (getSettings only
+                    // carries the frozen legacy blob, which would be stale/empty). If the DB
+                    // read fails, ABORT the backup — never ship a silently empty-stats file.
+                    const statsRes = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
+                    if (!statsRes || !statsRes.success) {
+                        throw new Error('Could not read stats from the database — backup aborted to avoid an incomplete file.');
+                    }
+                    exportData.messageGenerationStats = statsRes.stats || {};
+                    delete exportData.driveAccessToken;
+                    delete exportData.driveRefreshToken;
+                    delete exportData.driveTokenExpiry;
+                    delete exportData.driveFileId;
+                    delete exportData.driveLastSync;
+                    delete exportData.driveBackupFolderId;
+                    delete exportData.driveSyncStats;
+                    delete exportData.driveSyncSettings;
+                    delete exportData.driveSyncStyle;
+                    delete exportData.driveAutoSync;
+                    delete exportData.driveAutoSyncInterval;
+                    const result = await sendDriveMessage('SAI_DRIVE_CREATE_BACKUP', { exportData });
+                    if (result && result.success) {
+                        driveBackupStatus.textContent = 'Backup created.';
+                        driveBackupStatus.style.color = '#10b981';
+                        await loadDriveBackupList();
+                    } else {
+                        driveBackupStatus.textContent = (result && result.error) || 'Backup failed.';
+                        driveBackupStatus.style.color = '#dc2626';
+                    }
+                } catch (err) {
+                    driveBackupStatus.textContent = err.message || 'Backup failed.';
+                    driveBackupStatus.style.color = '#dc2626';
+                }
+                driveCreateBackupBtn.disabled = false;
+                driveCreateBackupBtn.textContent = 'Create Backup';
+            };
+
+            driveOpenFolderBtn.onclick = (e) => {
+                e.stopPropagation();
+                if (driveBackupFolderUrl) {
+                    window.open(driveBackupFolderUrl, '_blank');
+                } else {
+                    driveBackupStatus.textContent = 'Folder URL not available — try reloading the backup list.';
+                    driveBackupStatus.style.color = '#dc2626';
+                }
+            };
+
+            driveDisconnectBtn.onclick = async (e) => {
+                e.stopPropagation();
+                await storage.remove(['driveAccessToken', 'driveRefreshToken', 'driveTokenExpiry', 'driveFileId', 'driveLastSync', 'driveBackupFolderId']);
+                driveBackupFolderUrl = null;
+                // Disable auto-sync and clear the alarm
+                autoSyncToggle.checked = false;
+                autoSyncIntervalSelect.style.display = 'none';
+                await storage.setMultiple({ driveAutoSync: false });
+                await sendDriveMessage('SAI_DRIVE_SET_AUTO_SYNC', { enabled: false });
+                await updateDriveStatus();
+            };
+        })();
+
         // Save & Refresh button
         saveBtn.onclick = async (e) => {
             debugLog('[Core] Save & Refresh button clicked');
@@ -11958,16 +13051,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
                         [HIDE_CREATOR_KEY]: false,
                         'generationProfiles': '{}',
-                        'lastSelectedProfile': '',
-                        'messageGenerationStats': '{}'
+                        'lastSelectedProfile': ''
+                        // messageGenerationStats intentionally omitted — stats come from the
+                        // background IndexedDB store via SAI_STATS_EXPORT_ALL below, not storage.local.
                     });
                     
                     debugLog('[Core] All values fetched. Building export object...');
                     
                     // Parse JSON strings for proper export format
                     const generationProfilesParsed = JSON.parse(exportData['generationProfiles']);
-                    const messageGenerationStatsParsed = JSON.parse(exportData['messageGenerationStats']);
-                    
+                    // Stats live in the background IndexedDB store now — pull the nested snapshot
+                    // from the DB (storage.local only holds the frozen legacy blob post-migration).
+                    // If the DB read fails, ABORT the export — never write a silently empty-stats file.
+                    const statsRes = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
+                    if (!statsRes || !statsRes.success) {
+                        throw new Error('Could not read stats from the database — export aborted to avoid an incomplete file.');
+                    }
+                    const messageGenerationStatsParsed = statsRes.stats || {};
+
                     // Build the export object
                     const allData = {
                         enableSidebarLayout: exportData[SIDEBAR_LAYOUT_KEY],
@@ -12059,7 +13160,43 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             importAllBtn.onclick = async (e) => {
                 debugLog('[Core] Import All Data button clicked');
                 e.stopPropagation();
-                
+
+                // ---- progress overlay helpers ----
+                const showImportProgress = (statusText, pct) => {
+                    let overlay = shadow.getElementById('import-progress-overlay');
+                    if (!overlay) {
+                        overlay = document.createElement('div');
+                        overlay.id = 'import-progress-overlay';
+                        overlay.style.cssText = 'position:fixed;inset:0;z-index:10000005;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;pointer-events:auto;';
+                        const card = document.createElement('div');
+                        card.style.cssText = 'background:#1f2937;border-radius:12px;padding:1.5rem 2rem;display:flex;flex-direction:column;gap:0.75rem;min-width:280px;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+                        const title = document.createElement('div');
+                        title.textContent = 'Importing…';
+                        title.style.cssText = 'color:#f9fafb;font-size:14px;font-weight:600;';
+                        const statusEl = document.createElement('div');
+                        statusEl.id = 'import-progress-status';
+                        statusEl.style.cssText = 'color:#9ca3af;font-size:12px;min-height:1.2em;';
+                        const track = document.createElement('div');
+                        track.style.cssText = 'height:4px;background:#374151;border-radius:2px;overflow:hidden;';
+                        const fill = document.createElement('div');
+                        fill.id = 'import-progress-fill';
+                        fill.style.cssText = 'height:100%;background:#3b82f6;border-radius:2px;transition:width 0.2s ease;width:0%;';
+                        track.appendChild(fill);
+                        card.appendChild(title);
+                        card.appendChild(statusEl);
+                        card.appendChild(track);
+                        overlay.appendChild(card);
+                        shadow.appendChild(overlay);
+                    }
+                    shadow.getElementById('import-progress-status').textContent = statusText;
+                    shadow.getElementById('import-progress-fill').style.width = pct + '%';
+                };
+                const removeImportProgress = () => {
+                    const overlay = shadow.getElementById('import-progress-overlay');
+                    if (overlay) overlay.remove();
+                };
+                // ---- end progress helpers ----
+
                 const input = document.createElement('input');
                 input.type = 'file';
                 input.accept = '.json';
@@ -12074,7 +13211,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 const reader = new FileReader();
                 reader.onload = async function(e) {
                     try {
-                        const imported = JSON.parse(e.target.result);
+                        // Un-nest v2 grouped files (settings/style/stats) into the flat
+                        // layout the apply logic below expects; flat files pass through.
+                        const imported = normalizeImportPayload(JSON.parse(e.target.result));
                         debugLog('[Core] Parsed imported data:', Object.keys(imported));
                         
                         // Handle both old (double-encoded strings) and new (proper objects) formats
@@ -12139,20 +13278,48 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.hideCreatorName !== undefined) updates[HIDE_CREATOR_KEY] = imported.hideCreatorName;
                         if (generationProfilesValue !== undefined) updates.generationProfiles = generationProfilesValue;
                         if (imported.lastSelectedProfile !== undefined) updates.lastSelectedProfile = imported.lastSelectedProfile;
-                        if (messageGenerationStatsValue !== undefined) updates.messageGenerationStats = messageGenerationStatsValue;
-                        
                         debugLog('[Core] Importing keys:', Object.keys(updates));
-                        
+
+                        showImportProgress('Parsing import file…', 10);
+                        await new Promise(r => setTimeout(r, 0));
+
+                        // Merge stats rather than overwrite — preserve any entries in
+                        // current storage that are not in (or are newer than) the backup.
+                        // Stats live in the background IndexedDB store; merge there
+                        // (authoritative, collapses conversation level, never overwrites
+                        // richer entries). Not written to storage.local, so keep it out of
+                        // `updates`. (Page reloads after import, so the cache refreshes.)
+                        if (messageGenerationStatsValue !== undefined) {
+                            const importedStats = JSON.parse(messageGenerationStatsValue);
+                            const botCount = Object.keys(importedStats).length;
+                            showImportProgress(`Merging stats (${botCount} bots)…`, 35);
+                            await new Promise(r => setTimeout(r, 0));
+
+                            const mergeRes = await sendStatsMessage('SAI_STATS_IMPORT_MERGE', { stats: importedStats });
+                            if (!mergeRes || !mergeRes.success) {
+                                throw new Error('Stats merge failed: ' + ((mergeRes && mergeRes.error) || 'unknown error'));
+                            }
+
+                            debugLog('[Core] Stats merge requested:', botCount, 'bots');
+                        }
+
+                        showImportProgress('Saving to storage…', 70);
+                        await new Promise(r => setTimeout(r, 0));
+
                         // Apply all updates
                         await storage.setMultiple(updates);
                         debugLog('[Core] All data imported successfully');
-                        
-                        showNotification('All data imported successfully!\nRefreshing page...');
+
+                        showImportProgress('Done! Reloading…', 100);
+                        await new Promise(r => setTimeout(r, 0));
+
                         setTimeout(() => {
-                            debugLog('[Core] Reloading page...');
+                            removeImportProgress();
+                            debugLog('[Core] Reloading page…');
                             window.location.reload();
-                        }, 1500);
+                        }, 800);
                     } catch (error) {
+                        removeImportProgress();
                         console.error('[Core] Error importing data:', error);
                         alert('Error importing data: ' + error.message);
                     }
@@ -12178,24 +13345,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Core] ===== MODAL SETUP COMPLETE =====');
     }
 
-    // Global error monitoring to track React crashes
-    window.addEventListener('error', async (event) => {
-        debugLog('[Core] ===== GLOBAL ERROR DETECTED =====');
-        debugLog('[Core] Error message:', event.message);
-        debugLog('[Core] Error filename:', event.filename);
-        debugLog('[Core] Error line:', event.lineno, 'col:', event.colno);
-        debugLog('[Core] Error object:', event.error);
-        debugLog('[Core] Stack trace:', event.error?.stack);
-        debugLog('[Core] Time:', Date.now());
-    }, true);
-    
-    // Monitor unhandled promise rejections too
-    window.addEventListener('unhandledrejection', async (event) => {
-        debugLog('[Core] ===== UNHANDLED PROMISE REJECTION =====');
-        debugLog('[Core] Reason:', event.reason);
-        debugLog('[Core] Promise:', event.promise);
-        debugLog('[Core] Time:', Date.now());
-    });
+    // (Removed the diagnostic global `error` / `unhandledrejection` logger that was added
+    // during the WYSIWYG iOS crash investigation. It logged a verbose "GLOBAL ERROR
+    // DETECTED" block for every error, including opaque cross-origin "Script error."
+    // events from the host page — pure noise now that the crash is resolved.)
 
     // =============================================================================
     // =============================================================================
@@ -12254,6 +13407,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Initialize styles on page load
     await initializeStyles();
+
+    // Background cleanup: remove legacy null-only stats entries (fire-and-forget)
+    pruneNullStats();
 
     // Initialize Message Recovery: read the user's opt-in state from storage
     // and forward it to the page-context interceptor. Idempotent — safe to
@@ -13492,8 +14648,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     }
                     if (preCheckMessageId) {
                         const preCheckStats = await getStatsForMessage(preCheckMessageId);
-                        // If role is 'bot' OR we have generation settings (max_tokens), treat as bot message
-                        if (preCheckStats?.role === 'bot' || (preCheckStats?.max_tokens !== null && preCheckStats?.max_tokens !== undefined)) {
+                        // If in-memory bot set, stored role, or generation settings say bot — treat as bot message
+                        if (botMessageIds.has(preCheckMessageId) || preCheckStats?.role === 'bot' || (preCheckStats?.max_tokens !== null && preCheckStats?.max_tokens !== undefined)) {
                             effectiveIsBotMessage = true;
                             debugLog('[Stats] Story Mode: Corrected isBotMessage to true based on stored role/stats');
                         }
@@ -15254,7 +16410,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const changelogData = CHANGELOG[version] || {
             title: `Version ${version}`,
             date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-            features: ['Added customization for bot creator name under each bot message, as well as the option to hide it completely','Fixed bug with sidebar layout affeecting the lorebook page','Reduced number of DOM mutations by 90%, resulting in massive performance improvements (Thanks to Vegeta on Discord for troubleshooting)','Implemented fix for keyboard behavior on Firefox Android PWA (standalone display-mode)','Implemented Message Recovery (opt-in) feature which saves your message when SpicyChat\'s chat backend fails (502, CORS, network drop, timeout)']
+            features: ['Niiiiiiiiice...', 'You can now use Google Drive to backup and synchronize your generation statistics, styles and settings across devices! Go to the Data tab and sign in with your Google account to get started.','Fixed gap on right side when Sidebar Layout is enabled','Fixed crash on iOS when Live Text Editor (WYSIWYG) is enabled']
         };
 
         // Create container with shadow DOM
@@ -15719,6 +16875,136 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
     }
     
+    // Drive sync complete: background has merged new stats into the IndexedDB store.
+    // Invalidate the per-character cache and re-render visible message stats.
+    const _runtimeAPI = typeof browser !== 'undefined' ? browser : chrome;
+    if (_runtimeAPI?.runtime?.onMessage) {
+        _runtimeAPI.runtime.onMessage.addListener((message) => {
+            if (message.type === 'SAI_DRIVE_SYNC_COMPLETE') {
+                debugLog('[Sync] SAI_DRIVE_SYNC_COMPLETE received — invalidating cache and re-rendering stats');
+                if (typeof invalidateStatsCache === 'function') invalidateStatsCache();
+                if (typeof processMessagesForStats === 'function') {
+                    setTimeout(() => processMessagesForStats(false), 300);
+                }
+            }
+            if (message.type === 'SAI_DRIVE_AUTH_REQUIRED') {
+                debugLog('[Sync] SAI_DRIVE_AUTH_REQUIRED received — showing auth modal');
+                driveAuthErrorMessage = 'Drive sync: sign-in required';
+                const sb = document.getElementById('sai-toolkit-sidebar-btn');
+                const mb = document.getElementById('sai-toolkit-mobile-btn');
+                if (sb) sb.style.color = '#dc2626';
+                if (mb) mb.style.color = '#dc2626';
+                showDriveAuthModal();
+            }
+            if (message.type === 'SAI_SYNC_PROGRESS') {
+                debugLog(`[Sync] Progress [${message.stepNum}/${message.totalSteps}]: ${message.step}${message.detail ? ' — ' + message.detail : ''}`);
+                if (syncProgressCallback) syncProgressCallback(message);
+            }
+
+            // Drive download delegated from background page.
+            // The background page's fetch() freezes the JS event loop on Orion/WebKit
+            // iOS when a request stalls, making timeouts impossible. The background
+            // delegates large downloads here instead.
+            if (message.type === 'SAI_DRIVE_DOWNLOAD_REQ') {
+                const { token, fileId, storageKey } = message;
+                const t0 = Date.now();
+                const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+
+                const sendProgress = (detail) => {
+                    _runtimeAPI.runtime.sendMessage({ type: 'SAI_DRIVE_DOWNLOAD_PROGRESS', detail }).catch(() => {});
+                    if (syncProgressCallback) syncProgressCallback({ type: 'SAI_SYNC_PROGRESS', step: 'Downloading from Drive…', stepNum: 3, totalSteps: 5, detail });
+                };
+
+                (async () => {
+                    try {
+                        sendProgress('fetching…');
+                        const res = await fetch(url, {
+                            headers: { Authorization: `Bearer ${token}` },
+                        });
+                        if (res.status === 401) throw new Error('DRIVE_AUTH_EXPIRED');
+                        if (!res.ok) throw new Error(`Drive read failed: ${res.status}`);
+                        sendProgress('reading response…');
+                        const buffer = await res.arrayBuffer();
+                        const totalBytes = buffer.byteLength;
+                        sendProgress(`parsing ${(totalBytes / 1048576).toFixed(1)} MB…`);
+                        const fullText = new TextDecoder().decode(buffer);
+                        const data = JSON.parse(fullText);
+
+                        await _runtimeAPI.storage.local.set({ [storageKey]: data });
+                        await _runtimeAPI.runtime.sendMessage({
+                            type: 'SAI_DRIVE_DOWNLOAD_DONE',
+                            bytes: totalBytes,
+                            durationMs: Date.now() - t0,
+                        });
+                    } catch (err) {
+                        debugLog('[Sync] content download error:', err.message);
+                        await _runtimeAPI.runtime.sendMessage({
+                            type: 'SAI_DRIVE_DOWNLOAD_ERROR',
+                            error: err.message,
+                        });
+                    }
+                })();
+            }
+
+            if (message.type === 'SAI_DRIVE_UPLOAD_REQ') {
+                const { token, fileId, folderId, fileName, storageKey } = message;
+                const t0 = Date.now();
+
+                const sendProgress = (detail) => {
+                    _runtimeAPI.runtime.sendMessage({ type: 'SAI_DRIVE_UPLOAD_PROGRESS', detail }).catch(() => {});
+                    if (syncProgressCallback) syncProgressCallback({ type: 'SAI_SYNC_PROGRESS', step: 'Uploading to Drive…', stepNum: 5, totalSteps: 5, detail });
+                };
+
+                (async () => {
+                    try {
+                        sendProgress('reading payload…');
+                        const stored = await _runtimeAPI.storage.local.get(storageKey);
+                        const data = stored[storageKey];
+                        if (!data) throw new Error('Upload payload missing from storage');
+                        const body = JSON.stringify(data);
+                        sendProgress(`uploading ${(body.length / 1048576).toFixed(1)} MB…`);
+
+                        let newFileId;
+                        if (fileId) {
+                            const res = await fetch(
+                                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+                                { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body }
+                            );
+                            if (res.status === 401) throw new Error('DRIVE_AUTH_EXPIRED');
+                            if (!res.ok) throw new Error(`Drive update failed: ${res.status}`);
+                            newFileId = fileId;
+                        } else {
+                            const boundary = 'sai_toolkit_drive_boundary';
+                            const metaObj = { name: fileName, mimeType: 'application/json' };
+                            if (folderId) metaObj.parents = [folderId];
+                            const multipart = [
+                                `--${boundary}`, 'Content-Type: application/json; charset=UTF-8', '',
+                                JSON.stringify(metaObj),
+                                `--${boundary}`, 'Content-Type: application/json', '',
+                                body,
+                                `--${boundary}--`
+                            ].join('\r\n');
+                            const res = await fetch(
+                                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+                                { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` }, body: multipart }
+                            );
+                            if (res.status === 401) throw new Error('DRIVE_AUTH_EXPIRED');
+                            if (!res.ok) throw new Error(`Drive create failed: ${res.status}`);
+                            const created = await res.json();
+                            newFileId = created.id;
+                        }
+
+                        sendProgress(`done in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+                        await _runtimeAPI.runtime.sendMessage({ type: 'SAI_DRIVE_UPLOAD_DONE', newFileId });
+                    } catch (err) {
+                        debugLog('[Sync] content upload error:', err.message);
+                        await _runtimeAPI.runtime.sendMessage({ type: 'SAI_DRIVE_UPLOAD_ERROR', error: err.message });
+                    }
+                })();
+            }
+        });
+    }
+
     // Call initialization when DOM is ready
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', initWhenVisible);
@@ -15726,5 +17012,5 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         // DOM is already loaded
         initWhenVisible();
     }
-    
+
 })(); // End of async IIFE

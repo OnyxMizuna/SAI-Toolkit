@@ -33,3 +33,42 @@ body {
   opacity: 0.95;
   line-height: 1.4;
 }
+
+.sync-section {
+  margin-top: 16px;
+}
+
+.sync-btn {
+  width: 100%;
+  padding: 10px 16px;
+  background: rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 8px;
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.sync-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.sync-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sync-status {
+  margin-top: 8px;
+  font-size: 11px;
+  color: white;
+  opacity: 0.85;
+  min-height: 16px;
+}
+
+.sync-status.error {
+  color: #ffb3b3;
+  opacity: 1;
+}
