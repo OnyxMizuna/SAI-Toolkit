@@ -1,10 +1,52 @@
 # Privacy Policy for S.AI Toolkit Extension
 
-**Effective Date:** June 13, 2026
-**Version:** 1.6
+**Effective Date:** July 1, 2026
+**Version:** 1.7
 
 Thank you for using the **S.AI Toolkit Extension**. Your privacy is important to us.
 This Privacy Policy explains how we collect, use, and protect your data when you use our browser extension.
+
+---
+
+## Google User Data Disclosure
+
+This section consolidates exactly how the S.AI Toolkit Extension **accesses, uses, stores, shares, retains, and deletes Google user data**, in compliance with the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy) and the Google APIs Terms of Service. The extension touches Google user data **only** to power the optional **Drive Sync** and **Drive Backup** features (see section 1.5). If you never connect Google Drive, the extension accesses no Google user data at all.
+
+### Limited Use
+
+S.AI Toolkit's access to, and use and transfer of, information received from Google APIs adheres to the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy), including the **Limited Use** requirements. Google user data is used **only** to provide the user-facing Drive Sync / Backup features described below. We do **not** sell it, transfer it to third parties (except as needed to provide these features), use it for advertising or any unrelated purpose, or allow any human to read it.
+
+### Data Accessed
+
+When — and only when — you connect Google Drive, the extension accesses:
+
+- **A Google OAuth authorization** limited to the scope `https://www.googleapis.com/auth/drive.file`. This is a non-sensitive scope that grants access **only to files this extension itself creates or opens** in your Drive — never to any of your other Drive files. The flow yields a short-lived **access token** and a long-lived **refresh token**.
+- **The extension's own Drive files**: a sync file named `sai-toolkit-sync.json`, and any backup files (`sai-toolkit-backup-*.json`) inside a folder named **"S.AI Toolkit"** — all created by the extension. Their contents are *your own* extension data: generation statistics (model name, token count, temperature, top_p, top_k, message UUID, character UUID — **no** message text, **no** AI replies, **no** personal identifiers) and, if you enable those sync options, your extension settings and custom-style values.
+- The extension does **not** access your Google email address, profile, name, contacts, or any Drive file it did not create.
+
+### Data Usage
+
+- The **OAuth tokens** are used solely to authenticate Google Drive API calls so the extension can read and write its own sync/backup files. The refresh token mints new access tokens silently so you are not prompted to sign in roughly every hour.
+- The **Drive file contents** are used solely to (a) synchronise your generation statistics — and, optionally, settings/style — across your own devices, and (b) create and restore the backups you explicitly request. There is no other use: no profiling, no analytics, no advertising.
+
+### Data Sharing
+
+- Google user data is **not sold and not shared with any third party** for their own purposes.
+- Your statistics/settings/style travel **only** between your browser and **your own Google Drive** (`www.googleapis.com`).
+- The one intermediary is a **stateless OAuth token broker** — a small Cloudflare Worker operated by the extension's developer — used only to complete Google's token exchange (which requires a confidential `client_secret` that cannot ship inside a browser extension). The broker receives **only OAuth artifacts** (the one-time authorization code + PKCE verifier, or the refresh token), adds the client secret, relays the request to Google, and returns the tokens. **It never receives your Drive file contents, statistics, settings, or any other user content; it keeps no logs; and it stores nothing.** It is a pass-through the developer operates solely to authenticate you to Google, not a third party that receives your data for its own use.
+
+### Data Storage & Protection
+
+- **OAuth tokens** are stored locally on your device only, in the browser's `chrome.storage.local`. They are transmitted only to Google's OAuth endpoints and the token broker, always over **HTTPS**. They are excluded from any exported or backed-up data, and the refresh token is cleared when you click **Disconnect**.
+- **Drive file contents** are stored in **your own Google Drive account**, protected by Google's infrastructure security and by your own Google account credentials (and any 2-step verification you have enabled). The developer keeps **no** copy of this data on any server.
+- All communication with Google APIs and the token broker uses HTTPS.
+
+### Data Retention & Deletion
+
+- **OAuth tokens (on your device):** retained until you click **Disconnect** (which clears the access token, refresh token, expiry, and Drive file reference) or uninstall the extension.
+- **Drive files (sync file + backups, in your Google Drive):** retained until **you** delete them. You can delete them at any time by: (a) removing individual backups from the **Backups** list in the extension's Settings → Data tab; and/or (b) deleting `sai-toolkit-sync.json` and the **"S.AI Toolkit"** folder directly in Google Drive ([drive.google.com](https://drive.google.com)). Clicking **Disconnect** stops the extension from accessing Drive and clears your local credentials, but does **not** by itself delete files already saved in your Drive.
+- **Revoke access entirely** at any time at [Google Account → Permissions](https://myaccount.google.com/permissions).
+- Because the developer retains **no** Google user data, there is nothing for the developer to delete on your behalf — deletion is entirely under your control through Google Drive and your Google Account. Questions about deletion can be sent to the contact in section 9.
 
 ---
 
@@ -203,6 +245,7 @@ Continued use of the extension after updates indicates acceptance of the revised
 
 | Version | Date | Summary of changes |
 | --- | --- | --- |
+| 1.7 | 2026-07-01 | Added a consolidated **Google User Data Disclosure** section (data accessed / used / shared / stored & protected / retained & deleted) and an explicit Google API Services **Limited Use** affirmation; documented deletion of the Drive sync file and backups, and clarified that uninstalling does not auto-delete files already in your Drive. |
 | 1.6 | 2026-06-13 | Drive Sync OAuth moved to Authorization Code + PKCE with a refresh token and a stateless author-operated token broker (§1.5, §3, §4); generation statistics now stored in a local IndexedDB database (§1.2, §5); disclosed the opt-in Auto-sync (§1.5); corrected the Permissions list — added `alarms`/`tabs` and host access, removed `scripting`/`webRequest` (§7); conversation IDs are no longer part of the stored or synced statistics (§1.5). |
 | 1.5 | 2026-06-08 | Added Drive Sync (§1.5); updated data sharing, security, permissions, and user control sections. |
 | 1.4 | 2026-06-03 | Added Custom Background Image (§1.4); updated storage, customization, and user control sections. |
