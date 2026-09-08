@@ -5831,7 +5831,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             text-decoration: var(--wysiwyg-highlight-text-decoration);
             border-radius: 2px;
         }
-        
+
         /* Horizontal separator: a standalone --- line, matching SpicyChat mobile */
         .sai-wysiwyg-editor .wysiwyg-horizontal-rule {
             display: inline-block;
@@ -5845,7 +5845,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             ) center / 100% 1px no-repeat;
             opacity: 0.45;
         }
-        
+
         /* Hide the original textarea when WYSIWYG is active */
         /* Use position:absolute and zero dimensions to take it out of flex flow completely */
         textarea.sai-wysiwyg-hidden {
@@ -6028,7 +6028,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         while (i < len) {
             const char = text[i];
-            
+
             // Standalone --- line: render the same full-width separator shown on mobile.
             // Keep the literal --- inside the span so syncing back to SpicyChat preserves
             // the original message text exactly.
@@ -6041,7 +6041,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     continue;
                 }
             }
-            
+
             // Check for highlight: `text`
             if (char === '`') {
                 const endIdx = text.indexOf('`', i + 1);
@@ -6052,7 +6052,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     continue;
                 }
             }
-            
+
             // Check for bold narration: ***text***
             if (char === '*' && text[i + 1] === '*' && text[i + 2] === '*') {
                 const endIdx = text.indexOf('***', i + 3);
@@ -6593,7 +6593,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     childNodes[0].remove();
                 }
             });
-            
+
             // Replace real <br> elements with newlines
             clone.querySelectorAll('br').forEach(br => {
                 br.replaceWith('\n');
@@ -9093,19 +9093,95 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
     }
     
+    // Resolves the style settings that are actually active in the S.AI Toolkit
+    // Settings modal at export time (Classic Style / Custom Style / native
+    // SpicyChat colors), matched to the live page's current light/dark mode,
+    // so the exported HTML looks like the chat actually looked when exported.
+    function resolveExportStyle({ classicStyleEnabled, customStyleEnabled, customStyleValues, isDarkMode }) {
+        const sharedDefaults = {
+            bodyFontWeight: DEFAULT_CUSTOM_STYLE.bodyFontWeight,
+            bodyFontStyle: DEFAULT_CUSTOM_STYLE.bodyFontStyle,
+            bodyTextDecoration: DEFAULT_CUSTOM_STYLE.bodyTextDecoration,
+            spanQuoteFontWeight: DEFAULT_CUSTOM_STYLE.spanQuoteFontWeight,
+            spanQuoteFontStyle: DEFAULT_CUSTOM_STYLE.spanQuoteFontStyle,
+            spanQuoteTextDecoration: DEFAULT_CUSTOM_STYLE.spanQuoteTextDecoration,
+            narrationFontWeight: DEFAULT_CUSTOM_STYLE.narrationFontWeight,
+            narrationFontStyle: DEFAULT_CUSTOM_STYLE.narrationFontStyle,
+            narrationTextDecoration: DEFAULT_CUSTOM_STYLE.narrationTextDecoration,
+            highlightFontWeight: DEFAULT_CUSTOM_STYLE.highlightFontWeight,
+            highlightFontStyle: DEFAULT_CUSTOM_STYLE.highlightFontStyle,
+            highlightTextDecoration: DEFAULT_CUSTOM_STYLE.highlightTextDecoration,
+            fontSize: DEFAULT_CUSTOM_STYLE.fontSize,
+            fontFamily: DEFAULT_CUSTOM_STYLE.fontFamily
+        };
+
+        // Classic Style forces a fixed dark-reading palette (white body text,
+        // #06B7DB narration, blue/gray bubbles) regardless of the live theme —
+        // mirrors getClassicStyleCSSEarly(). It never touches typography.
+        if (classicStyleEnabled) {
+            return {
+                isDark: true,
+                aiMessageBg: 'rgba(100, 100, 100, 0.1)',
+                userMessageBg: 'rgba(0, 100, 255, 0.1)',
+                bot: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#06B7DB' },
+                user: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#06B7DB' },
+                highlightBgColor: DEFAULT_CUSTOM_STYLE.dark.highlightBgColor,
+                highlightTextColor: DEFAULT_CUSTOM_STYLE.dark.highlightTextColor,
+                ...sharedDefaults
+            };
+        }
+
+        // Custom Style off: DEFAULT_CUSTOM_STYLE's light/dark profiles are
+        // measured directly off native SpicyChat colors (see their own
+        // comment above), so they're the correct "off" palette to mirror.
+        const active = customStyleEnabled
+            ? customStyleValues[isDarkMode ? 'dark' : 'light']
+            : DEFAULT_CUSTOM_STYLE[isDarkMode ? 'dark' : 'light'];
+
+        return {
+            isDark: isDarkMode,
+            aiMessageBg: active.aiMessageBg,
+            userMessageBg: active.userMessageBg,
+            bot: { ...active.bot },
+            user: { ...active.user },
+            highlightBgColor: active.highlightBgColor,
+            highlightTextColor: active.highlightTextColor,
+            ...(customStyleEnabled ? {
+                bodyFontWeight: customStyleValues.bodyFontWeight,
+                bodyFontStyle: customStyleValues.bodyFontStyle,
+                bodyTextDecoration: customStyleValues.bodyTextDecoration,
+                spanQuoteFontWeight: customStyleValues.spanQuoteFontWeight,
+                spanQuoteFontStyle: customStyleValues.spanQuoteFontStyle,
+                spanQuoteTextDecoration: customStyleValues.spanQuoteTextDecoration,
+                narrationFontWeight: customStyleValues.narrationFontWeight,
+                narrationFontStyle: customStyleValues.narrationFontStyle,
+                narrationTextDecoration: customStyleValues.narrationTextDecoration,
+                highlightFontWeight: customStyleValues.highlightFontWeight,
+                highlightFontStyle: customStyleValues.highlightFontStyle,
+                highlightTextDecoration: customStyleValues.highlightTextDecoration,
+                fontSize: customStyleValues.fontSize,
+                fontFamily: customStyleValues.fontFamily
+            } : sharedDefaults)
+        };
+    }
+
     // Export chat as formatted HTML with embedded images (data URLs)
     async function exportChatAsHTML() {
         try {
             debugLog('[Export] Starting HTML export...');
-            
-            // Fetch custom style settings for highlight colors. The exported
-            // HTML uses its own fixed dark reading theme regardless of the live
-            // site's mode, so it always pulls the dark profile for consistency
-            // with that template's own always-dark palette.
+
+            // Resolve whichever style is actually active in the Settings modal
+            // right now (Classic Style / Custom Style / native), matched to the
+            // live page's current light/dark mode, so the export matches what
+            // the chat looked like at export time.
+            const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
             const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
             const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-            const customStyleValues = normalizeCustomStyleValues(customStyleValuesStr).dark;
-            
+            const customStyleValues = normalizeCustomStyleValues(customStyleValuesStr);
+            const isDarkMode = document.documentElement.classList.contains('dark') ||
+                                window.matchMedia('(prefers-color-scheme: dark)').matches;
+            const exportStyle = resolveExportStyle({ classicStyleEnabled, customStyleEnabled, customStyleValues, isDarkMode });
+
             const { messages, character } = await fetchAllChatMessages();
             
             const botName = character?.name || 'Bot';
@@ -9207,9 +9283,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 isGroupChat,
                 subCharacterMap,
                 subCharacterImageMap,
-                // Custom style colors for backtick formatting
-                highlightBgColor: customStyleEnabled && customStyleValues.highlightBgColor ? customStyleValues.highlightBgColor : '#ffdd6d',
-                highlightTextColor: customStyleEnabled && customStyleValues.highlightTextColor ? customStyleValues.highlightTextColor : '#000000'
+                // Resolved Classic Style / Custom Style / native colors and fonts
+                style: exportStyle
             });
             
             // Build filename with chat label if available
@@ -9284,13 +9359,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     // Generate standalone HTML for chat export (uses direct URLs or data URLs)
     function generateChatHTML(data) {
-        const { 
-            botName, botImageUrl, userName, userImageUrl, characterTitle, 
+        const {
+            botName, botImageUrl, userName, userImageUrl, characterTitle,
             conversationId, messages, exportedAt,
             // Group chat support
             isGroupChat = false, subCharacterMap = {}, subCharacterImageMap = {},
-            // Custom style colors
-            highlightBgColor = '#ffdd6d', highlightTextColor = '#000000'
+            // Resolved Classic Style / Custom Style / native colors and fonts
+            style
         } = data;
         
         // =====================================================================
@@ -9357,8 +9432,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const formatContent = (text) => {
             if (!text) return '';
             let formatted = escapeHTML(text);
+            // Process quoted dialogue BEFORE backticks/asterisks — the quote span just
+            // wraps in place, so it doesn't interfere with the delimiters below
+            formatted = formatted.replace(/&quot;([\s\S]*?)&quot;/g, '<span class="quote">&quot;$1&quot;</span>');
             // Process backticks for highlighted code/text BEFORE asterisks to avoid conflicts
-            formatted = formatted.replace(/`([^`]+)`/g, `<span class="highlight-text" style="background-color: ${highlightBgColor}; color: ${highlightTextColor}; padding: 0 4px; border-radius: 4px; display: inline-block; max-width: max-content;">$1</span>`);
+            formatted = formatted.replace(/`([^`]+)`/g, `<span class="highlight-text" style="background-color: ${style.highlightBgColor}; color: ${style.highlightTextColor}; padding: 0 4px; border-radius: 4px; display: inline-block; max-width: max-content; font-weight: ${style.highlightFontWeight}; font-style: ${style.highlightFontStyle}; text-decoration: ${style.highlightTextDecoration};">$1</span>`);
             // Process double asterisks for bold BEFORE single asterisks to avoid conflicts
             formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
             formatted = formatted.replace(/\*([^*]+)\*/g, '<em class="action">$1</em>');
@@ -9441,16 +9519,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
          */
         
         :root {
-            --bg-color: #0f0f0f;
-            --text-color: #e5e5e5;
-            --header-bg: #1a1a1a;
-            --message-bg: #1a1a1a;
-            --user-message-bg: rgba(0, 100, 255, 0.1);
-            --bot-message-bg: rgba(100, 100, 100, 0.1);
-            --border-color: #333;
-            --action-color: #06B7DB;
-            --timestamp-color: #6b7280;
-            --accent-color: #ffdd6d;
+            --bg-color: ${style.isDark ? '#0f0f0f' : '#f5f5f5'};
+            --text-color: ${style.isDark ? '#e5e5e5' : '#18181b'};
+            --header-bg: ${style.isDark ? '#1a1a1a' : '#ffffff'};
+            --message-bg: ${style.isDark ? '#1a1a1a' : '#ffffff'};
+            --user-message-bg: ${style.userMessageBg};
+            --bot-message-bg: ${style.aiMessageBg};
+            --border-color: ${style.isDark ? '#333' : '#e2e2e2'};
+            --timestamp-color: ${style.isDark ? '#6b7280' : '#71717a'};
+            --accent-color: ${style.highlightBgColor};
         }
         
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -9518,9 +9595,31 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             background: var(--accent-color); color: white;
             border-radius: 4px; text-transform: uppercase; font-weight: 600;
         }
-        .message-text { word-wrap: break-word; }
-        .message-text .action { color: var(--action-color); font-style: italic; }
-        
+        .message-text {
+            word-wrap: break-word;
+            font-size: ${style.fontSize};
+            ${style.fontFamily ? `font-family: ${style.fontFamily};` : ''}
+            font-weight: ${style.bodyFontWeight};
+            font-style: ${style.bodyFontStyle};
+            text-decoration: ${style.bodyTextDecoration};
+        }
+        .message.bot .message-text { color: ${style.bot.bodyColor}; }
+        .message.user .message-text { color: ${style.user.bodyColor}; }
+        .message-text .action {
+            font-weight: ${style.narrationFontWeight};
+            font-style: ${style.narrationFontStyle};
+            text-decoration: ${style.narrationTextDecoration};
+        }
+        .message.bot .message-text .action { color: ${style.bot.narrationColor}; }
+        .message.user .message-text .action { color: ${style.user.narrationColor}; }
+        .message-text .quote {
+            font-weight: ${style.spanQuoteFontWeight};
+            font-style: ${style.spanQuoteFontStyle};
+            text-decoration: ${style.spanQuoteTextDecoration};
+        }
+        .message.bot .message-text .quote { color: ${style.bot.spanQuoteColor}; }
+        .message.user .message-text .quote { color: ${style.user.spanQuoteColor}; }
+
         @media (max-width: 600px) {
             .container { padding: 10px; }
             .message { padding: 12px; }

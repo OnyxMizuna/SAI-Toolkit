@@ -176,6 +176,10 @@ This has broken in subtle, hard-to-notice ways more than once. Test all of:
 - [ ] Resize the browser window (or drag the sidebar resize handle), then
       open a **new** chat afterward — WYSIWYG still works
 - [ ] Paste text into the composer — reformats correctly
+- [ ] Paste or edit multi-paragraph text (multiple blank lines between
+      paragraphs) — no extra blank lines get added
+- [ ] Type a standalone `---` line — renders as a full-width horizontal
+      separator; sending the message preserves the literal `---` in the text
 - [ ] On iOS/mobile if available: backspace in an empty composer doesn't
       crash the page
 - [ ] With Grammarly (or a similar grammar-checking extension) installed and
@@ -242,8 +246,19 @@ right after bumping `manifest.json`'s version.
 
 ## 8. Chat export
 
-- [ ] Export as JSON — downloads, contains the real conversation
-- [ ] Export as HTML — downloads, contains the real conversation
+- [ ] Export as JSON — downloads, contains the real conversation (full
+      message count, not just one page), and bot/user name + avatar are
+      populated
+- [ ] Export as HTML — downloads, contains the real conversation, and bot/user
+      name + avatar are populated
+- [ ] HTML export follows the active Settings modal style at export time:
+  - [ ] Neither Classic Style nor Custom Style on — matches native SpicyChat
+        colors for the current light/dark mode
+  - [ ] Classic Style on — matches its fixed dark palette regardless of the
+        live light/dark mode
+  - [ ] Custom Style on — matches the configured bot/user colors, fonts, and
+        highlight/quote/narration styling for the current light/dark mode
+  - [ ] Quoted dialogue ("...") is colored per the Custom Style quote color
 
 ## 9. Cross-browser
 

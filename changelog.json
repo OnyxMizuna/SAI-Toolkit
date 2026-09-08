@@ -1,5 +1,23 @@
 [
   {
+    "version": "1.2.8",
+    "date": "September 8, 2026",
+    "features": [
+      "Fixed extra blank lines being added when pasting or editing multi-paragraph text in the WYSIWYG composer",
+      "Standalone \"---\" lines in the WYSIWYG composer now render as a full-width horizontal separator, matching SpicyChat's mobile app",
+      "Thanks to dragongraf1312 for their contribution!"
+    ]
+  },
+  {
+    "version": "1.2.7",
+    "date": "August 20, 2026",
+    "features": [
+      "Fixed chat exports (JSON and HTML) failing with an \"Invalid or expired token\" error",
+      "Fixed exported chats missing the bot's name and profile picture when the bot has since been made private",
+      "HTML chat exports now follow the style (Classic Style / Custom Style / native colors) active in the S.AI Toolkit Settings modal at the time of export, instead of always using a fixed dark theme"
+    ]
+  },
+  {
     "version": "1.2.6",
     "date": "August 16, 2026",
     "features": [

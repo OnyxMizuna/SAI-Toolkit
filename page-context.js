@@ -81,17 +81,30 @@
     
     XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
         this._requestHeaders = this._requestHeaders || {};
-        this._requestHeaders[header] = value;
+        // Keyed lowercase: SpicyChat's HTTP client now calls setRequestHeader with
+        // lowercase names (e.g. 'authorization', not 'Authorization' — confirmed live).
+        // HTTP header names are case-insensitive on the wire, but a JS property lookup
+        // isn't, so a capitalized lookup here silently never matched and every captured
+        // header (Authorization included) came back empty. This is the actual cause of
+        // chat export's "Invalid or expired token" — no token was ever captured, not an
+        // actually-expired one.
+        this._requestHeaders[header.toLowerCase()] = value;
         return originalXHRSetRequestHeader.apply(this, [header, value]);
     };
-    
+
     XMLHttpRequest.prototype.send = function(...args) {
         // Capture headers from prod.nd-api.com requests
         if (this._url && this._url.includes('prod.nd-api.com') && this._requestHeaders) {
-            if (this._requestHeaders.Authorization) window.__lastAuthHeaders.Authorization = this._requestHeaders.Authorization;
-            if (this._requestHeaders['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = this._requestHeaders['X-Guest-UserId'];
-            if (this._requestHeaders['X-Country']) window.__lastAuthHeaders['X-Country'] = this._requestHeaders['X-Country'];
-            if (this._requestHeaders['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = this._requestHeaders['X-App-Id'];
+            const h = this._requestHeaders;
+            if (h['authorization']) window.__lastAuthHeaders.Authorization = h['authorization'];
+            if (h['x-guest-userid']) window.__lastAuthHeaders['X-Guest-UserId'] = h['x-guest-userid'];
+            if (h['x-country']) window.__lastAuthHeaders['X-Country'] = h['x-country'];
+            if (h['x-app-id']) window.__lastAuthHeaders['X-App-Id'] = h['x-app-id'];
+            // Newer headers SpicyChat's client now sends alongside the above (confirmed
+            // live) — forwarded too in case the API has started expecting them.
+            if (h['x-app-version']) window.__lastAuthHeaders['X-App-Version'] = h['x-app-version'];
+            if (h['x-platform']) window.__lastAuthHeaders['X-Platform'] = h['x-platform'];
+            if (h['x-platform-os']) window.__lastAuthHeaders['X-Platform-OS'] = h['x-platform-os'];
         }
         
         // Listen for Kinde token refresh responses
@@ -116,22 +129,47 @@
         return originalXHRSend.apply(this, args);
     };
     
+    // Case-insensitive header read: options.headers may be a plain object (keys in
+    // whatever case the caller used — confirmed live to be lowercase now) or a Headers
+    // instance (already case-insensitive via .get(), but plain-object property access
+    // like headers.Authorization is not).
+    function readHeaderCI(headers, name) {
+        if (!headers) return null;
+        if (typeof headers.get === 'function') return headers.get(name);
+        const lname = name.toLowerCase();
+        for (const key of Object.keys(headers)) {
+            if (key.toLowerCase() === lname) return headers[key];
+        }
+        return null;
+    }
+
     // Also intercept fetch
     const originalFetch = window.fetch;
     window.fetch = function(...args) {
         const [url, options] = args;
-        
+        const urlString = typeof url === 'string' ? url : (url && url.url) || '';
+
         // Capture auth headers from API calls
-        if (options && options.headers && url.includes('prod.nd-api.com')) {
+        if (options && options.headers && urlString.includes('prod.nd-api.com')) {
             const headers = options.headers;
-            if (headers.Authorization) window.__lastAuthHeaders.Authorization = headers.Authorization;
-            if (headers['X-Guest-UserId']) window.__lastAuthHeaders['X-Guest-UserId'] = headers['X-Guest-UserId'];
-            if (headers['X-Country']) window.__lastAuthHeaders['X-Country'] = headers['X-Country'];
-            if (headers['X-App-Id']) window.__lastAuthHeaders['X-App-Id'] = headers['X-App-Id'];
+            const auth = readHeaderCI(headers, 'Authorization');
+            const guestId = readHeaderCI(headers, 'X-Guest-UserId');
+            const country = readHeaderCI(headers, 'X-Country');
+            const appId = readHeaderCI(headers, 'X-App-Id');
+            const appVersion = readHeaderCI(headers, 'X-App-Version');
+            const platform = readHeaderCI(headers, 'X-Platform');
+            const platformOs = readHeaderCI(headers, 'X-Platform-OS');
+            if (auth) window.__lastAuthHeaders.Authorization = auth;
+            if (guestId) window.__lastAuthHeaders['X-Guest-UserId'] = guestId;
+            if (country) window.__lastAuthHeaders['X-Country'] = country;
+            if (appId) window.__lastAuthHeaders['X-App-Id'] = appId;
+            if (appVersion) window.__lastAuthHeaders['X-App-Version'] = appVersion;
+            if (platform) window.__lastAuthHeaders['X-Platform'] = platform;
+            if (platformOs) window.__lastAuthHeaders['X-Platform-OS'] = platformOs;
         }
-        
+
         // Intercept Kinde token refresh
-        if (url.includes('gamma.kinde.com/oauth2/token')) {
+        if (urlString.includes('gamma.kinde.com/oauth2/token')) {
             return originalFetch.apply(this, args).then(response => {
                 const clonedResponse = response.clone();
                 clonedResponse.json().then(data => {
@@ -255,14 +293,17 @@ window.addEventListener('message', async function(event) {
     // Only handle our specific export request
     if (event.source !== window) return;
     if (event.data.type !== 'SAI_EXPORT_CHAT_REQUEST') return;
-    
+
     const { characterId, conversationId } = event.data;
-    
+
     try {
         let authToken = null;
         let guestUserId = null;
         let country = null;
-        
+        let appVersion = null;
+        let platform = null;
+        let platformOs = null;
+
         // Get auth headers from intercepted data
         if (window.__kindeAccessToken) {
             authToken = window.__kindeAccessToken;
@@ -277,8 +318,17 @@ window.addEventListener('message', async function(event) {
             if (!country && window.__lastAuthHeaders['X-Country']) {
                 country = window.__lastAuthHeaders['X-Country'];
             }
+            if (!appVersion && window.__lastAuthHeaders['X-App-Version']) {
+                appVersion = window.__lastAuthHeaders['X-App-Version'];
+            }
+            if (!platform && window.__lastAuthHeaders['X-Platform']) {
+                platform = window.__lastAuthHeaders['X-Platform'];
+            }
+            if (!platformOs && window.__lastAuthHeaders['X-Platform-OS']) {
+                platformOs = window.__lastAuthHeaders['X-Platform-OS'];
+            }
         }
-        
+
         // Fallback to localStorage
         if (!authToken) {
             for (const key of Object.keys(localStorage)) {
@@ -298,16 +348,19 @@ window.addEventListener('message', async function(event) {
                 } catch (e) {}
             }
         }
-        
+
         const headers = {
             'Accept': 'application/json, text/plain, */*',
             'X-App-Id': 'spicychat'
         };
-        
+
         if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
         if (guestUserId) headers['X-Guest-UserId'] = guestUserId;
         if (country) headers['X-Country'] = country;
-        
+        if (appVersion) headers['X-App-Version'] = appVersion;
+        if (platform) headers['X-Platform'] = platform;
+        if (platformOs) headers['X-Platform-OS'] = platformOs;
+
         console.log('[Export] Fetching from API with character ID:', characterId, 'conversation ID:', conversationId);
 
         // Fetch messages for specific conversation
@@ -315,36 +368,63 @@ window.addEventListener('message', async function(event) {
         const apiUrl = conversationId && conversationId !== 'null'
             ? `https://prod.nd-api.com/characters/${characterId}/messages/${conversationId}`
             : `https://prod.nd-api.com/characters/${characterId}/messages`;
-        
+
         console.log('[Export] Fetching from:', apiUrl);
-        
+
         const messagesResponse = await fetch(apiUrl, {
             method: 'GET',
             headers: headers,
             credentials: 'include'
         });
-        
+
         console.log('[Export] Messages API response status:', messagesResponse.status);
-        
+
         if (!messagesResponse.ok) {
             throw new Error('Failed to fetch messages: ' + messagesResponse.status);
         }
-        
+
         const messagesData = await messagesResponse.json();
         console.log('[Export] Messages received:', messagesData.messages?.length || 0);
-        
+
         // Also fetch character info
         const characterResponse = await fetch(`https://prod.nd-api.com/v2/characters/${characterId}`, {
             method: 'GET',
             headers: headers,
             credentials: 'include'
         });
-        
+
         let characterData = null;
         if (characterResponse.ok) {
             characterData = await characterResponse.json();
         }
-        
+
+        // A character that's since been made private/unlisted returns `{}` from
+        // the direct lookup above (still 200 OK, just empty — not an error we can
+        // catch). The conversations list embeds a denormalized character snapshot
+        // (name/avatar/title) per conversation that isn't gated by the character's
+        // current visibility, since it's just your own conversation history — so
+        // fall back to it when the direct lookup didn't give us a name.
+        if (!characterData || !characterData.name) {
+            try {
+                const conversationsResponse = await fetch('https://prod.nd-api.com/v2/conversations?limit=500', {
+                    method: 'GET',
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (conversationsResponse.ok) {
+                    const conversations = await conversationsResponse.json();
+                    const match = Array.isArray(conversations)
+                        ? conversations.find((c) => c.id === conversationId || c.character_id === characterId)
+                        : null;
+                    if (match && match.character) {
+                        characterData = { ...characterData, ...match.character };
+                    }
+                }
+            } catch (e) {
+                console.error('[Export] Conversations fallback for character info failed:', e);
+            }
+        }
+
         // Send data back via postMessage
         window.postMessage({
             type: 'SAI_EXPORT_CHAT_RESPONSE',

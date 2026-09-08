@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "S.AI Toolkit",
-  "version": "1.2.6",
+  "version": "1.2.8",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
   "permissions": [
     "storage",
