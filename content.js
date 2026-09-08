@@ -5832,6 +5832,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             border-radius: 2px;
         }
         
+        /* Horizontal separator: a standalone --- line, matching SpicyChat mobile */
+        .sai-wysiwyg-editor .wysiwyg-horizontal-rule {
+            display: inline-block;
+            width: 100%;
+            height: 1em;
+            color: transparent !important;
+            vertical-align: middle;
+            background: linear-gradient(
+                var(--wysiwyg-body-color),
+                var(--wysiwyg-body-color)
+            ) center / 100% 1px no-repeat;
+            opacity: 0.45;
+        }
+        
         /* Hide the original textarea when WYSIWYG is active */
         /* Use position:absolute and zero dimensions to take it out of flex flow completely */
         textarea.sai-wysiwyg-hidden {
@@ -6014,6 +6028,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         while (i < len) {
             const char = text[i];
+            
+            // Standalone --- line: render the same full-width separator shown on mobile.
+            // Keep the literal --- inside the span so syncing back to SpicyChat preserves
+            // the original message text exactly.
+            const isLineStart = i === 0 || text[i - 1] === '\n';
+            if (isLineStart && text.startsWith('---', i)) {
+                const afterRule = text[i + 3];
+                if (afterRule === undefined || afterRule === '\n' || afterRule === '\r') {
+                    result.push('<span class="wysiwyg-horizontal-rule">---</span>');
+                    i += 3;
+                    continue;
+                }
+            }
             
             // Check for highlight: `text`
             if (char === '`') {
@@ -6553,7 +6580,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Clone to avoid modifying the actual DOM
             const clone = editor.cloneNode(true);
             
-            // Replace <br> with newlines
+            // Chromium uses a lone <br> inside an otherwise-empty block as a
+            // placeholder for a blank line. The block boundary already represents
+            // that line break, so counting the placeholder <br> as another newline
+            // would add an extra blank line when pasting/editing multi-paragraph text.
+            clone.querySelectorAll('div, p').forEach(block => {
+                const childNodes = Array.from(block.childNodes);
+                const isPlaceholderOnly = childNodes.length === 1 &&
+                    childNodes[0].nodeType === Node.ELEMENT_NODE &&
+                    childNodes[0].tagName === 'BR';
+                if (isPlaceholderOnly) {
+                    childNodes[0].remove();
+                }
+            });
+            
+            // Replace real <br> elements with newlines
             clone.querySelectorAll('br').forEach(br => {
                 br.replaceWith('\n');
             });
