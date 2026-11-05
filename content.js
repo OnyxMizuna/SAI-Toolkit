@@ -2829,6 +2829,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Note: We clear these sets when navigating conversations to allow re-insertion
     const statsInsertedForMessageIds = new Set();      // Successfully inserted
     const statsInsertionInProgress = new Set();        // Currently being processed (prevents parallel runs)
+    // Declared here, before the message listener is registered, so the handler can never hit the TDZ
+    let statsFailedForWrappers = new WeakSet();        // Wrappers that failed ID extraction (prevents retries)
 
     // Track how many new messages are pending insertion (used to skip newest messages in processMessagesForStats)
     // This prevents race conditions where processMessagesForStats runs before insertStatsForRegeneratedMessage
@@ -4020,6 +4022,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             // Don't rebuild index map - we already built it from GET /messages order above
             // await buildIndexMapFromStats();
+
+            // Retry wrappers that previously failed ID extraction.
+            statsFailedForWrappers = new WeakSet();
+
+            // Reprocess all messages, including versioned messages.
+            setTimeout(() => processMessagesForStats(false), 250);
+            setTimeout(() => processMessagesForStats(false), 1200);
         }
         
         if (event.data.type === 'SAI_NEW_MESSAGE') {
@@ -11896,7 +11905,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </div>
 
-                    <div class="memorial">
+                    <div class="memorial hidden" id="memorial-section">
                         <img id="memorial-img" alt="Mari">
                         <div class="memorial-name">Mari</div>
                         <div class="memorial-dates">10 October 2013 - 1 October 2026</div>
@@ -12052,6 +12061,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             versionText.textContent = 'v' + _api.runtime.getManifest().version;
         }
 
+        const memorialSection = shadow.querySelector('#memorial-section');
         const memorialImg = shadow.querySelector('#memorial-img');
         if (memorialImg) {
             const _api = typeof browser !== 'undefined' ? browser : chrome;
@@ -12225,6 +12235,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 } else {
                     debugFiltersSection.classList.add('hidden');
                 }
+            }
+            // Mari's tribute is only shown while Debug Mode is on
+            if (memorialSection) {
+                memorialSection.classList.toggle('hidden', !DEBUG_MODE);
             }
         }
         updateDebugFiltersVisibility();
@@ -15396,7 +15410,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     // This is needed because regenerations REPLACE the message content, not add a new element
     // So processMessagesForStats can't find them by DOM index
     // Note: statsInsertedForMessageIds and statsInsertionInProgress are defined earlier in the file
-    const statsFailedForWrappers = new WeakSet();      // Wrappers that failed ID extraction (prevents retries)
+    // Note: statsFailedForWrappers is declared next to statsInsertedForMessageIds (it's reassigned by the SAI_MESSAGES_LOADED handler)
     let lastConversationIdForStatsSet = null;
 
     // Memory optimization: Maximum tracked message IDs to prevent unbounded growth
@@ -15512,8 +15526,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         // Look for message bubbles and find the one with a version counter showing the highest version
         const versionCounters = document.querySelectorAll('p.text-label-md');
         let targetBubble = null;
+        let targetCounterEl = null; // Version counter that picked targetBubble (null on the fallback path)
         let highestVersion = 0;
-        
+
         for (const counter of versionCounters) {
             const match = counter.textContent.trim().match(/^(\d+)\/(\d+)$/);
             if (match) {
@@ -15522,6 +15537,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // We want the one showing the LATEST version (currentVer === totalVer)
                 if (currentVer === totalVer && totalVer > highestVersion) {
                     highestVersion = totalVer;
+                    targetCounterEl = counter;
                     targetBubble = counter.closest('div[class*="bg-gray-4"][class*="rounded"]');
                     if (!targetBubble) {
                         targetBubble = counter.closest('div[class*="px-\\[13px\\]"]');
@@ -15665,12 +15681,38 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
         
         const displayText = displayLines.join('<br>');
-        
+
+        // The awaits above let processMessagesForStats insert its own block after we
+        // took our first look. If the user switched this message to an older version in
+        // the meantime, this request is stale: writing it now would relabel the block
+        // that belongs to the version they are now viewing. Leave that to the scan.
+        if (targetCounterEl) {
+            const liveMatch = targetCounterEl.isConnected && targetCounterEl.textContent.trim().match(/^(\d+)\/(\d+)$/);
+            if (!liveMatch) {
+                // React re-rendered the counter (or it is mid-update): we can't verify the
+                // displayed version, so let insertStatsWithRetry try again rather than
+                // treating this as done.
+                debugLog('[Stats REGEN] Version counter not verifiable yet, will retry');
+                statsInsertionInProgress.delete(messageId);
+                return false;
+            }
+            if (liveMatch[1] !== liveMatch[2]) {
+                debugLog('[Stats REGEN] Displayed version changed while awaiting storage, abandoning stale insert');
+                statsInsertionInProgress.delete(messageId);
+                if (pendingNewMessageCount > 0) pendingNewMessageCount--;
+                return true;
+            }
+        }
+
+        // Re-read the live DOM so we update the block that is actually attached
+        // (not a stale or removed one) instead of duplicating.
+        statsDiv = headerContainer.querySelector('.generation-stats');
+
         if (!statsDiv) {
             // Create new stats div
             statsDiv = document.createElement('div');
             statsDiv.className = 'generation-stats';
-            
+
             // Check if we're in story mode for different positioning
             const inStoryMode = isStoryMode();
             
@@ -15693,7 +15735,13 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // Insert before the menu button container
                 const menuButtonContainer = headerContainer.querySelector('.relative');
                 if (menuButtonContainer) {
-                    headerContainer.insertBefore(statsDiv, menuButtonContainer);
+                    // menuButtonContainer may be a nested descendant; insertBefore needs a direct child
+                    headerContainer.insertBefore(
+                        statsDiv,
+                        [...headerContainer.children].find(
+                            child => child.contains(menuButtonContainer)
+                        ) || null
+                    );
                     headerContainer.style.setProperty('gap', '4px', 'important');
                 } else {
                     headerContainer.appendChild(statsDiv);
@@ -15727,6 +15775,29 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     // This unified function handles all stats injection to avoid duplication and inconsistency
     // skipVersionCounterMessages: if true, skip messages with version counters (for new message handling)
     //                             if false, process all messages (for initial page load)
+    // Map a "current/total" version counter element to the message ID of the version
+    // it is displaying, via alternativeMessageGroups. Returns null if unresolvable.
+    function resolveVersionMessageId(versionCounter) {
+        const versionMatch = versionCounter.textContent.trim().match(/^(\d+)\/(\d+)$/);
+        if (!versionMatch) return null;
+        const currentVersion = parseInt(versionMatch[1]);
+        const totalVersions = parseInt(versionMatch[2]);
+        debugLog('[Stats] Message has version counter:', currentVersion, '/', totalVersions);
+
+        // Find the alternative group that matches this total version count
+        for (const alternatives of Object.values(alternativeMessageGroups)) {
+            if (alternatives.length === totalVersions) {
+                // Found matching group - get the message ID for the current version
+                const targetIndex = currentVersion - 1; // versions are 1-indexed
+                if (targetIndex >= 0 && targetIndex < alternatives.length) {
+                    return alternatives[targetIndex].id;
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+
     async function processMessagesForStats(skipVersionCounterMessages = false) {
         debugLog('[Stats DISPLAY] ========== processMessagesForStats CALLED ==========');
         debugLog('[Stats DISPLAY] skipVersionCounterMessages:', skipVersionCounterMessages);
@@ -15878,6 +15949,19 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                             if (!existingText.includes('→')) {
                                 // Stats are outdated - remove and re-insert
                                 debugLog('[Stats] OUTDATED! Removing old stats div and re-inserting...');
+                                // Forget the removed block's IDs too, otherwise the
+                                // "already handled" guard below skips re-insertion and
+                                // the message is left with no stats at all.
+                                statsInsertedForMessageIds.delete(messageId);
+                                if (existingStatsDiv.dataset.versionId) {
+                                    statsInsertedForMessageIds.delete(existingStatsDiv.dataset.versionId);
+                                }
+                                // The re-insert below resolves the displayed version through
+                                // the version counter, which can pick yet another ID.
+                                if (hasVersionCounter && versionCounter) {
+                                    const displayedVersionId = resolveVersionMessageId(versionCounter);
+                                    if (displayedVersionId) statsInsertedForMessageIds.delete(displayedVersionId);
+                                }
                                 existingStatsDiv.remove();
                                 // Don't skip - let it fall through to re-insert
                             } else {
@@ -15955,24 +16039,10 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // For messages with version counters, find the correct message ID from alternativeMessageGroups
                 // based on which version is currently being displayed
                 if (hasVersionCounter && versionCounter) {
-                    const versionMatch = versionCounter.textContent.trim().match(/^(\d+)\/(\d+)$/);
-                    if (versionMatch) {
-                        const currentVersion = parseInt(versionMatch[1]);
-                        const totalVersions = parseInt(versionMatch[2]);
-                        debugLog('[Stats] Message has version counter:', currentVersion, '/', totalVersions);
-                        
-                        // Find the alternative group that matches this total version count
-                        for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
-                            if (alternatives.length === totalVersions) {
-                                // Found matching group - get the message ID for the current version
-                                const targetIndex = currentVersion - 1; // versions are 1-indexed
-                                if (targetIndex >= 0 && targetIndex < alternatives.length) {
-                                    messageId = alternatives[targetIndex].id;
-                                    debugLog('[Stats] Found message ID from alternativeMessageGroups:', messageId?.substring(0, 8));
-                                }
-                                break;
-                            }
-                        }
+                    const versionMessageId = resolveVersionMessageId(versionCounter);
+                    if (versionMessageId) {
+                        messageId = versionMessageId;
+                        debugLog('[Stats] Found message ID from alternativeMessageGroups:', messageId?.substring(0, 8));
                     }
                 }
                 
@@ -16117,6 +16187,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 }
                 debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                 
+                let leftRacedStatsUntouched = false; // Set when another path's block for a different version is kept
                 // Insert positioning based on story mode
                 if (inStoryMode) {
                     // In story mode: insert INSIDE the message container as first child
@@ -16148,14 +16219,38 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     // Normal mode: insert in the action container header
                     const menuButtonContainer = actionContainer.querySelector('.relative');
                     debugLog('[Stats] Menu button container:', menuButtonContainer);
-                    if (menuButtonContainer) {
+                    const racedStatsDiv = actionContainer.querySelector('.generation-stats');
+                    if (racedStatsDiv) {
+                        // insertStatsForRegeneratedMessage added a block while we awaited
+                        // storage. Never add a second one. If it is for the same message (or
+                        // unlabeled) refresh it with our content; if it is labeled for a
+                        // different version, our snapshot may be stale, so leave it alone
+                        // and don't finalize, letting a later scan correct it if needed.
+                        const racedVersionId = racedStatsDiv.dataset.versionId;
+                        if (!racedVersionId || !messageId || racedVersionId === messageId) {
+                            debugLog('[Stats] Stats div appeared during processing, updating it instead of duplicating');
+                            safeSetHTML(racedStatsDiv, displayText);
+                            if (messageId) {
+                                racedStatsDiv.dataset.versionId = messageId;
+                            }
+                        } else {
+                            debugLog('[Stats] Stats div for another version appeared during processing, leaving it untouched');
+                            leftRacedStatsUntouched = true;
+                        }
+                    } else if (menuButtonContainer) {
                         if (DEBUG_MODE) {
                             debugLog('[Stats DISPLAY] ========== INSERTING STATS DIV ==========');
                             debugLog('[Stats DISPLAY] Stats div content before insert:', statsDiv.textContent);
                             debugLog('[Stats DISPLAY] Inserting into action container');
                         }
                         debugLog('[Stats] Inserting stats div...');
-                        actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                        // menuButtonContainer may be a nested descendant; insertBefore needs a direct child
+                        actionContainer.insertBefore(
+                            statsDiv,
+                            [...actionContainer.children].find(
+                                child => child.contains(menuButtonContainer)
+                            ) || null
+                        );
                         actionContainer.style.setProperty('gap', '4px', 'important');
                     } else {
                         actionContainer.appendChild(statsDiv);
@@ -16171,7 +16266,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 
                 // OPTIMIZATION: Mark stats as finalized if they have arrow format
                 // This prevents unnecessary storage checks on future mutations
-                if (generationStats.model && generationStats.model.includes('→')) {
+                if (!leftRacedStatsUntouched && generationStats.model && generationStats.model.includes('→')) {
                     actionContainer.dataset.statsFinalized = 'true';
                     debugLog('[Stats] Marked stats as finalized (has arrow format)');
                 }
@@ -16290,7 +16385,13 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                         // Normal mode: insert in the action container header
                         const menuButtonContainer = actionContainer.querySelector('.relative');
                         if (menuButtonContainer) {
-                            actionContainer.insertBefore(statsDiv, menuButtonContainer);
+                            // menuButtonContainer may be a nested descendant; insertBefore needs a direct child
+                            actionContainer.insertBefore(
+                                statsDiv,
+                                [...actionContainer.children].find(
+                                    child => child.contains(menuButtonContainer)
+                                ) || null
+                            );
                             actionContainer.style.setProperty('gap', '4px', 'important');
                             // Mark this message as having stats inserted
                             if (messageId) {
@@ -16649,7 +16750,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     // Insert before the menu button container
                     const menuButtonContainer = liveHeaderContainer.querySelector('.relative');
                     if (menuButtonContainer) {
-                        liveHeaderContainer.insertBefore(liveStatsDiv, menuButtonContainer);
+                        insertBeforeContainerChild(liveHeaderContainer, menuButtonContainer, liveStatsDiv);
                         liveHeaderContainer.style.setProperty('gap', '4px', 'important');
                     } else {
                         liveHeaderContainer.appendChild(liveStatsDiv);
@@ -16716,7 +16817,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                                         // Insert before the menu button container
                                         const menuButtonContainer = headerContainer.querySelector('.relative');
                                         if (menuButtonContainer) {
-                                            headerContainer.insertBefore(newStatsDiv, menuButtonContainer);
+                                            insertBeforeContainerChild(headerContainer, menuButtonContainer, newStatsDiv);
                                             headerContainer.style.setProperty('gap', '4px', 'important');
                                         } else {
                                             headerContainer.appendChild(newStatsDiv);

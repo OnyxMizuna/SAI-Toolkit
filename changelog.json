@@ -1,5 +1,15 @@
 [
   {
+    "version": "1.3.0",
+    "date": "November 5, 2026",
+    "features": [
+      "Fixed Generation Statistics (model name and inference settings) not appearing above chat messages after a SpicyChat page update changed the message header layout",
+      "Fixed stats sometimes disappearing or showing twice on a message while a new response or regeneration was loading",
+      "Sidebar Layout now only applies on chat and Story Mode pages, so dialogs like \"Attach Lorebook\" on the new-bot page show their Cancel/Attach buttons correctly",
+      "A small tribute to Mari was added at the bottom of the Settings Data tab (visible when Debug Mode is on)"
+    ]
+  },
+  {
     "version": "1.2.9",
     "date": "September 30, 2026",
     "features": [
