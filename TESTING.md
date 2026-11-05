@@ -115,6 +115,13 @@ Don't let it drift from what the extension actually does.
         polls the URL — [content.js:5476](content.js#L5476)
 - [ ] **Page Jump Modal**
 - [ ] **Show Generation Stats** (+ sub: full model details, compact stats)
+  - [ ] On a long chat, reload and confirm **every** message shows its model/
+        settings block exactly once (real bug once — SpicyChat nested the header
+        menu button, so `insertBefore` threw `NotFoundError` and no stats
+        rendered at all; check DevTools console for that error)
+  - [ ] Regenerate a bot message a few times, then flip between versions with
+        `<` `>` while a new response is still loading: each version shows one
+        stats block, none duplicated, none missing
 - [ ] **Show Timestamps** (+ sub: date-first order, 24-hour time)
   - [ ] **Switch directly from one chat to another** via an in-app link (SPA
         navigation, no reload) and confirm stats/timestamps still appear on the
@@ -159,9 +166,10 @@ hide. Code is still intact; nothing to test here unless it's un-hidden.)
       (see section 7b)
 - [ ] Version number shown at the bottom matches the actual installed
       extension version (not a hardcoded string)
-- [ ] Mari's photo and caption show at the very bottom of the Data tab, below
-      the version number (and below the debug filters when Debug Mode is on).
-      Check that the image loads in both Chrome and Firefox, since it's loaded
+- [ ] Mari's photo and caption are **hidden** by default, and appear at the very
+      bottom of the Data tab (below the debug filters) only while Debug Mode is
+      on — toggle Debug Mode (Shift+click or 4 quick taps on the version text)
+      and confirm it shows/hides live. When visible, check that the image loads in both Chrome and Firefox, since it's loaded
       from `images/mari.jpg` via `web_accessible_resources`
 
 ## 5. WYSIWYG composer — dedicated stress test
