@@ -321,6 +321,15 @@
                     // Extract conversation_id and label from response
                     const conversationId = response.conversation_id || response.chat_id || response.id || null;
                     const label = response.label || null;
+                    // This endpoint is windowed (the live app calls it with
+                    // ?limit=50, and never fetches the rest of a long
+                    // conversation's history unless the user scrolls up), but
+                    // num_messages reports the conversation's true total
+                    // regardless of the limit — content.js uses it to
+                    // calibrate its message-index numbering against the real
+                    // total instead of restarting from 0 for whatever window
+                    // happened to load on this page visit.
+                    const numMessages = typeof response.num_messages === 'number' ? response.num_messages : null;
                     debugLog('[ChatTitle XHR] ========== GET /messages RESPONSE ==========');
                     debugLog('[ChatTitle XHR] Full response keys:', Object.keys(response));
                     debugLog('[ChatTitle XHR] Extracted conversation ID:', conversationId);
@@ -351,6 +360,7 @@
                             type: 'SAI_MESSAGES_LOADED',
                             conversationId: conversationId, // Include conversation ID
                             label: label, // Include label for page title
+                            numMessages: numMessages, // True conversation total, for index calibration
                             botMessages: botMessages.map(msg => ({
                                 id: msg.id,
                                 createdAt: msg.createdAt,

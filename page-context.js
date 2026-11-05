@@ -365,26 +365,84 @@ window.addEventListener('message', async function(event) {
 
         // Fetch messages for specific conversation
         // If conversation ID is not provided, use the character-level endpoint
-        const apiUrl = conversationId && conversationId !== 'null'
+        const messagesBaseUrl = conversationId && conversationId !== 'null'
             ? `https://prod.nd-api.com/characters/${characterId}/messages/${conversationId}`
             : `https://prod.nd-api.com/characters/${characterId}/messages`;
 
-        console.log('[Export] Fetching from:', apiUrl);
+        // PAGINATE. The messages endpoint silently caps a single response body at
+        // ~1MB — with no limit it returns only the most recent ~625 messages of a
+        // longer conversation and drops the rest, which is exactly the "exports
+        // cut off around 1MB" bug. So walk the history in pages the way the site's
+        // own "Load Previous Chapters" button does: ?limit=N returns the newest N,
+        // and ?limit=N&last_id=<oldest id we have> returns the N older than that.
+        // We page backward with the oldest id as the cursor until the history is
+        // exhausted, then merge + de-dupe. limit=300 keeps each page (~0.5MB here)
+        // safely under the cap while minimizing round-trips.
+        const PAGE_LIMIT = 300;
+        const MAX_PAGES = 500; // hard safety valve (150k messages) against a loop
+        const messagesById = new Map(); // id -> message, de-dupes across pages
+        let messagesData = null;        // first (newest) page, reused for metadata
+        let cursorLastId = null;        // oldest id seen so far = next page's cursor
+        let pageNum = 0;
 
-        const messagesResponse = await fetch(apiUrl, {
-            method: 'GET',
-            headers: headers,
-            credentials: 'include'
-        });
+        while (pageNum < MAX_PAGES) {
+            const pageUrl = messagesBaseUrl + `?limit=${PAGE_LIMIT}` +
+                (cursorLastId ? `&last_id=${encodeURIComponent(cursorLastId)}` : '') + '&';
+            const pageResponse = await fetch(pageUrl, {
+                method: 'GET',
+                headers: headers,
+                credentials: 'include'
+            });
 
-        console.log('[Export] Messages API response status:', messagesResponse.status);
+            if (!pageResponse.ok) {
+                // A failure on the very first page is fatal; on a later page we keep
+                // whatever history we've already gathered rather than losing it all.
+                if (pageNum === 0) {
+                    throw new Error('Failed to fetch messages: ' + pageResponse.status);
+                }
+                console.warn('[Export] Pagination page', pageNum + 1, 'failed with', pageResponse.status,
+                    '- stopping with', messagesById.size, 'messages gathered');
+                break;
+            }
 
-        if (!messagesResponse.ok) {
-            throw new Error('Failed to fetch messages: ' + messagesResponse.status);
+            const pageData = await pageResponse.json();
+            if (!messagesData) messagesData = pageData; // keep newest page's metadata
+            const pageMsgs = Array.isArray(pageData.messages) ? pageData.messages : [];
+
+            let addedThisPage = 0;
+            let oldestTs = Infinity;
+            let oldestId = null;
+            for (const m of pageMsgs) {
+                if (m && m.id && !messagesById.has(m.id)) {
+                    messagesById.set(m.id, m);
+                    addedThisPage++;
+                }
+                const ts = m && (m.createdAt || m.created_at);
+                if (typeof ts === 'number' && ts < oldestTs) {
+                    oldestTs = ts;
+                    oldestId = m.id;
+                }
+            }
+            pageNum++;
+            console.log('[Export] Page', pageNum, '- received', pageMsgs.length, ', new', addedThisPage,
+                ', running total', messagesById.size, 'of', messagesData.num_messages);
+
+            // Termination — robust to alternatives inflating counts vs num_messages:
+            //   empty page = reached the beginning; no new ids = wrapped/duplicate;
+            //   cursor didn't advance = the endpoint ignored last_id (e.g. the
+            //   character-level fallback), so there's nothing more to page.
+            if (pageMsgs.length === 0) break;
+            if (addedThisPage === 0) break;
+            if (!oldestId || oldestId === cursorLastId) break;
+            cursorLastId = oldestId;
         }
 
-        const messagesData = await messagesResponse.json();
-        console.log('[Export] Messages received:', messagesData.messages?.length || 0);
+        if (!messagesData) messagesData = { messages: [] };
+        // Replace the windowed array with the full, de-duped, chronological history.
+        messagesData.messages = Array.from(messagesById.values())
+            .sort((a, b) => (a.createdAt || a.created_at || 0) - (b.createdAt || b.created_at || 0));
+        console.log('[Export] Messages received:', messagesData.messages.length,
+            'across', pageNum, 'page(s); API num_messages =', messagesData.num_messages);
 
         // Also fetch character info
         const characterResponse = await fetch(`https://prod.nd-api.com/v2/characters/${characterId}`, {

@@ -1,5 +1,17 @@
 [
   {
+    "version": "1.2.9",
+    "date": "September 30, 2026",
+    "features": [
+      "New: Automatic Story Mode — a toggle in the Story Mode header that keeps clicking \"Continue Story\" for you until you turn it off",
+      "New: the export/download button is now available in Story Mode, not just regular chats",
+      "Fixed long chat and story exports getting cut off around 1MB — exports now include the full conversation no matter how many messages it has",
+      "Story Mode now shows a running message number (e.g. \"#124\") next to the timestamp in the Generation Statistics",
+      "Story Mode text now follows your Classic Style / Custom Style colors and formatting, matching regular chat",
+      "Fixed duplicate stat lines appearing under Story Mode messages during long or automatic generation"
+    ]
+  },
+  {
     "version": "1.2.8",
     "date": "September 8, 2026",
     "features": [

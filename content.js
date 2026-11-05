@@ -835,6 +835,20 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         };
     }
 
+    // Story Mode (spicychat.ai/story/...) renders its prose in a page wrapper
+    // that's structurally unrelated to either Chat Mode layout below (Classic
+    // Layout's `div.p-0[...]`, Sidebar Layout's `div.bg-gray-2`) — none of the
+    // rules below matched a single thing there before this selector existed.
+    // This is Story Mode's equivalent page-background container, found by
+    // inspecting a live Story Mode page: same "flex grow flex-col top-0
+    // left-0 w-full h-full" shell as Chat Mode's wrapper, just with SpicyChat's
+    // own `dark:bg-gray-4` in place of `bg-gray-2`. Also: Story Mode has no
+    // separate "user message" bubble to split styling on the way Chat Mode's
+    // .text-white marker does (see the comment below) — it's one continuous
+    // narrative — so every Story Mode addition below reuses the bot/AI colors
+    // for all text, with no .text-white counterpart.
+    const STORY_MODE_WRAPPER_SELECTOR = 'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.dark\\:bg-gray-4';
+
     // Color rule groups shared by both theme profiles. Each entry's selectors
     // get rendered twice: once unprefixed (light — the default) and once
     // prefixed with `.dark ` (only applies under a real .dark ancestor, i.e.
@@ -846,7 +860,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] body',
                 'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] html',
                 'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"]',
-                'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2'
+                'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2',
+                STORY_MODE_WRAPPER_SELECTOR
             ],
             declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
   font-size: ${shared.fontSize} !important;
@@ -866,7 +881,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         {
             selectors: [
                 'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white)',
-                'div.bg-gray-2 span.leading-6:not(.text-white)'
+                'div.bg-gray-2 span.leading-6:not(.text-white)',
+                `${STORY_MODE_WRAPPER_SELECTOR} span.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\]`
             ],
             declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
   font-size: ${shared.fontSize} !important;
@@ -922,7 +938,11 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
                 'div.bg-gray-2 em:not(.text-white em)',
                 'div.bg-gray-2 i:not(.text-white i)',
                 'div.bg-gray-2 .narration:not(.text-white .narration)',
-                'div.bg-gray-2 .styled:not(.text-white .styled)'
+                'div.bg-gray-2 .styled:not(.text-white .styled)',
+                `${STORY_MODE_WRAPPER_SELECTOR} em`,
+                `${STORY_MODE_WRAPPER_SELECTOR} i`,
+                `${STORY_MODE_WRAPPER_SELECTOR} .narration`,
+                `${STORY_MODE_WRAPPER_SELECTOR} .styled`
             ],
             declarations: (c, shared) => `  color: ${c.bot.narrationColor} !important;
   ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.narrationFontWeight} !important;
@@ -1174,9 +1194,9 @@ ${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
     // sidebar layout enabled. It's designed specifically for that layout mode.
     // Without sidebar, the default SpicyChat layout is fine.
     // 
-    // Skip on lorebook, chatbot/edit, create, and group pages - different layouts there
-    // Supports localized URLs: /{language}/lorebook, /{language}/chatbot/edit, /{language}/create, /{language}/group
-    const isNonChatPage = /^\/(([a-z]{2}\/)?)(lorebook|chatbot\/edit|create|group)/i.test(window.location.pathname);
+    // Only applies on chat pages - every other page (chatbot create/edit, lorebook,
+    // group, voice, ...) has its own layout. See isNonChatPageForSidebar().
+    const isNonChatPage = isNonChatPageForSidebar();
     if (sidebarEnabled && !isNonChatPage) {
         const injectComposerCSS = () => {
             // Wait for document.head to exist (very early in page lifecycle)
@@ -2392,12 +2412,23 @@ body, html {
   color: #fff !important;
 }
 
+/* Story Mode's body-text span carries its own native text-color utility
+   class, which wins over the inherited body/html color above regardless of
+   !important (inheritance is never a match for a rule that targets the
+   element directly) — so it needs pointing at directly, same as the quote
+   fix below. */
+${STORY_MODE_WRAPPER_SELECTOR} span.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\] {
+  color: #fff !important;
+}
+
 em, i, .narration, .styled {
   color: #06B7DB !important;
   font-style: italic !important;
 }
 
-.dark .text-colorQuote {
+.dark .text-colorQuote,
+q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900,
+q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300 {
   color: #fff !important;
 }
 
@@ -2765,6 +2796,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let pendingMessageStats = null; // Store stats temporarily until message appears in DOM
     let loadedMessageIds = []; // Store message IDs from GET /messages response
     let messageIdToIndexMap = {}; // Map bot message IDs to their order in the conversation
+    // Separate from messageIdToIndexMap on purpose: that map's keys are
+    // window-relative 0-based positions (GET /messages is windowed to
+    // ?limit=50, and existing fallback lookups throughout this file compute
+    // `storageOffset + messageIndex` to match — a small, 0-based number for
+    // whatever's in the CURRENTLY loaded window). Overwriting those keys with
+    // absolute positions broke every one of those lookups. This map instead
+    // holds id -> absolute 1-based display number (calibrated against the
+    // API's num_messages total in the SAI_MESSAGES_LOADED handler), read only
+    // by getMessageNumber() for the Story Mode "| #N" display.
+    let messageDisplayNumberMap = {};
     let userMessageIdToIndexMap = {}; // Map user message IDs to their order in the conversation
     let currentConversationId = null; // Store the actual conversation ID from API
     
@@ -3277,7 +3318,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     function getChatUrlPattern() {
         return /^\/([a-z]{2}\/)?chat\//i;
     }
-    
+
     // Get current character ID from URL
     function getCurrentCharacterId() {
         // URL structure: 
@@ -3507,6 +3548,28 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         return dateFirst ? `${dateStr} @ ${timeStr}` : `${timeStr} @ ${dateStr}`;
     }
 
+    // Reverse-lookup a message's 1-based position in the full conversation
+    // (both roles combined) from messageIdToIndexMap, for display next to its
+    // timestamp in Story Mode (e.g. "... @ ... | #37") — see isStoryMode()
+    // callers of formatTimestamp() below. O(n) over the index map, but only
+    // run once per message when its stats line is (re-)built, not on every
+    // mutation.
+    function getMessageNumber(messageId) {
+        if (!messageId) return null;
+        return messageDisplayNumberMap[messageId] || null;
+    }
+
+    // Appends "| #N" (N = 1-based position in the full conversation) to a
+    // formatted timestamp, Story Mode only — Chat Mode's shorter back-and-forth
+    // doesn't need a running count the way a long, unattended Story Mode
+    // session does. Falls back to the plain timestamp if the message isn't in
+    // messageIdToIndexMap yet (e.g. it was just added and hasn't been indexed).
+    function withStoryMessageNumber(timestamp, messageId) {
+        if (!isStoryMode()) return timestamp;
+        const number = getMessageNumber(messageId);
+        return number ? `${timestamp} | #${number}` : timestamp;
+    }
+
     // =============================================================================
     // HELPER: Find Generation Settings modal (supports both old and new UI)
     // =============================================================================
@@ -3664,7 +3727,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Listen for network interception data from page context
         if (event.data.type === 'SAI_MESSAGES_LOADED') {
             debugLog('[Stats] Received SAI_MESSAGES_LOADED from page context');
-            const { conversationId, botMessages, userMessages, label } = event.data;
+            const { conversationId, botMessages, userMessages, label, numMessages } = event.data;
             
             // =================================================================
             // HANDLE CHAT LABEL FOR PAGE TITLE (extracted from GET /messages)
@@ -3851,6 +3914,31 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             
             debugLog('[Core] Built combined index map with', Object.keys(messageIdToIndexMap).length, 'entries');
             debugLog('[Core] (Bot messages:', botOnlyIndex, ', User messages:', userOnlyIndex, ')');
+
+            // Build messageDisplayNumberMap by calibrating against the API's
+            // own num_messages total, WITHOUT touching messageIdToIndexMap
+            // itself (see its declaration comment for why that matters). GET
+            // /messages is windowed (?limit=50, never fetching older history
+            // unless the user scrolls up), so on a long conversation this
+            // window always starts at 0 regardless of the real total — left
+            // uncalibrated, the most recent message would relabel to e.g.
+            // "#50" on every reload instead of its real, stable position.
+            // num_messages reports the true total regardless of the limit, so
+            // anchor the last entry in this window to it and count backward
+            // for the rest, per the user's own diagnosis from the raw API
+            // response.
+            messageDisplayNumberMap = {};
+            if (typeof numMessages === 'number' && numMessages > 0) {
+                const windowEntryCount = Object.keys(messageIdToIndexMap).length;
+                const offset = numMessages - windowEntryCount;
+                if (offset > 0) {
+                    for (const [idx, id] of Object.entries(messageIdToIndexMap)) {
+                        messageDisplayNumberMap[id] = parseInt(idx, 10) + offset + 1; // 1-based
+                    }
+                    debugLog('[Core] Calibrated display numbering against API num_messages:', numMessages, 'offset:', offset);
+                }
+            }
+
             if (DEBUG_MODE) {
                 debugLog('[Stats MESSAGES_LOADED] First 5 combined mappings:', Object.keys(messageIdToIndexMap).slice(0, 5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
                 debugLog('[Stats MESSAGES_LOADED] Last 5 combined mappings:', Object.keys(messageIdToIndexMap).slice(-5).map(k => `${k}: ${messageIdToIndexMap[k]}`));
@@ -4114,12 +4202,55 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     // NOTE: insertStatsForRegeneratedMessage will add messageId to statsInsertionInProgress
                     insertStatsWithRetry(messageId, model, settings, createdAt);
                     
-                    // Also add to index map for historical message display on page refresh
-                    if (!isRegenerationDetected) {
-                        const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
-                        const newIndex = currentMaxIndex + 1;
-                        messageIdToIndexMap[newIndex] = messageId;
-                        debugLog('[Stats SAVE] Added message to index map at index:', newIndex, 'messageId:', messageId);
+                    // Also add to index map for historical message display on page refresh.
+                    //
+                    // Story Mode's "Continue Story" sends the same continue_chat:true
+                    // flag that Chat Mode's regenerate uses, so isRegenerationDetected
+                    // is true for every single continue — but a Story Mode continue is
+                    // a genuinely new message appended to the story, not an alternate
+                    // replacing an existing one the way a Chat Mode regen is. Skipping
+                    // the index update for it (as Chat Mode correctly does for real
+                    // regens) left every continue permanently missing from
+                    // messageIdToIndexMap and messageDisplayNumberMap.
+                    if (!isRegenerationDetected || isStoryMode()) {
+                        // messageIdToIndexMap is the window-relative fallback map.
+                        // Only append an id that isn't already in it, so a duplicate
+                        // SAI_NEW_MESSAGE (or a Story Mode regeneration re-firing for a
+                        // new id at the same position) can't grow it past what a page
+                        // reload would rebuild.
+                        if (!Object.values(messageIdToIndexMap).includes(messageId)) {
+                            const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
+                            const newIndex = currentMaxIndex + 1;
+                            messageIdToIndexMap[newIndex] = messageId;
+                            debugLog('[Stats SAVE] Added message to index map at index:', newIndex, 'messageId:', messageId);
+                        }
+
+                        // Extend the calibrated Story Mode display numbering (see its
+                        // declaration and the SAI_MESSAGES_LOADED handler). Anchor to the
+                        // predecessor's number rather than a running max+1: every Story
+                        // Mode message's prev_id is the immediately preceding message
+                        // (verified against the live API — the conversation is a clean
+                        // bot→bot linked list), so number(new) = number(prev_id) + 1 is
+                        // both deterministic and idempotent. That keeps the live counter
+                        // locked to the API's num_messages instead of drifting ahead of
+                        // it, because:
+                        //   - a duplicate SAI_NEW_MESSAGE for the same id recomputes the
+                        //     SAME number instead of adding one, and
+                        //   - a regeneration (a new id that shares prev_id with the message
+                        //     it replaces) resolves to that message's number, since a regen
+                        //     replaces a position rather than appending one.
+                        // Fall back to max+1 only if the predecessor isn't numbered yet
+                        // (e.g. it scrolled out of the loaded window) and the id is new.
+                        let displayNumber;
+                        if (prevId && messageDisplayNumberMap[prevId] !== undefined) {
+                            displayNumber = messageDisplayNumberMap[prevId] + 1;
+                        } else if (messageDisplayNumberMap[messageId] !== undefined) {
+                            displayNumber = messageDisplayNumberMap[messageId];
+                        } else {
+                            displayNumber = Math.max(0, ...Object.values(messageDisplayNumberMap)) + 1;
+                        }
+                        messageDisplayNumberMap[messageId] = displayNumber;
+                        debugLog('[Stats SAVE] Story display number for', messageId, '=', displayNumber);
                     }
                     
                     // Check if auto-regeneration should be triggered
@@ -4937,18 +5068,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let sidebarMinWidth = DEFAULT_SIDEBAR_MIN_WIDTH; // User-configurable minimum page width
     let sidebarAutoDisabled = false; // True when user has sidebar enabled but page is too narrow
     let sidebarUserEnabled = false; // Tracks user's actual preference (persisted to storage)
-    let sidebarPageDisabled = false; // True when CSS is off specifically because the current page is chatbot/edit, lorebook, create, or group
+    let sidebarPageDisabled = false; // True when CSS is off specifically because the current page isn't a chat page
     
-    // Check if current page should have sidebar layout disabled
-    // Supports localized URLs: /{language}/lorebook, /{language}/chatbot/edit, /{language}/group
+    // Check if current page should have sidebar layout disabled.
+    // Allowlist rather than denylist: Sidebar Layout only applies on chat and Story
+    // Mode pages (/chat/..., /chats/..., /story/..., and localized
+    // /{language}/chat(s)/..., /{language}/story/...). A denylist kept
+    // missing pages — e.g. the new-bot creation page pinned the "Attach Lorebook"
+    // modal into the sidebar panel and hid its Attach/Cancel buttons.
     function isNonChatPageForSidebar() {
-        return /^\/(([a-z]{2}\/)?)(lorebook|chatbot\/edit|create|group)/i.test(window.location.pathname);
+        return !/^\/([a-z]{2}\/)?(chats?|story)\//i.test(window.location.pathname);
     }
     
     // Apply or remove sidebar layout CSS
     // saveToStorage: if false, only updates the CSS state without saving (used for responsive auto-disable)
     async function toggleSidebarLayout(enable, saveToStorage = true) {
-        // Don't enable sidebar on non-chat pages (lorebook, chatbot, group)
+        // Don't enable sidebar on non-chat pages (chatbot, lorebook, group, voice, ...)
         const shouldBlock = enable && isNonChatPageForSidebar();
 
         if (enable && !shouldBlock) {
@@ -7770,7 +7905,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
         // Sidebar Layout CSS is already injected early if enabled
         // Just get a reference to the existing element
-        // BUT: Ensure it's disabled on non-chat pages (lorebook, chatbot, group)
+        // BUT: Ensure it's disabled on non-chat pages (chatbot, lorebook, group, voice, ...)
         const shouldDisableSidebarLayout = isNonChatPageForSidebar();
         sidebarPageDisabled = sidebarEnabled && shouldDisableSidebarLayout;
 
@@ -8275,11 +8410,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             return;
         }
         
-        // Only show on chat pages (supports both /chat/ and /{language}/chat/)
-        if (!isOnChatPage()) {
+        // Show on chat pages (/chat/ or /{language}/chat/) and on Story Mode
+        // pages (/story/...) — export works identically in both.
+        if (!isOnChatPage() && !isStoryMode()) {
             return;
         }
-        
+
         // Check if already injected
         const existingButton = document.getElementById('sai-export-btn');
         if (existingButton) return;
@@ -8329,8 +8465,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             showExportMenu(exportBtn);
         });
         
-        // Insert before the toolkit button (if it exists), otherwise at the beginning
-        if (toolkitBtn) {
+        // Position the button. In Story Mode the reference buttons (Sparkles /
+        // Generation Settings, and our Auto Story toggle) are wrapped in
+        // tooltip/layout divs rather than being direct children of the row, so
+        // use insertBeforeContainerChild. Place export to the LEFT of the Auto
+        // Story toggle (or the Sparkles button if the toggle isn't present yet),
+        // mirroring Chat Mode where export sits left of the toolkit button.
+        if (isStoryMode()) {
+            const autoStoryBtn = document.getElementById('sai-auto-story-btn');
+            const anchor = autoStoryBtn || sparklesButton || referenceButton;
+            insertBeforeContainerChild(buttonContainer, anchor, exportBtn);
+        } else if (toolkitBtn) {
             buttonContainer.insertBefore(exportBtn, toolkitBtn);
         } else {
             buttonContainer.insertBefore(exportBtn, buttonContainer.firstChild);
@@ -8891,6 +9036,243 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (btn) btn.remove();
     }
 
+    // =========================================================================
+    // AUTO STORY MODE
+    // =========================================================================
+    //
+    // WHAT THIS DOES
+    //   Story Mode (spicychat.ai/story/{characterId}/{conversationId}) lets the
+    //   user seed a scene and then either direct it or click "Continue Story"
+    //   to have the model keep writing unattended. This feature adds a toggle
+    //   button, injected to the left of the Generation Settings (Sparkles)
+    //   button, that repeatedly clicks "Continue Story" for you: turn it on
+    //   and the model keeps extending the story on its own until you turn it
+    //   back off.
+    //
+    // HOW IT WORKS
+    //   SpicyChat removes the "Continue Story" button from the DOM the moment
+    //   a generation starts and re-renders it once the new passage lands, so
+    //   we don't need to track a separate "is it generating" flag — a simple
+    //   poll for the button's presence already reflects the page's own state.
+    //   Every tick: if the toggle is on, we're still on the same story, no
+    //   error banner is showing, and the button is present, we click it and
+    //   arm a short cooldown before the next click is allowed.
+    //
+    // SAFETY
+    //   - Stops (and turns the toggle off) if SpicyChat's own "Oops!
+    //     Something went wrong" banner appears (see findOopsBanner() above),
+    //     rather than hammering a failing request.
+    //   - Stops if the URL navigates away from this story, or to a different
+    //     story entirely, so it can't silently keep writing the wrong chat.
+    //   - Hard safety cap on consecutive continues so a detection bug can't
+    //     turn this into an unattended, unbounded API-usage loop.
+    //   - Runtime-only: the toggle always starts OFF on a fresh page load
+    //     rather than persisting/auto-resuming, so reloading the page can't
+    //     silently leave it running in the background.
+
+    let autoStoryModeActive = false;
+    let autoStoryPollTimer = null;
+    let autoStoryNextClickAt = 0;
+    let autoStoryClickInFlight = false;
+    let autoStoryConversationKey = null;
+    let autoStoryContinueCount = 0;
+    const AUTO_STORY_MAX_CONTINUES = 1000; // safety net, not a target — see SAFETY above
+
+    // Find the enabled "Continue Story" button. Primary match is the tooltip
+    // wrapper SpicyChat renders around it (data-tooltip-content="Continue
+    // Story"); falls back to matching on the button's own text so this
+    // survives tooltip markup changes, same approach as findOopsBanner().
+    function findContinueStoryButton() {
+        const wrapper = document.querySelector('div[data-tooltip-content="Continue Story"]');
+        const wrapped = wrapper ? wrapper.querySelector('button') : null;
+        if (wrapped && !wrapped.disabled) return wrapped;
+
+        const buttons = document.querySelectorAll('button');
+        for (const b of buttons) {
+            if (!b.disabled && (b.textContent || '').trim() === 'Continue Story') return b;
+        }
+        return null;
+    }
+
+    function getStoryConversationKey() {
+        const match = window.location.pathname.match(/\/story\/([^/]+)\/([^/?#]+)/i);
+        return match ? match[1] + '/' + match[2] : window.location.pathname;
+    }
+
+    function stopAutoStoryMode(reason, opts) {
+        opts = opts || {};
+        if (!autoStoryModeActive) return;
+        autoStoryModeActive = false;
+        autoStoryContinueCount = 0;
+        if (autoStoryPollTimer) {
+            clearInterval(autoStoryPollTimer);
+            autoStoryPollTimer = null;
+        }
+        updateAutoStoryButtonIcon();
+        debugLog('[AutoStory] Stopped:', reason);
+        if (!opts.silent) {
+            showNotification('Auto Story Mode stopped — ' + reason, true);
+        }
+    }
+
+    function autoStoryTick() {
+        if (!autoStoryModeActive) return;
+
+        if (!isStoryMode()) {
+            stopAutoStoryMode('navigated away from Story Mode');
+            return;
+        }
+        if (getStoryConversationKey() !== autoStoryConversationKey) {
+            stopAutoStoryMode('switched to a different story');
+            return;
+        }
+        if (findOopsBanner()) {
+            stopAutoStoryMode('SpicyChat reported an error');
+            return;
+        }
+        if (autoStoryContinueCount >= AUTO_STORY_MAX_CONTINUES) {
+            stopAutoStoryMode(`reached the safety limit of ${AUTO_STORY_MAX_CONTINUES} continues`);
+            return;
+        }
+        if (autoStoryClickInFlight || Date.now() < autoStoryNextClickAt) return;
+
+        const btn = findContinueStoryButton();
+        if (!btn) return; // still generating, or the story hasn't been started yet
+
+        // The Generation Statistics block for the message that JUST arrived is
+        // still being written asynchronously (insertStatsWithRetry retries for
+        // up to ~3s before giving up) when this button reappears. Clicking
+        // again immediately races that retry loop — the DOM changes underneath
+        // it as the next message starts streaming in, and the stats insertion
+        // silently fails. pendingNewMessageCount is the same counter that
+        // pipeline already uses to track "a bot message landed but its stats
+        // aren't confirmed yet" (see insertStatsWithRetry/processMessagesForStats
+        // above); waiting for it to clear lets stats catch up before we
+        // generate more work for them to race against. It self-clears within
+        // that ~3s window even if insertion ultimately fails, so this can
+        // never hang Auto Story Mode indefinitely.
+        if (pendingNewMessageCount > 0) {
+            debugLog('[AutoStory] Waiting for generation stats to catch up before continuing (pending:', pendingNewMessageCount, ')');
+            return;
+        }
+
+        autoStoryClickInFlight = true;
+        autoStoryContinueCount++;
+        debugLog('[AutoStory] Clicking Continue Story (#' + autoStoryContinueCount + ')');
+        btn.click();
+        // The button vanishing while SpicyChat generates already paces us —
+        // this cooldown is just a floor in case it reappears unexpectedly fast.
+        autoStoryNextClickAt = Date.now() + 2000 + Math.random() * 1000;
+        setTimeout(() => { autoStoryClickInFlight = false; }, 1500);
+    }
+
+    function startAutoStoryMode() {
+        if (autoStoryModeActive || !isStoryMode()) return;
+        autoStoryModeActive = true;
+        autoStoryContinueCount = 0;
+        autoStoryNextClickAt = 0;
+        autoStoryConversationKey = getStoryConversationKey();
+        updateAutoStoryButtonIcon();
+        debugLog('[AutoStory] Started for', autoStoryConversationKey);
+        autoStoryPollTimer = setInterval(autoStoryTick, 1000);
+        autoStoryTick();
+    }
+
+    // Update (or create-time initialize) the toggle button's icon/title to
+    // reflect autoStoryModeActive. Called with no argument to refresh the
+    // live button after state changes.
+    function updateAutoStoryButtonIcon(btn) {
+        if (!btn) btn = document.getElementById('sai-auto-story-btn');
+        if (!btn) return;
+
+        const on = autoStoryModeActive;
+        btn.title = on
+            ? 'Auto Story Mode: ON — automatically clicking Continue Story (click to stop)'
+            : 'Auto Story Mode: OFF — click to auto-continue the story until you turn it off';
+        btn.classList.toggle('sai-auto-story-active', on);
+
+        btn.textContent = '';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '20');
+        svg.setAttribute('height', '20');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', on ? '#3b82f6' : 'currentColor');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.setAttribute('class', 'inline-flex items-center justify-center w-5 h-5' + (on ? ' sai-auto-story-spin' : ''));
+        svg.style.opacity = on ? '1' : '0.6';
+        // Lucide "repeat" icon — reads as "auto-advance/loop" at a glance.
+        svg.innerHTML = '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>';
+        btn.appendChild(svg);
+    }
+
+    let autoStoryStyleInjected = false;
+    function ensureAutoStoryStyle() {
+        if (autoStoryStyleInjected) return;
+        const style = document.createElement('style');
+        style.textContent = `
+@keyframes sai-auto-story-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.sai-auto-story-spin { animation: sai-auto-story-pulse 1.5s ease-in-out infinite; }
+`;
+        document.head.appendChild(style);
+        autoStoryStyleInjected = true;
+    }
+
+    // Walk up from deepDescendant until we find the node that is a direct
+    // child of container, then insert newNode before it. Used because the
+    // Sparkles/Generation Settings button in Story Mode's header is wrapped
+    // in a couple of layout/tooltip divs rather than being a direct child of
+    // the row container itself.
+    function insertBeforeContainerChild(container, deepDescendant, newNode) {
+        let node = deepDescendant;
+        while (node && node.parentElement !== container) {
+            node = node.parentElement;
+        }
+        if (node) {
+            container.insertBefore(newNode, node);
+        } else {
+            container.appendChild(newNode);
+        }
+    }
+
+    function injectAutoStoryToggleButton() {
+        if (typeof isResizing !== 'undefined' && isResizing) return;
+        if (typeof sidebarWidthTransitionPending !== 'undefined' && sidebarWidthTransitionPending) return;
+        if (!isStoryMode()) return;
+        if (document.getElementById('sai-auto-story-btn')) return;
+
+        const sparklesBtn = document.querySelector('button[aria-label="Sparkles-button"]');
+        if (!sparklesBtn) {
+            debugLog('[AutoStory] Generation Settings (Sparkles) button not found');
+            return;
+        }
+        const container = sparklesBtn.closest('.flex.justify-end.items-center.gap-sm') || sparklesBtn.parentElement;
+
+        ensureAutoStoryStyle();
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'sai-auto-story-btn';
+        toggleBtn.type = 'button';
+        toggleBtn.setAttribute('aria-label', 'Auto-Story-toggle');
+        toggleBtn.className = 'inline-flex items-center justify-center transition-all duration-200 rounded-full bg-transparent border-1 border-solid border-gray-5 text-black dark:border-gray-8 dark:text-white w-9 h-9 cursor-pointer';
+        updateAutoStoryButtonIcon(toggleBtn);
+
+        toggleBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (autoStoryModeActive) {
+                stopAutoStoryMode('turned off', { silent: true });
+            } else {
+                startAutoStoryMode();
+            }
+        });
+
+        insertBeforeContainerChild(container, sparklesBtn, toggleBtn);
+        debugLog('[AutoStory] Toggle button injected');
+    }
+
     // Show export dropdown menu
     function showExportMenu(anchorButton) {
         // Remove any existing menu
@@ -9005,8 +9387,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             chatIndexOffset = 1;
         }
 
-        if (pathParts.length < (chatIndexOffset + 2) || pathParts[chatIndexOffset].toLowerCase() !== 'chat') {
-            throw new Error('Not on a chat page. URL should be /chat/{characterId}/{conversationId} or /{language}/chat/{characterId}/{conversationId}');
+        // Accept both Chat Mode (/chat/...) and Story Mode (/story/...) — the
+        // underlying messages endpoint (characters/{id}/messages/{convId}) is the
+        // same for both, so the export path only needs the two ids from the URL.
+        const routeSegment = pathParts[chatIndexOffset] ? pathParts[chatIndexOffset].toLowerCase() : '';
+        if (pathParts.length < (chatIndexOffset + 2) || (routeSegment !== 'chat' && routeSegment !== 'story')) {
+            throw new Error('Not on a chat or story page. URL should be /chat/ or /story/{characterId}/{conversationId} (optionally with a /{language} prefix)');
         }
         
         const characterId = pathParts[chatIndexOffset + 1];
@@ -10360,6 +10746,27 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 @media (prefers-color-scheme: dark) {
                     .version-text { color: #6b7280; }
                 }
+                .memorial {
+                    margin-top: 1.5rem;
+                    text-align: center;
+                    font-size: 12px;
+                    color: #9ca3af;
+                }
+                .memorial img {
+                    display: block;
+                    width: 160px;
+                    max-width: 100%;
+                    margin: 0 auto 0.5rem;
+                    border-radius: 8px;
+                }
+                .memorial-name {
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                .memorial-note {
+                    margin-top: 0.25rem;
+                    font-style: italic;
+                }
                 .debug-filter-label {
                     display: flex;
                     align-items: center;
@@ -11488,6 +11895,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <input type="text" id="model-override-input" placeholder="e.g. glm5-beta" autocomplete="off" style="width: 100%; box-sizing: border-box; padding: 0.4rem 0.5rem; background: rgba(255,140,0,0.08); border: 1px solid rgba(255,140,0,0.5); border-radius: 4px; color: #ff8c00; font-size: 0.75rem; outline: none; font-family: monospace;">
                         </div>
                     </div>
+
+                    <div class="memorial">
+                        <img id="memorial-img" alt="Mari">
+                        <div class="memorial-name">Mari</div>
+                        <div class="memorial-dates">10 October 2013 - 1 October 2026</div>
+                        <div class="memorial-note">I miss my baby girl 🌈</div>
+                    </div>
                 </div>
             </div>
             
@@ -11636,6 +12050,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (versionText) {
             const _api = typeof browser !== 'undefined' ? browser : chrome;
             versionText.textContent = 'v' + _api.runtime.getManifest().version;
+        }
+
+        const memorialImg = shadow.querySelector('#memorial-img');
+        if (memorialImg) {
+            const _api = typeof browser !== 'undefined' ? browser : chrome;
+            memorialImg.src = _api.runtime.getURL('images/mari.jpg');
         }
 
         if (viewWhatsNewBtn) {
@@ -14812,6 +15232,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         // Try to inject NSFW toggle button (only on chat pages, after export button)
         injectNSFWToggleButton();
 
+        // Try to inject the Auto Story Mode toggle (only on Story Mode pages)
+        injectAutoStoryToggleButton();
+
         // NOTE: previously we scheduled 20 retry setTimeouts (5 delays × 4 buttons) on
         // every mutation batch. The buttonCheckInterval below already re-injects any
         // missing buttons every 2s, so those retries were redundant churn. Removed.
@@ -14875,6 +15298,19 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 // Cheap no-op when the feature is off or the banner is gone.
                 injectRecoverButtonIfNeeded();
             }
+
+            // Check Auto Story Mode toggle + export button (only on Story Mode pages)
+            if (isStoryMode()) {
+                const autoStoryButton = document.getElementById('sai-auto-story-btn');
+                if (!autoStoryButton) {
+                    injectAutoStoryToggleButton();
+                }
+
+                const storyExportButton = document.getElementById('sai-export-btn');
+                if (!storyExportButton) {
+                    injectChatExportButton();
+                }
+            }
             }, TIMING.PERIODIC_CHECK); // Check periodically instead of on every DOM mutation
         }
     });
@@ -14892,7 +15328,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         injectToolkitMobileButton();
         injectChatExportButton();
         injectNSFWToggleButton();
-        
+        injectAutoStoryToggleButton();
+
         // Also schedule retry attempts in case page content loads slowly
         // Use scheduleInjection so these can be cancelled on resize
         TIMING.BUTTON_INJECT_RETRIES.forEach(delay => {
@@ -14901,6 +15338,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 injectToolkitMobileButton();
                 injectChatExportButton();
                 injectNSFWToggleButton();
+                injectAutoStoryToggleButton();
             }, delay);
         });
     }).catch((err) => {
@@ -14914,6 +15352,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 injectToolkitMobileButton();
                 injectChatExportButton();
                 injectNSFWToggleButton();
+                injectAutoStoryToggleButton();
             }
         }, 2000);
     });
@@ -15121,7 +15560,23 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     // Check if this is a bot message (has character link)
                     // Use contains selector to support localized URLs like /pt/chatbot/
                     const characterLink = wrapper.querySelector('a[href*="/chatbot/"]');
-                    if (characterLink) {
+                    let isBotWrapper = !!characterLink;
+                    // Story Mode never renders a chatbot profile link on the message
+                    // wrapper, so characterLink is always null there — this loop
+                    // used to fall through every wrapper and never find one,
+                    // meaning EVERY brand-new Story Mode message fell through this
+                    // entire function (always "no target bubble found") and burned
+                    // insertStatsWithRetry's full ~3s of retries before giving up,
+                    // relying entirely on processMessagesForStats's slower,
+                    // DOM-snapshot-dependent pass to ever backfill stats. This
+                    // function is only ever called for bot messages in the first
+                    // place (see the SAI_NEW_MESSAGE handler above — user messages
+                    // take the processMessagesForStats path instead), so in Story
+                    // Mode the last wrapper in the DOM is always the one we want.
+                    if (!isBotWrapper && isStoryMode()) {
+                        isBotWrapper = true;
+                    }
+                    if (isBotWrapper) {
                         // This is a bot message - find its bubble
                         targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
                         if (!targetBubble) {
@@ -15194,7 +15649,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         if (timestampEnabled && hasTimestamp) {
             const timestamp = await formatTimestamp(fullStats?.timestamp || createdAt);
             if (timestamp) {
-                displayLines.push(timestamp);
+                displayLines.push(withStoryMessageNumber(timestamp, messageId));
             }
         }
 
@@ -15366,8 +15821,22 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 continue;
             }
             
-            // Check if stats already exist
-            const existingStatsDiv = actionContainer.querySelector('.generation-stats');
+            // Check if stats already exist. In Story Mode the stats div is
+            // inserted into an ANCESTOR container (see the insertion below),
+            // not inside actionContainer, so also look there — otherwise this
+            // guard never sees an existing Story Mode block and a later pass
+            // inserts a duplicate. That second pass happens easily during a
+            // live auto-run: the in-memory statsInsertedForMessageIds guard
+            // misses whenever extractMessageId falls back to the index map and
+            // the growing map shifts storageOffset, resolving an old wrapper to
+            // a different id. Detecting the actual DOM node is resolution-proof.
+            let existingStatsDiv = actionContainer.querySelector('.generation-stats');
+            if (!existingStatsDiv && isStoryMode()) {
+                const storyStatsContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
+                if (storyStatsContainer) {
+                    existingStatsDiv = storyStatsContainer.querySelector(':scope > .generation-stats');
+                }
+            }
             if (existingStatsDiv) {
                 debugLog('[Stats] Found existing stats div');
                 
@@ -15624,7 +16093,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                         debugLog('[Stats DISPLAY] Input to formatTimestamp was:', generationStats.timestamp);
                     }
                     if (timestamp) {
-                        displayLines.push(timestamp);
+                        displayLines.push(withStoryMessageNumber(timestamp, messageId));
                     }
                 }
 
@@ -15654,6 +16123,15 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     // This keeps the stats within the same width constraints as the message
                     const innerContainer = actionContainer.closest('div.flex.flex-col.gap-0, div.flex.flex-col.gap-md');
                     if (innerContainer) {
+                        // Belt-and-suspenders against duplicates: if this container
+                        // already holds a Story Mode stats block, replace it in place
+                        // rather than prepending a second one. The broadened guard
+                        // near the top of the loop should already have skipped us, but
+                        // this makes a duplicate structurally impossible regardless of
+                        // which upstream path (mutation re-run, retry, live event) got
+                        // here.
+                        const priorStoryStats = innerContainer.querySelector(':scope > .generation-stats');
+                        if (priorStoryStats) priorStoryStats.remove();
                         // Insert stats as first child inside the flex-col container
                         statsDiv.style.cssText = 'display: block; color: #6b7280; font-size: 10px; line-height: 1.4; text-align: right; margin-bottom: 4px; width: 100%;';
                         innerContainer.insertBefore(statsDiv, innerContainer.firstChild);
@@ -15782,7 +16260,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     }
 
                     // Build display content for user messages
-                    let displayLines = [timestamp];
+                    let displayLines = [withStoryMessageNumber(timestamp, messageId)];
 
                     // Add message ID if enabled
                     if (showMessageIds && messageId) {
@@ -16138,7 +16616,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             if (timestampEnabled && hasTimestamp) {
                 const timestamp = await formatTimestamp(generationStats.timestamp);
                 if (timestamp) {
-                    displayLines.push(timestamp);
+                    displayLines.push(withStoryMessageNumber(timestamp, newMessageId));
                 }
             }
 

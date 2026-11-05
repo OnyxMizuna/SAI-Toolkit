@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "S.AI Toolkit",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
   "homepage_url": "https://sai.onyxmizuna.eu/SAI-Toolkit/",
   "permissions": [
@@ -47,7 +47,8 @@
       "resources": [
         "page-context.js",
         "xhr-intercept.js",
-        "changelog.json"
+        "changelog.json",
+        "images/mari.jpg"
       ],
       "matches": [
         "*://spicychat.ai/*"

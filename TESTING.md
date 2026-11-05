@@ -51,6 +51,12 @@ Don't let it drift from what the extension actually does.
         was a real bug once — the sidebar CSS only got re-checked against the
         URL on full page load, not on SPA navigation —
         [content.js:5066](content.js#L5066))
+  - [ ] Sidebar Layout only applies on chat and Story Mode pages (`/chat/*`,
+        `/chats/*`, `/story/*`, and localized `/{lang}/...` versions). With it enabled, create a **new** bot
+        (before its first save), click "Attach Lorebook" — confirm it opens as
+        a centered dialog with Cancel/Attach buttons, not a right-side panel
+        (real bug once — the old denylist missed the new-bot page). Also spot
+        check `/chatbot/*`, `/lorebook/*`, `/group/*`, `/voice/*` look normal
 - [ ] **Classic Chat Layout** — messages center into a single column
 - [ ] **Small Profile Images** — avatars shrink
 - [ ] **Rounded Profile Images** — avatars become circular
@@ -153,6 +159,10 @@ hide. Code is still intact; nothing to test here unless it's un-hidden.)
       (see section 7b)
 - [ ] Version number shown at the bottom matches the actual installed
       extension version (not a hardcoded string)
+- [ ] Mari's photo and caption show at the very bottom of the Data tab, below
+      the version number (and below the debug filters when Debug Mode is on).
+      Check that the image loads in both Chrome and Firefox, since it's loaded
+      from `images/mari.jpg` via `web_accessible_resources`
 
 ## 5. WYSIWYG composer — dedicated stress test
 
@@ -251,6 +261,16 @@ right after bumping `manifest.json`'s version.
       populated
 - [ ] Export as HTML — downloads, contains the real conversation, and bot/user
       name + avatar are populated
+- [ ] **Long conversation (800+ messages) exports in full, not cut off around
+      1MB.** The messages endpoint silently caps a single response body at ~1MB
+      (~625 messages), so the export pages backward through history with
+      `?limit=300&last_id=<oldest id so far>` — the same cursor the site's "Load
+      Previous Chapters" button uses — until it reaches the first message
+      ([page-context.js](page-context.js), the `SAI_EXPORT_CHAT_REQUEST` handler).
+      Verify the exported message count matches the whole active thread (first
+      message present) and the file is well over 1MB. Note: the count can be
+      lower than the on-screen `#N` / `num_messages`, which also counts
+      regenerated alternates the endpoint doesn't return.
 - [ ] HTML export follows the active Settings modal style at export time:
   - [ ] Neither Classic Style nor Custom Style on — matches native SpicyChat
         colors for the current light/dark mode
@@ -259,6 +279,38 @@ right after bumping `manifest.json`'s version.
   - [ ] Custom Style on — matches the configured bot/user colors, fonts, and
         highlight/quote/narration styling for the current light/dark mode
   - [ ] Quoted dialogue ("...") is colored per the Custom Style quote color
+
+## 8b. Story Mode (`/story/...` URLs)
+
+- [ ] **Auto Story Mode toggle** appears in the Story Mode header immediately to
+      the left of the Generation Settings (sparkles) button
+- [ ] Enabling it repeatedly clicks "Continue Story" on its own; the icon
+      reflects the on/off state; disabling it stops further clicks
+- [ ] It stops itself safely if "Continue Story" disappears or navigation leaves
+      Story Mode (no runaway clicking, no console errors)
+- [ ] **Text color/formatting** in Story Mode follows the Settings modal style,
+      matching Chat Mode:
+  - [ ] Custom Style on — bot body text, quoted dialogue ("..."), and narration
+        take the configured colors/fonts
+  - [ ] Classic Style on — Story Mode text uses its fixed light-on-dark palette
+- [ ] **Message number (`#N`)** shows in the Generation Statistics block on the
+      same line as the timestamp (`MM/DD/YYYY @ HH:MM:SS AM | #N`)
+- [ ] On a fresh load of a long story (>50 messages), the newest message's `#N`
+      equals the conversation's true total — it does **not** reset to `#50`
+      (numbering is calibrated against the API's `num_messages`; the GET
+      /messages window is only the last 50)
+- [ ] During a live Auto Story Mode run, each new message increments `#N` by
+      exactly 1 and the newest number stays equal to `num_messages` — it does
+      **not** drift ahead over a long run (each number is anchored to its
+      predecessor via `prev_id`, so duplicate insert events and regenerations
+      don't inflate the count — [content.js:4215](content.js#L4215))
+- [ ] Refresh mid-run — the recalibrated `#N` matches what was shown live (no
+      jump up or down)
+- [ ] **Export/download button** appears in the Story Mode header (same download
+      icon as Chat Mode), to the left of the Auto Story toggle
+- [ ] Clicking it opens the JSON/HTML menu; both exports download the full story
+      conversation (all messages, not just the loaded window) — the messages API
+      is the same endpoint for chat and story, so the fetch is mode-agnostic
 
 ## 9. Cross-browser
 
