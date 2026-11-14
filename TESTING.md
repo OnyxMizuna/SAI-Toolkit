@@ -1,8 +1,10 @@
 # S.AI Toolkit — Manual Test Checklist
 
 Run through this before cutting a new build, and after any change that touches
-a feature. It's organized to match the Settings modal's own tabs (Layout →
-Style → Features → Data), plus a few things that live outside the modal.
+a feature. Sections 1–4 match the Settings modal's own tabs (Layout → Style →
+Features → Data); sections 5–11 cover things that live outside the modal.
+Steps marked **iOS** need an iPhone/iPad (Safari); section 12 lists them all
+in one place for a phone-only pass.
 
 **Keeping this current:** every time a feature is added, changed, or removed,
 update this file in the same change — add a step, edit one, or delete one.
@@ -24,8 +26,8 @@ Don't let it drift from what the extension actually does.
       there's **no page-level horizontal scrollbar** at all, with Sidebar
       Layout both on and off (a stray right-side margin causing one — desktop
       only, both Sidebar Layout states — was a real bug once, caused by a
-      mobile-only fix that wasn't actually scoped to mobile —
-      [content.js:1659](content.js#L1659))
+      mobile-only fix that wasn't actually scoped to mobile — search
+      `content.js` for "Character info bar full-width background fix")
 
 ## 1. Layout tab
 
@@ -34,7 +36,7 @@ Don't let it drift from what the extension actually does.
   - [ ] Open Memories too — confirm the split view (Generation Settings on
         top ~40%, Memories on the bottom ~60%)
   - [ ] Confirm the chat's scrollbar sits flush against the sidebar panel
-        with no gap (this exact gap was a real bug once — [content.js:2061](content.js#L2061))
+        with no gap (this exact gap was a real bug once)
   - [ ] **Compact Generation Settings** sub-toggle — descriptions disappear
   - [ ] **Minimum page width** — change it, confirm the layout adapts; clear
         the field or type garbage, confirm it falls back to 1000px
@@ -49,61 +51,87 @@ Don't let it drift from what the extension actually does.
         "Attach Lorebook" shows its Cancel/Attach buttons; then click back to
         the chat page and confirm Sidebar Layout is still active there (this
         was a real bug once — the sidebar CSS only got re-checked against the
-        URL on full page load, not on SPA navigation —
-        [content.js:5066](content.js#L5066))
+        URL on full page load, not on SPA navigation — see
+        `initSidebarLayoutPageWatcher` in `content.js`)
   - [ ] Sidebar Layout only applies on chat and Story Mode pages (`/chat/*`,
         `/chats/*`, `/story/*`, and localized `/{lang}/...` versions). With it enabled, create a **new** bot
         (before its first save), click "Attach Lorebook" — confirm it opens as
         a centered dialog with Cancel/Attach buttons, not a right-side panel
         (real bug once — the old denylist missed the new-bot page). Also spot
         check `/chatbot/*`, `/lorebook/*`, `/group/*`, `/voice/*` look normal
-- [ ] **Classic Chat Layout** — messages center into a single column
-- [ ] **Small Profile Images** — avatars shrink
 - [ ] **Rounded Profile Images** — avatars become circular
 - [ ] **Selection Checkboxes on Right Side** — start a multi-select, confirm
-      checkboxes flip to the right; confirm it now also carries over via
-      Drive "Settings" sync (key-name mismatch fixed — verify it stays fixed)
-- [ ] **Square Message Box Edges** — corners go from rounded to square;
-      confirm it also carries over via Drive "Settings" sync
+      checkboxes flip to the right
+- [ ] **Square Message Box Edges** — corners go from rounded to square
 
 ## 2. Style tab
 
-- [ ] **Classic Style** — enable, colors change; confirm it and Custom Style
-      can't both be on at once
-- [ ] **Custom Style**
-  - [ ] Enable with everything left at defaults — confirm **zero** visual
-        difference from native SpicyChat, in **both** Light and Dark mode,
-        for **both** the AI's messages and your own (this is the main thing
-        to watch for regressing)
-  - [ ] Flip the Light/Dark "Editing colors for" switch — the color fields
-        swap to that theme's values
-  - [ ] Flip the Bot/User "Colors for" switch — Message BG, Body Text,
-        Dialogue, and Narration all swap to that role's values (only one
-        Message BG row is visible at a time); Highlight and Button Hover
-        stay put — those aren't split by role
-  - [ ] Edit a color on only one theme/role combination, then check the
-        other three — confirm they're unaffected
-  - [ ] Send a message yourself using dialogue/narration/asterisks — confirm
-        YOUR OWN message text/quotes/italics pick up the "You" role's
-        colors, and the AI's pick up the "Bot" role's colors, independently
-  - [ ] Font Size / Font Family / weight/style/decoration selects — preview
-        box updates live (these stay shared across both roles and themes)
-  - [ ] Preview box's backdrop matches the actual configured Message BG for
-        whichever role is selected — check "You" specifically in Light mode,
-        since the user's bubble is always dark-navy regardless of theme, so
-        a flat light-page guess would make light text look broken there
-  - [ ] Background image upload applies; Clear removes it
-  - [ ] Reset to Defaults — only resets the **currently-viewed** theme (both
-        roles within it), not the other theme
-  - [ ] Export Custom Style, then Import it back — identical result
-  - [ ] If you have Custom Style colors saved from before the Bot/User
-        split existed, confirm they migrated into "Bot" with no visual
-        change, and "You" got safe new defaults (white body/dialogue,
-        light-cyan narration) instead of inheriting a color that was never
-        meant for your own always-dark bubble
-- [ ] **Message Container Max Width** — set a value, chat column resizes;
-      clear it, reverts to 800px
-- [ ] **Memory Limit Indicator** — toggle Show Memory Dot; change Dot Color
+### 2.1 Message Colors
+
+- [ ] The tab shows only: **Message Colors**, **Background Image**, and
+      **Memory Limit Indicator**. No Classic Style, Custom Style, font,
+      Creator Link, or Max Width controls anywhere
+- [ ] **Custom Message Colors** checkbox off (the default on a fresh
+      install): the color fields are hidden and there is **zero** visual
+      difference from native SpicyChat in both Light and Dark mode
+- [ ] Tick it: the fields appear (Bot Message BG, User Message BG, Button
+      Hover — each with a ☀ Light and 🌙 Dark field) and any **empty** field
+      is filled with its default (Dark: `rgba(100, 100, 100, 0.1)`,
+      `rgba(0, 100, 255, 0.1)`, `#292929`; Light: `#ededed`, `#335566`,
+      `#fcfcfc`). Fields that already hold a value are **not** overwritten
+- [ ] Save & Refresh with it ticked — the colors apply to the chat
+- [ ] Untick it, Save & Refresh — the chat returns to SpicyChat's own colors;
+      tick it again and the previous values are still in the fields
+- [ ] While ticked, clear a single field and Save & Refresh — that one color
+      falls back to SpicyChat's own; the others still apply
+- [ ] A Dark-only value does **not** leak into Light mode, and vice versa
+- [ ] Color swatch next to each field updates live while typing; accepts
+      hex, rgb()/rgba() and named colors
+
+### 2.2 Background Image
+
+- [ ] Upload applies after Save & Refresh; the status line says "An image is
+      set."
+- [ ] The square bin button (right of the file picker) removes it after
+      Save & Refresh; status says "No image set."; the chosen file's name
+      has room to show
+
+### 2.3 Memory Limit Indicator
+
+- [ ] Toggle Show Memory Dot; change Dot Color
+
+### 2.4 Retired Custom Style (upgrading from 1.3.0 or earlier)
+
+- [ ] **Migration, Custom Style was on** — after updating, **Custom Message
+      Colors** is ticked, the fields hold the old Message BG / Button Hover
+      values (built-in ones included), and the bubbles look the same as before
+- [ ] **Migration, Custom Style was off** — the checkbox is unticked and the
+      chat is unchanged; ticking it reveals the old values already filled in
+- [ ] The background image carries over in both cases
+- [ ] The migration runs once: change or blank the migrated fields, Save &
+      Refresh, reload — your edits stay
+- [ ] **Your old Custom Style** section appears at the bottom of the Style tab
+      only when old Custom Style data exists (it was enabled, or its values
+      differ from defaults)
+- [ ] **Export Custom Style URL to SpicyChat** shows a link field + "Open in
+      SpicyChat ↗"; the link is copied to the clipboard where allowed
+- [ ] Opening the link lands on SpicyChat's Customize preview: "Trying
+      'Toolkit Custom Style'" with your bubble/text/dialogue/narration/
+      highlight colors, in each theme you had customized. **Save** adds it to
+      SpicyChat's saved styles
+- [ ] Translucent colors (e.g. the old default `rgba(...)` bubbles) come
+      through as their blended solid equivalent, not bright opaque colors
+- [ ] The note under the link lists what SpicyChat styles can't carry
+      (separate text colors for your own messages, fonts, highlight text
+      color) when those were customized
+- [ ] A Custom Style left at defaults → "matches SpicyChat's defaults —
+      nothing to export" (no broken link)
+- [ ] **Clear Custom Style data** → confirm dialog; after confirming, the
+      section disappears and stays gone after reload. Message Colors,
+      Background Image and Memory Indicator are untouched
+- [ ] Once cleared, **nothing** brings the section back: not a Drive sync
+      (Style checked), not restoring a Drive backup, not importing an All
+      Data file — including ones made before 1.3.1 (see 4.3)
 
 ## 3. Features tab
 
@@ -112,7 +140,7 @@ Don't let it drift from what the extension actually does.
         chat) and back to page 1 **without reloading** — confirm the "For You"
         tiles are still hidden. This was driven by a `history.pushState` hook
         that never fired (SpicyChat's router reassigns `pushState`); it now
-        polls the URL — [content.js:5476](content.js#L5476)
+        polls the URL — see `startHideForYou` in `content.js`
 - [ ] **Page Jump Modal**
 - [ ] **Show Generation Stats** (+ sub: full model details, compact stats)
   - [ ] On a long chat, reload and confirm **every** message shows its model/
@@ -122,13 +150,26 @@ Don't let it drift from what the extension actually does.
   - [ ] Regenerate a bot message a few times, then flip between versions with
         `<` `>` while a new response is still loading: each version shows one
         stats block, none duplicated, none missing
+  - [ ] **Background page down (iOS/Orion)** — switch to another app and back
+        so Orion unloads the background page, then generate a few messages.
+        Each new message still shows its stats block, and the console logs
+        "Held (background unavailable) stats…". **Orion on iOS only (test
+        with both the Firefox build and the Chrome build installed in
+        Orion):** an
+        alert appears **once per page load** saying Orion shut down the
+        background page, that it's a bug in the Orion app, and to force-quit
+        Orion and reopen it. No alert in any other browser. Force-quit and
+        reopen Orion (or toggle the extension off/on) and reload: the same messages still show their stats, the console
+        logs "Delivered N held stats record(s)", and `pendingStatsRecords`
+        is gone from storage. An Export All or Drive sync right after
+        includes those messages
 - [ ] **Show Timestamps** (+ sub: date-first order, 24-hour time)
   - [ ] **Switch directly from one chat to another** via an in-app link (SPA
         navigation, no reload) and confirm stats/timestamps still appear on the
         second chat's messages **and** on newly generated ones. The message
         observer's reattach-after-navigation was previously stuck on the old
         chat's detached container (same inert-`pushState` root cause), silently
-        killing stats until a full reload — [content.js:15785](content.js#L15785)
+        killing stats until a full reload
 - [ ] **Show Message IDs**
 - [ ] **Highlight Model Changes** — actually switch models mid-chat, confirm
       the yellow border appears
@@ -139,7 +180,6 @@ Don't let it drift from what the extension actually does.
 - [ ] **Chat Name in Title** — browser tab title updates
 - [ ] **NSFW Image Toggle** — button appears, stays in sync with SpicyChat's
       own Image Settings modal
-- [ ] **Live Text Formatting (WYSIWYG)** — see dedicated section below
 - [ ] **Message Recovery** (off by default) — enable it, force a failed send,
       confirm a Recover button appears and restores the text
 
@@ -149,77 +189,76 @@ hide. Code is still intact; nothing to test here unless it's un-hidden.)
 
 ## 4. Data tab
 
+### 4.1 Drive Sync — connection and sign-in
+
+- [ ] Connect — status line updates; when healthy it shows the Google account
+      email
+- [ ] Disconnect — fully clears (buttons revert, no stale "connected" state)
+- [ ] Dead sign-in detection: revoke the toolkit's access at
+      myaccount.google.com → Security → Third-party connections, then open
+      the Data tab — status turns red ("Google sign-in expired"), the
+      **Reconnect Google** button appears, and the backup list stays hidden
+      (no surprise sign-in sheet)
+- [ ] Reconnect Google — shows Google's account chooser, then "Reconnected
+      as …"; Sync Now and Create Backup work afterwards **without** clearing
+      browser cookies (**iOS**: this used to need a cookie wipe)
+
+- [ ] **iOS (Orion)** background page unloaded: open a chat, switch to another
+      app and back, open the Data tab and tap Sync Now. Either it recovers by
+      itself within ~5 s, or the status says Orion has shut down the
+      background page, that it's a bug in the Orion app, and to force-quit
+      and reopen Orion — never a bare "Sync failed — please try again."
+      After force-quitting and reopening Orion, Sync Now works. (Other
+      browsers get the generic "turn the extension off and on again" text)
+
+### 4.2 Drive Sync — syncing
+
+- [ ] Toggle Stats / Settings / Style independently, Sync Now — confirm only
+      the checked scopes actually change
+- [ ] Auto-sync on/off + interval
+- [ ] Layout toggles "Selection Checkboxes on Right Side" and "Square Message
+      Box Edges" carry over via "Settings" sync
+- [ ] Fresh install on a second device, then sync with **Style** checked
+      (before pressing Save & Refresh there) — it **receives** the other
+      device's Message Colors / Background Image instead of wiping them
+
+### 4.3 Backups and import/export
+
+- [ ] Drive: Create Backup, Restore Backup, Delete Backup, Open in Drive
+- [ ] Create Backup shows live status ("Reading stats database…" →
+      "Uploading N MB… Ns") and finishes with "Backup created." (**iOS**:
+      test with a large ~20 MB stats set; it must not sit on "Creating…"
+      forever)
+- [ ] Restore Backup — button shows "Downloading… Ns" → "Parsing N MB…" →
+      "Applying…", then the page reloads with restored settings and merged
+      stats (**iOS**: test with a ~20 MB backup; no endless "Restoring…")
+- [ ] **All Data Export/Import** round-trips settings, profiles and stats
+- [ ] New exports and new Drive backups contain `styleOverrides` and do
+      **not** contain `enableCustomStyle` / `customStyleValues` (open the
+      JSON and check)
+- [ ] Importing/restoring a **pre-1.3.1** backup that has `customStyleValues`:
+      the old Custom Style data is quietly ignored — the "Your old Custom
+      Style" section does **not** appear because of it. Only the surviving
+      settings (bubble BGs, button hover, background image) are filled in
+      from it, with Custom Message Colors ticked only if Custom Style was on
+      in that backup
 - [ ] **Generation Profiles** — Export, Delete (with confirmation dialog)
-- [ ] **Drive Sync**
-  - [ ] Connect — status line updates
-  - [ ] Toggle Stats / Settings / Style independently, Sync Now — confirm
-        only the checked scopes actually change
-  - [ ] Auto-sync on/off + interval
-  - [ ] Create Backup, Restore Backup, Delete Backup, Open in Drive
-  - [ ] Disconnect — fully clears (buttons revert, no stale "connected"
-        state)
-- [ ] **Custom Style Export/Import** (separate from All Data)
-- [ ] **All Data Export/Import**
 - [ ] **Clear All Data** — confirm the warning modal, confirm it actually
       wipes everything
+
+### 4.4 Footer
+
 - [ ] **What's New / View Changelog** button opens the release-history modal
-      (see section 7b)
+      (see section 7)
 - [ ] Version number shown at the bottom matches the actual installed
       extension version (not a hardcoded string)
-- [ ] Mari's photo and caption are **hidden** by default, and appear at the very
-      bottom of the Data tab (below the debug filters) only while Debug Mode is
-      on — toggle Debug Mode (Shift+click or 4 quick taps on the version text)
-      and confirm it shows/hides live. When visible, check that the image loads in both Chrome and Firefox, since it's loaded
-      from `images/mari.jpg` via `web_accessible_resources`
+- [ ] Mari's photo and caption are **hidden** by default, and appear at the
+      very bottom of the Data tab (below the debug filters) only while Debug
+      Mode is on (see section 11). When visible, check that the image loads
+      in both Chrome and Firefox, since it's loaded from `images/mari.jpg`
+      via `web_accessible_resources`
 
-## 5. WYSIWYG composer — dedicated stress test
-
-This has broken in subtle, hard-to-notice ways more than once. Test all of:
-
-- [ ] Type dialogue "...", narration *...*, bold **...**, bold-narration
-      ***...***, and highlight `` `...` `` — each renders live as you type
-- [ ] With Custom Style on, the colors you see WHILE TYPING match the "You"
-      role's colors (not "Bot") — send the message and confirm it renders
-      with the same colors it previewed with in the composer
-- [ ] Leave a quote or asterisk unclosed — the rest of the text still styles
-      reasonably instead of breaking
-- [ ] **Start a brand-new chat while already in an existing chat (no page
-      reload)** — confirm the new chat's composer still allows arrow-key
-      cursor movement and still highlights syntax (this exact bug was fixed
-      once already — top regression risk)
-- [ ] Switch between chats a few times in a row — re-check arrow keys and
-      highlighting after each switch
-- [ ] Edit an existing message — arrow keys still work and don't accidentally
-      switch between regeneration siblings
-- [ ] Resize the browser window (or drag the sidebar resize handle), then
-      open a **new** chat afterward — WYSIWYG still works
-- [ ] Paste text into the composer — reformats correctly
-- [ ] Paste or edit multi-paragraph text (multiple blank lines between
-      paragraphs) — no extra blank lines get added
-- [ ] Type a standalone `---` line — renders as a full-width horizontal
-      separator; sending the message preserves the literal `---` in the text
-- [ ] On iOS/mobile if available: backspace in an empty composer doesn't
-      crash the page
-- [ ] With Grammarly (or a similar grammar-checking extension) installed and
-      enabled, type an incorrect sentence, select it, and accept a suggested
-      correction a few times in a row — the correction replaces the original
-      text; it should never end up duplicated (correction glued in front of
-      the original) even after several repeats
-- [ ] With Grammarly enabled, trigger a small in-place suggestion (e.g. a
-      missing comma, or lowercase "i" that should be capitalized) — accepting
-      it should actually change the text, not silently do nothing. Try it
-      right after typing (composer still "warm") as well as after pausing a
-      few seconds first
-- [ ] With Grammarly enabled, click away from the composer to interact with a
-      suggestion popup, then click back into the composer to keep typing —
-      whatever the popup did to the text should still be there, not reverted
-      back to what it was before
-- [ ] On Android (or any mobile layout where the composer's bottom-right
-      button can show a voice/mic icon instead of send): with text typed,
-      press Enter/Return on the on-screen keyboard — it should send the
-      message, not toggle voice input
-
-## 6. Generation Settings integration
+## 5. Generation Settings integration
 
 - [ ] Open Generation Settings with Sidebar Layout off — still centered/modal
       as before
@@ -227,7 +266,7 @@ This has broken in subtle, hard-to-notice ways more than once. Test all of:
       sliders apply
 - [ ] Delete a profile — removed from the dropdown
 
-## 7. Toolbar popup
+## 6. Toolbar popup
 
 - [ ] Click the extension icon — quick toggles mirror the in-page settings
       (toggle one in the popup, refresh the page, confirm it applied)
@@ -237,7 +276,7 @@ This has broken in subtle, hard-to-notice ways more than once. Test all of:
 - [ ] "What's New" button: with **no** SpicyChat tab open, opens a new tab and
       the modal appears once that tab finishes loading
 
-## 7b. Update notifications / changelog
+## 7. Update notifications / changelog
 
 Release notes live in `changelog.json` — edit that file on every release, not
 `content.js`. Add an entry there (`version`, `date`, `features[]`) before or
@@ -251,6 +290,10 @@ right after bumping `manifest.json`'s version.
       view (replacing the toast) and also marks the version as seen — reload
       the tab afterward and confirm the toast does **not** come back
 - [ ] Dismiss it via "Got it!", reload the tab — it should **not** reappear
+- [ ] Both the update modal and the history modal have a **×** button
+      (top-right) that closes them (**iOS**: the modal fills the screen, so
+      there's no backdrop to tap; the footer button must also be visible
+      above Safari's bottom toolbar)
 - [ ] Repeat with no SpicyChat tab open at update time; open one afterward —
       modal appears once with correct notes
 - [ ] Bump the version twice in a row (simulating two quick releases) while a
@@ -279,16 +322,11 @@ right after bumping `manifest.json`'s version.
       message present) and the file is well over 1MB. Note: the count can be
       lower than the on-screen `#N` / `num_messages`, which also counts
       regenerated alternates the endpoint doesn't return.
-- [ ] HTML export follows the active Settings modal style at export time:
-  - [ ] Neither Classic Style nor Custom Style on — matches native SpicyChat
-        colors for the current light/dark mode
-  - [ ] Classic Style on — matches its fixed dark palette regardless of the
-        live light/dark mode
-  - [ ] Custom Style on — matches the configured bot/user colors, fonts, and
-        highlight/quote/narration styling for the current light/dark mode
-  - [ ] Quoted dialogue ("...") is colored per the Custom Style quote color
+- [ ] HTML export uses native SpicyChat colors for the current light/dark mode,
+      with the Style tab's Bot/User Message BG for that mode when Custom Message
+      Colors is ticked and a value is set
 
-## 8b. Story Mode (`/story/...` URLs)
+## 9. Story Mode (`/story/...` URLs)
 
 - [ ] **Auto Story Mode toggle** appears in the Story Mode header immediately to
       the left of the Generation Settings (sparkles) button
@@ -296,11 +334,6 @@ right after bumping `manifest.json`'s version.
       reflects the on/off state; disabling it stops further clicks
 - [ ] It stops itself safely if "Continue Story" disappears or navigation leaves
       Story Mode (no runaway clicking, no console errors)
-- [ ] **Text color/formatting** in Story Mode follows the Settings modal style,
-      matching Chat Mode:
-  - [ ] Custom Style on — bot body text, quoted dialogue ("..."), and narration
-        take the configured colors/fonts
-  - [ ] Classic Style on — Story Mode text uses its fixed light-on-dark palette
 - [ ] **Message number (`#N`)** shows in the Generation Statistics block on the
       same line as the timestamp (`MM/DD/YYYY @ HH:MM:SS AM | #N`)
 - [ ] On a fresh load of a long story (>50 messages), the newest message's `#N`
@@ -311,7 +344,7 @@ right after bumping `manifest.json`'s version.
       exactly 1 and the newest number stays equal to `num_messages` — it does
       **not** drift ahead over a long run (each number is anchored to its
       predecessor via `prev_id`, so duplicate insert events and regenerations
-      don't inflate the count — [content.js:4215](content.js#L4215))
+      don't inflate the count)
 - [ ] Refresh mid-run — the recalibrated `#N` matches what was shown live (no
       jump up or down)
 - [ ] **Export/download button** appears in the Story Mode header (same download
@@ -320,15 +353,36 @@ right after bumping `manifest.json`'s version.
       conversation (all messages, not just the loaded window) — the messages API
       is the same endpoint for chat and story, so the fetch is mode-agnostic
 
-## 9. Cross-browser
+## 10. Cross-browser
 
-- [ ] Repeat the checks that matter most (WYSIWYG, Custom Style, Sidebar
-      Layout) on both the Firefox build (`manifest.json`, MV2) and the Chrome
-      build (`manifest.chrome.json`, MV3) — they're maintained separately
-      now, so a fix on one side isn't guaranteed on the other
+- [ ] Repeat the checks that matter most (Style tab colors, Custom Style
+      export, Sidebar Layout, Drive backup/restore) on both the Firefox build
+      (`manifest.json`, MV2) and the Chrome build (`manifest.chrome.json`,
+      MV3) — they're maintained separately now, so a fix on one side isn't
+      guaranteed on the other
 
-## 10. Debug Mode (only if you touched it)
+## 11. Debug Mode
 
-- [ ] Version-text easter egg (shift-click or 4 quick taps) toggles it on
-- [ ] "Generation Profiles (Legacy)" row and "Debug Log Filters" section
-      appear/disappear along with it
+- [ ] Version-text easter egg (Shift+click, or 4 quick taps/clicks on the
+      version number in the Data tab) toggles it on and off; the version
+      text turns green while on
+- [ ] **iOS**: 4 fast taps toggle it every time (no page zoom, no
+      text-selection callout)
+- [ ] "Generation Profiles (Legacy)" row, "Debug Log Filters" section and
+      Mari's tribute appear/disappear along with it
+
+## 12. iOS pass (iPhone/iPad Safari)
+
+The **iOS**-marked steps above, gathered for a phone-only run:
+
+- [ ] Changelog modals close via **×** and fit above Safari's toolbar (7)
+- [ ] 4 taps on the version number toggle Debug Mode reliably (11)
+- [ ] Reconnect Google works without clearing cookies (4.1)
+- [ ] Create Backup and Restore Backup finish with a large stats set and show
+      progress (4.3)
+- [ ] Sync Now completes with a large stats set (4.2)
+- [ ] Orion: after switching apps, Drive actions recover or explain that the
+      extension needs toggling off/on (4.1)
+- [ ] Orion: stats for messages generated while the background page was
+      unloaded are kept and delivered later, and the one-time alert explains
+      the Orion bug and the force-quit fix (3)

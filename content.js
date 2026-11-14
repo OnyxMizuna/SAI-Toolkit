@@ -77,7 +77,7 @@ if (typeof storage !== 'undefined') {
 }
 
 // Debug log category filters - controls which log categories are shown
-// Categories: Core, Stats, Memories, Export, NSFW, ChatTitle, WYSIWYG, WYSIWYG-Text, Profile, Model, Cache, Migration, Custom, Compact, Sync, AutoRegen, MsgRecovery
+// Categories: Core, Stats, Memories, Export, NSFW, ChatTitle, Profile, Model, Cache, Migration, Custom, Compact, Sync, AutoRegen, MsgRecovery
 let debugLogFilters = {
     Core: true,
     Stats: true,
@@ -85,8 +85,6 @@ let debugLogFilters = {
     Export: true,
     NSFW: true,
     ChatTitle: true,
-    WYSIWYG: true,
-    'WYSIWYG-Text': false,  // Disabled by default - very noisy
     Profile: true,
     Model: true,
     Cache: true,
@@ -187,7 +185,7 @@ function debugLog(...args) {
         // that's what the category filter and the console reader key off of. Only
         // stamp the default [Core] namespace on genuinely uncategorized logs.
         // (Previously every line was hard-prefixed '[Core]', which mislabeled
-        // Stats/WYSIWYG/Model/Export/NSFW/etc. as "Core" in the console.)
+        // Stats/Model/Export/NSFW/etc. as "Core" in the console.)
         if (category) {
             console.log(...sanitized);
         } else {
@@ -284,6 +282,174 @@ function sendStatsMessage(type, payload, _retries = 1) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Stats holding list — survives a dead background page.
+// Some browsers (Orion on iOS) unload the background page when the app is
+// backgrounded and don't reliably bring it back, so SAI_STATS_PUT gets an empty
+// reply and the record would be silently lost. storage.local is served by the
+// browser itself (no background page needed), so records that couldn't be
+// delivered are parked there as { [messageId]: record } and replayed once the
+// background answers again. Replaying is safe to repeat: the store merges by
+// messageId (idbMergePut).
+// ---------------------------------------------------------------------------
+const STATS_HOLD_KEY = 'pendingStatsRecords';
+const STATS_HOLD_MAX = 2000;          // oldest are dropped beyond this (~300 KB worst case)
+const STATS_RECORD_FIELDS = ['model', 'max_tokens', 'temperature', 'top_p', 'top_k', 'role'];
+let _heldStatsMayExist = true;        // unknown until first read
+let _heldStatsFlushing = null;
+
+async function readHeldStats() {
+    try {
+        const got = await runtimeAPI.storage.local.get(STATS_HOLD_KEY);
+        const v = got && got[STATS_HOLD_KEY];
+        return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+async function writeHeldStats(held) {
+    try {
+        if (Object.keys(held).length) await runtimeAPI.storage.local.set({ [STATS_HOLD_KEY]: held });
+        else await runtimeAPI.storage.local.remove(STATS_HOLD_KEY);
+        _heldStatsMayExist = Object.keys(held).length > 0;
+    } catch (e) {
+        debugLog('[Stats] holding list write failed:', e && e.message);
+    }
+}
+
+// Newer non-null fields win; never lose a value we already had.
+function mergeHeldRecord(older, newer) {
+    const out = { ...(older || {}), messageId: newer.messageId, characterId: newer.characterId || (older && older.characterId) || null };
+    STATS_RECORD_FIELDS.forEach((f) => {
+        if (newer[f] !== null && newer[f] !== undefined) out[f] = newer[f];
+        else if (out[f] === undefined) out[f] = null;
+    });
+    return out;
+}
+
+async function holdStatsRecord(record) {
+    if (!record || !record.messageId) return;
+    const held = await readHeldStats();
+    held[record.messageId] = mergeHeldRecord(held[record.messageId], record);
+    const ids = Object.keys(held);
+    for (let i = 0; i < ids.length - STATS_HOLD_MAX; i++) delete held[ids[i]];
+    await writeHeldStats(held);
+    debugLog('[Stats] Background unavailable — held stats for message', String(record.messageId).substring(0, 8),
+        '(' + Object.keys(held).length + ' waiting)');
+}
+
+// True only when the background positively confirmed the write.
+async function tryPutStatsRecord(record) {
+    try {
+        const res = await sendStatsMessage('SAI_STATS_PUT', { record });
+        return !!(res && res.success);
+    } catch (_) {
+        return false;
+    }
+}
+
+// Orion on iOS/iPadOS. Orion doesn't identify itself in the user agent, so
+// detect it by elimination: it is the only browser on an Apple touch device
+// that runs Firefox-style (moz-extension://) or Chrome-style
+// (chrome-extension://) extensions — it accepts both builds of this extension.
+// Safari uses safari-web-extension://, and Chrome/Firefox for iOS can't run
+// extensions at all. Desktop Macs are excluded by the touch check.
+function isOrionOnIOS() {
+    try {
+        const ua = navigator.userAgent || '';
+        const foreignExtensionScheme = /^(moz|chrome)-extension:/.test(runtimeAPI.runtime.getURL(''));
+        const appleTouch = /iPhone|iPad|iPod/i.test(ua) || /iPhone|iPad|iPod/i.test(navigator.platform || '') ||
+            (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        return foreignExtensionScheme && appleTouch;
+    } catch (_) {
+        return false;
+    }
+}
+
+const ORION_BACKGROUND_DEAD_MSG =
+    'S.AI Toolkit: Orion has shut down the extension\'s background page.\n\n' +
+    'This is a bug in the Orion app — not in SpicyChat or S.AI Toolkit. Until it is restarted, ' +
+    'generation statistics can\'t be saved to the database and Google Drive sync won\'t work.\n\n' +
+    'To fix it: force-quit Orion (swipe it away in the app switcher) and open it again.\n\n' +
+    'Nothing is lost: your new statistics are being held safely and will be saved automatically ' +
+    'once Orion is restarted.';
+
+// Tell the user once per page load, and only on Orion for iOS, that stats can't
+// reach the background page. Deferred so the blocking alert() never runs inside
+// the stats write queue.
+let _orionBackgroundAlertShown = false;
+function warnOrionBackgroundDead() {
+    if (_orionBackgroundAlertShown || !isOrionOnIOS()) return;
+    _orionBackgroundAlertShown = true;
+    debugLog('[Stats] Orion background page is down — alerting the user');
+    setTimeout(() => { try { alert(ORION_BACKGROUND_DEAD_MSG); } catch (_) {} }, 0);
+}
+
+// Deliver a record, or park it. Returns 'stored' | 'held'.
+async function putStatsRecordDurably(record) {
+    if (await tryPutStatsRecord(record)) {
+        if (_heldStatsMayExist) flushHeldStats();   // background is alive: catch up (not awaited)
+        return 'stored';
+    }
+    await holdStatsRecord(record);
+    warnOrionBackgroundDead();
+    return 'held';
+}
+
+// Replay parked records. Stops at the first failure (background still down).
+// Each record is removed only after the background confirmed it, and the list
+// is re-read before writing so records parked meanwhile aren't clobbered.
+function flushHeldStats() {
+    if (_heldStatsFlushing) return _heldStatsFlushing;
+    _heldStatsFlushing = (async () => {
+        const held = await readHeldStats();
+        const ids = Object.keys(held);
+        if (!ids.length) { _heldStatsMayExist = false; return 0; }
+        const delivered = [];
+        for (const id of ids) {
+            if (!(await tryPutStatsRecord(held[id]))) break;
+            delivered.push(id);
+        }
+        if (delivered.length) {
+            const latest = await readHeldStats();
+            delivered.forEach((id) => {
+                // Only drop it if it wasn't updated while we were sending
+                if (JSON.stringify(latest[id]) === JSON.stringify(held[id])) delete latest[id];
+            });
+            await writeHeldStats(latest);
+            debugLog('[Stats] Delivered', delivered.length, 'held stats record(s);', Object.keys(latest).length, 'still waiting');
+        }
+        return delivered.length;
+    })().catch(() => 0).finally(() => { _heldStatsFlushing = null; });
+    return _heldStatsFlushing;
+}
+
+async function removeHeldStats(messageId) {
+    if (!_heldStatsMayExist) return;
+    const held = await readHeldStats();
+    if (held[messageId]) { delete held[messageId]; await writeHeldStats(held); }
+}
+
+async function clearHeldStats() {
+    await writeHeldStats({});
+}
+
+// Parked records for one character, in the same shape the store returns.
+async function getHeldStatsForCharacter(characterId) {
+    if (!_heldStatsMayExist) return {};
+    const held = await readHeldStats();
+    if (!Object.keys(held).length) { _heldStatsMayExist = false; return {}; }
+    const out = {};
+    Object.values(held).forEach((r) => {
+        if (!r || r.characterId !== characterId) return;
+        const rec = {};
+        STATS_RECORD_FIELDS.forEach((f) => { rec[f] = r[f] === undefined ? null : r[f]; });
+        out[r.messageId] = rec;
+    });
+    return out;
+}
+
 debugLog('[Core] Content script starting...');
 debugLog('[Core] URL:', window.location.href);
 debugLog('[Core] Document ready state:', document.readyState);
@@ -334,6 +500,7 @@ window.addEventListener('message', async (event) => {
         // nested wire-format snapshot for console display.
         let stats = {};
         try {
+            await flushHeldStats();   // include stats parked while the background was down
             const res = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
             if (res && res.success) stats = res.stats || {};
         } catch (_) { /* return empty on failure */ }
@@ -346,7 +513,7 @@ window.addEventListener('message', async (event) => {
     // -------------------------------------------------------------------------
     // Wipes all message generation stats from storage (useful for testing)
     if (event.data.type === 'SAI_CLEAR_STATS_REQUEST') {
-        try { await sendStatsMessage('SAI_STATS_CLEAR'); } catch (_) { /* ignore */ }
+        try { await clearHeldStats(); await sendStatsMessage('SAI_STATS_CLEAR'); } catch (_) { /* ignore */ }
         // Confirm deletion to page context
         window.postMessage({ type: 'SAI_CLEAR_STATS_RESPONSE' }, '*');
     }
@@ -360,6 +527,7 @@ window.addEventListener('message', async (event) => {
         // of the stats model — so this always exports the full nested snapshot.
         let stats = {};
         try {
+            await flushHeldStats();   // include stats parked while the background was down
             const res = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
             if (res && res.success) stats = res.stats || {};
         } catch (_) { /* return empty on failure */ }
@@ -612,7 +780,7 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     // ------------------------------------------------------------------
     // EARLY-DECLARED STATE
     // ------------------------------------------------------------------
-    // Hoisted here because asynchronous observers (WYSIWYG, body-class,
+    // Hoisted here because asynchronous observers (body-class,
     // resize) are wired up partway through this IIFE and can fire BEFORE
     // execution reaches the later `let` declarations. Reading a let/const
     // before its declaration line throws TDZ ("Cannot access … before
@@ -672,24 +840,23 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     
     // Storage keys for each CSS feature
     const SIDEBAR_LAYOUT_KEY = 'enableSidebarLayout';      // Pin modals to right sidebar
-    const CLASSIC_LAYOUT_KEY = 'enableClassicLayout';      // Classic message box layout
-    const CLASSIC_STYLE_KEY = 'enableClassicStyle';        // Classic colors/styling
-    const CUSTOM_STYLE_KEY = 'enableCustomStyle';          // Custom colors/styling
-    const CUSTOM_STYLE_VALUES_KEY = 'customStyleValues';   // Stores custom color/font values
-    const MESSAGE_CONTAINER_MAX_WIDTH_KEY = 'messageContainerMaxWidth';  // Max width for message container
-    const THEME_CUSTOMIZATION_KEY = 'enableThemeCustomization';  // DEPRECATED - migrated to CLASSIC_LAYOUT_KEY + CLASSIC_STYLE_KEY
-    const SMALL_PROFILE_IMAGES_KEY = 'enableSmallProfileImages';  // Smaller profile images
+    // RETIRED Custom Style. Only read for the Style tab's "Export Custom Style URL
+    // to SpicyChat" / "Clear Custom Style data" buttons and the one-time migration
+    // into STYLE_OVERRIDES_KEY — nothing applies these to the page anymore.
+    const CUSTOM_STYLE_KEY = 'enableCustomStyle';
+    const CUSTOM_STYLE_VALUES_KEY = 'customStyleValues';
     const ROUNDED_PROFILE_IMAGES_KEY = 'enableRoundedProfileImages';  // Rounded profile images
     const SWAP_CHECKBOX_POSITION_KEY = 'enableSwapCheckboxPosition';  // Swap selection checkbox positions
     const SQUARE_MESSAGE_EDGES_KEY = 'enableSquareMessageEdges';  // Square message box edges
-    const WYSIWYG_EDITOR_KEY = 'enableWysiwygEditor';  // Live formatting in textareas
     const SHOW_MESSAGE_IDS_KEY = 'showMessageIds';  // Show message IDs in stats display
     const ENABLE_GENERATION_PROFILES_KEY = 'enableGenerationProfiles';  // Override to force-enable generation profiles (debug only)
     const MEMORY_DOT_ENABLED_KEY = 'memoryDotEnabled';  // Show/hide memory limit indicator dot
     const MEMORY_DOT_COLOR_KEY = 'memoryDotColor';  // Custom color for memory limit indicator dot
     const HIDE_CREATOR_KEY = 'hideCreatorName';  // Hide bot creator @username link under bot messages
 
-    // Default custom style values.
+    // Default (legacy) Custom Style values — measured off native SpicyChat, so
+    // they double as the native palette for HTML chat export and as the
+    // "untouched" baseline when migrating / exporting a legacy Custom Style.
     // Color fields are split per-theme (light/dark) since a color that reads
     // fine on a dark chat background (e.g. white body text) can be invisible
     // on a light one. Typography/layout fields aren't a contrast concern, so
@@ -835,223 +1002,227 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
         };
     }
 
-    // Story Mode (spicychat.ai/story/...) renders its prose in a page wrapper
-    // that's structurally unrelated to either Chat Mode layout below (Classic
-    // Layout's `div.p-0[...]`, Sidebar Layout's `div.bg-gray-2`) — none of the
-    // rules below matched a single thing there before this selector existed.
-    // This is Story Mode's equivalent page-background container, found by
-    // inspecting a live Story Mode page: same "flex grow flex-col top-0
-    // left-0 w-full h-full" shell as Chat Mode's wrapper, just with SpicyChat's
-    // own `dark:bg-gray-4` in place of `bg-gray-2`. Also: Story Mode has no
-    // separate "user message" bubble to split styling on the way Chat Mode's
-    // .text-white marker does (see the comment below) — it's one continuous
-    // narrative — so every Story Mode addition below reuses the bot/AI colors
-    // for all text, with no .text-white counterpart.
-    const STORY_MODE_WRAPPER_SELECTOR = 'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.dark\\:bg-gray-4';
-
-    // Color rule groups shared by both theme profiles. Each entry's selectors
-    // get rendered twice: once unprefixed (light — the default) and once
-    // prefixed with `.dark ` (only applies under a real .dark ancestor, i.e.
-    // SpicyChat's own theme class — not the OS's prefers-color-scheme, which
-    // is a different, unrelated signal).
-    const CUSTOM_STYLE_RULES = [
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] body',
-                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] html',
-                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"]',
-                'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2',
-                STORY_MODE_WRAPPER_SELECTOR
-            ],
-            declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
-  font-size: ${shared.fontSize} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
-  font-style: ${shared.bodyFontStyle} !important;
-  text-decoration: ${shared.bodyTextDecoration} !important;`
-        },
-        // Body/Dialogue/Narration each get a Bot-scoped and a User-scoped
-        // rule, split on .text-white — that's SpicyChat's own marker for the
-        // user's sent-message text, which renders against a fixed dark bubble
-        // regardless of theme (blumine-6/blumine-3, never gray-4), unlike the
-        // AI's bubble which follows the page theme. Splitting on it (rather
-        // than the old approach of just excluding the user's side) lets both
-        // roles be styled explicitly and independently, while still
-        // defaulting the user's side to colors that are safe against its
-        // always-dark bubble in both themes.
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white)',
-                'div.bg-gray-2 span.leading-6:not(.text-white)',
-                `${STORY_MODE_WRAPPER_SELECTOR} span.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\]`
-            ],
-            declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
-  font-size: ${shared.fontSize} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
-  font-style: ${shared.bodyFontStyle} !important;
-  text-decoration: ${shared.bodyTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] span.leading-6.text-white',
-                'div.bg-gray-2 span.leading-6.text-white'
-            ],
-            declarations: (c, shared) => `  color: ${c.user.bodyColor} !important;
-  font-size: ${shared.fontSize} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
-  font-style: ${shared.bodyFontStyle} !important;
-  text-decoration: ${shared.bodyTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white) q.text-colorQuote',
-                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white) q.text-white',
-                'div.bg-gray-2 span.leading-6:not(.text-white) q.text-colorQuote',
-                'div.bg-gray-2 span.leading-6:not(.text-white) q.text-white',
-                'q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900',
-                'q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300',
-                'span.leading-6.mb-\\[10px\\]:not(.text-white) q'
-            ],
-            declarations: (c, shared) => `  color: ${c.bot.spanQuoteColor} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.spanQuoteFontWeight} !important;
-  font-style: ${shared.spanQuoteFontStyle} !important;
-  text-decoration: ${shared.spanQuoteTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] span.leading-6.text-white q.text-colorQuote',
-                'div.p-0[style*="width: 100%"] span.leading-6.text-white q.text-white',
-                'div.bg-gray-2 span.leading-6.text-white q.text-colorQuote',
-                'div.bg-gray-2 span.leading-6.text-white q.text-white',
-                'span.leading-6.mb-\\[10px\\].text-white q'
-            ],
-            declarations: (c, shared) => `  color: ${c.user.spanQuoteColor} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.spanQuoteFontWeight} !important;
-  font-style: ${shared.spanQuoteFontStyle} !important;
-  text-decoration: ${shared.spanQuoteTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] em:not(.text-white em)',
-                'div.p-0[style*="width: 100%"] i:not(.text-white i)',
-                'div.p-0[style*="width: 100%"] .narration:not(.text-white .narration)',
-                'div.p-0[style*="width: 100%"] .styled:not(.text-white .styled)',
-                'div.bg-gray-2 em:not(.text-white em)',
-                'div.bg-gray-2 i:not(.text-white i)',
-                'div.bg-gray-2 .narration:not(.text-white .narration)',
-                'div.bg-gray-2 .styled:not(.text-white .styled)',
-                `${STORY_MODE_WRAPPER_SELECTOR} em`,
-                `${STORY_MODE_WRAPPER_SELECTOR} i`,
-                `${STORY_MODE_WRAPPER_SELECTOR} .narration`,
-                `${STORY_MODE_WRAPPER_SELECTOR} .styled`
-            ],
-            declarations: (c, shared) => `  color: ${c.bot.narrationColor} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.narrationFontWeight} !important;
-  font-style: ${shared.narrationFontStyle} !important;
-  text-decoration: ${shared.narrationTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] .text-white em',
-                'div.p-0[style*="width: 100%"] .text-white i',
-                'div.p-0[style*="width: 100%"] .text-white .narration',
-                'div.p-0[style*="width: 100%"] .text-white .styled',
-                'div.bg-gray-2 .text-white em',
-                'div.bg-gray-2 .text-white i',
-                'div.bg-gray-2 .text-white .narration',
-                'div.bg-gray-2 .text-white .styled'
-            ],
-            declarations: (c, shared) => `  color: ${c.user.narrationColor} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.narrationFontWeight} !important;
-  font-style: ${shared.narrationFontStyle} !important;
-  text-decoration: ${shared.narrationTextDecoration} !important;`
-        },
-        {
-            selectors: [
-                'div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight',
-                'div.bg-gray-2 blockquote.bg-colorHighlight',
-                'blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md',
-                'blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md.text-black'
-            ],
-            declarations: (c, shared) => `  background-color: ${c.highlightBgColor} !important;
-  color: ${c.highlightTextColor} !important;
-  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.highlightFontWeight} !important;
-  font-style: ${shared.highlightFontStyle} !important;
-  text-decoration: ${shared.highlightTextDecoration} !important;`
-        },
-        {
-            selectors: ['.py-md.rounded-\\[4px_20px_20px_20px\\]'],
-            declarations: (c) => `  background-color: ${c.aiMessageBg} !important;`
-        },
-        {
-            selectors: ['.py-md.rounded-\\[20px_4px_20px_20px\\]'],
-            declarations: (c) => `  background-color: ${c.userMessageBg} !important;`
-        }
-    ];
-
-    function renderCustomStyleProfile(values, profileKey, prefix) {
-        const c = values[profileKey];
-        return CUSTOM_STYLE_RULES.map((rule) => {
-            const selectorList = rule.selectors.map((s) => `${prefix}${s}`).join(',\n');
-            return `${selectorList} {\n${rule.declarations(c, values)}\n}`;
-        }).join('\n\n');
-    }
-
-    function getCustomStyleCSSEarly(valuesJson) {
-        const values = normalizeCustomStyleValues(valuesJson);
-        const light = values.light;
-        const dark = values.dark;
-
-        let css = `/* Custom Style - User Defined Colors and Font Size */
-
-/* Light Mode (default — no .dark ancestor) */
-${renderCustomStyleProfile(values, 'light', '')}
-
-/* Dark Mode */
-${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
-
-        if (light.hoverButtonColor || dark.hoverButtonColor) {
-            css += `\n\n/* Button Hover Color */`;
-            if (light.hoverButtonColor) css += `\nbutton:hover {\n  background-color: ${light.hoverButtonColor} !important;\n}`;
-            if (dark.hoverButtonColor) css += `\n.dark button:hover {\n  background-color: ${dark.hoverButtonColor} !important;\n}`;
-        }
-
-        if (light.creatorLinkColor || dark.creatorLinkColor) {
-            css += `\n\n/* Creator Link Color */`;
-            if (light.creatorLinkColor) css += `\na[aria-label="creator-profile"] p,\na[href^="/creator/"] p.text-link {\n  color: ${light.creatorLinkColor} !important;\n}`;
-            if (dark.creatorLinkColor) css += `\n.dark a[aria-label="creator-profile"] p,\n.dark a[href^="/creator/"] p.text-link {\n  color: ${dark.creatorLinkColor} !important;\n}`;
-        }
-
-        if (values.backgroundImage) {
-            css += `\n\n/* Custom Background Image */\n.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative {\n  background-image: url('${values.backgroundImage}') !important;\n  background-size: cover !important;\n  background-position: center !important;\n  background-repeat: no-repeat !important;\n  background-attachment: fixed !important;\n}`;
-        }
-
-        return css;
-    }
-    
     // =============================================================================
-    // STORAGE MIGRATION: Classic Theme -> Classic Layout + Classic Style
+    // STYLE TAB OVERRIDES (successor to the retired Custom Style)
     // =============================================================================
-    // Migrate old THEME_CUSTOMIZATION_KEY to new separate keys if needed
-    async function migrateClassicThemeSettings() {
-        const oldThemeEnabled = await storage.get(THEME_CUSTOMIZATION_KEY, null);
-        const hasClassicLayout = await storage.get(CLASSIC_LAYOUT_KEY, null);
-        const hasClassicStyle = await storage.get(CLASSIC_STYLE_KEY, null);
-        
-        // Only migrate if old key exists and new keys don't
-        if (oldThemeEnabled !== null && hasClassicLayout === null && hasClassicStyle === null) {
-            debugLog('[Migration] Migrating Classic Theme to new keys');
-            // User had classic theme enabled, preserve both layout and style
-            await storage.set(CLASSIC_LAYOUT_KEY, oldThemeEnabled);
-            await storage.set(CLASSIC_STYLE_KEY, oldThemeEnabled);
-            // Clean up old key
-            await storage.remove(THEME_CUSTOMIZATION_KEY);
-            debugLog('[Migration] Migration complete: Classic Theme =', oldThemeEnabled, '-> Layout & Style');
-            return true;
+    // SpicyChat now has native chat styles (text colors, fonts, bubble shapes), so
+    // Custom Style was retired. Only these survive as individual Style-tab
+    // settings, each with its own Light and Dark value ('' = SpicyChat's color):
+    const STYLE_OVERRIDES_KEY = 'styleOverrides';
+    // `enabled` is the "Custom Message Colors" checkbox: the three colors are only
+    // applied while it is on. Values are kept when it is off.
+    const EMPTY_STYLE_OVERRIDES = {
+        enabled: false,
+        botMessageBg:  { light: '', dark: '' },
+        userMessageBg: { light: '', dark: '' },
+        buttonHover:   { light: '', dark: '' },
+        backgroundImage: ''
+    };
+
+    function normalizeStyleOverrides(raw) {
+        if (typeof raw === 'string') {
+            try { raw = JSON.parse(raw); } catch (e) { raw = null; }
         }
-        return false;
+        const base = raw && typeof raw === 'object' ? raw : {};
+        const pair = (v) => ({
+            light: v && typeof v.light === 'string' ? v.light : '',
+            dark:  v && typeof v.dark  === 'string' ? v.dark  : ''
+        });
+        const out = {
+            enabled: false,
+            botMessageBg:  pair(base.botMessageBg),
+            userMessageBg: pair(base.userMessageBg),
+            buttonHover:   pair(base.buttonHover),
+            backgroundImage: typeof base.backgroundImage === 'string' ? base.backgroundImage : ''
+        };
+        // Records saved before the checkbox existed applied whatever was set.
+        out.enabled = typeof base.enabled === 'boolean' ? base.enabled : styleOverridesHaveColors(out);
+        return out;
     }
-    // Run migration immediately
-    await migrateClassicThemeSettings();
+
+    function styleOverridesHaveColors(o) {
+        return ['botMessageBg', 'userMessageBg', 'buttonHover'].some(k => o[k].light || o[k].dark);
+    }
+
+    // What the fields are filled with when "Custom Message Colors" is switched on
+    // and a field is still empty: the retired Custom Style's own values (the
+    // translucent gray/blue bubbles in Dark mode).
+    const STYLE_COLOR_DEFAULTS = {
+        botMessageBg:  { light: DEFAULT_CUSTOM_STYLE.light.aiMessageBg,      dark: DEFAULT_CUSTOM_STYLE.dark.aiMessageBg },
+        userMessageBg: { light: DEFAULT_CUSTOM_STYLE.light.userMessageBg,    dark: DEFAULT_CUSTOM_STYLE.dark.userMessageBg },
+        buttonHover:   { light: DEFAULT_CUSTOM_STYLE.light.hoverButtonColor, dark: DEFAULT_CUSTOM_STYLE.dark.hoverButtonColor }
+    };
+
+    // Carries the kept fields over from a legacy Custom Style. The three colors
+    // are copied as stored (built-in values included — in Dark mode those are
+    // Custom Style's own look, not SpicyChat's), and the "Custom Message Colors"
+    // checkbox takes over Custom Style's on/off state, so the chat looks the same
+    // after the update: on -> still applied, off -> stored but not applied.
+    function deriveStyleOverridesFromLegacy(enabled, rawValues) {
+        const out = normalizeStyleOverrides(null);
+        if (rawValues == null) return out;
+        const v = normalizeCustomStyleValues(rawValues);
+        ['light', 'dark'].forEach((t) => {
+            out.botMessageBg[t]  = v[t].aiMessageBg || '';
+            out.userMessageBg[t] = v[t].userMessageBg || '';
+            out.buttonHover[t]   = v[t].hoverButtonColor || '';
+        });
+        out.backgroundImage = v.backgroundImage || '';
+        out.enabled = enabled === true && styleOverridesHaveColors(out);
+        return out;
+    }
+
+    // True while there's legacy Custom Style data worth exporting/clearing.
+    function hasLegacyCustomStyleData(enabled, rawValues) {
+        if (enabled === true) return true;
+        if (rawValues == null) return false;
+        return JSON.stringify(normalizeCustomStyleValues(rawValues)) !==
+               JSON.stringify(normalizeCustomStyleValues(DEFAULT_CUSTOM_STYLE));
+    }
+
+    // Light rules are scoped to html:not(.dark) (not left unprefixed) so a value
+    // set only for Light never leaks into Dark mode, and vice versa.
+    function getStyleOverridesCSSEarly(raw) {
+        const o = normalizeStyleOverrides(raw);
+        const scopes = { light: 'html:not(.dark) ', dark: 'html.dark ' };
+        const rules = [];
+        if (o.enabled) ['light', 'dark'].forEach((t) => {
+            const p = scopes[t];
+            if (o.botMessageBg[t])  rules.push(`${p}.py-md.rounded-\\[4px_20px_20px_20px\\] {\n  background-color: ${o.botMessageBg[t]} !important;\n}`);
+            if (o.userMessageBg[t]) rules.push(`${p}.py-md.rounded-\\[20px_4px_20px_20px\\] {\n  background-color: ${o.userMessageBg[t]} !important;\n}`);
+            if (o.buttonHover[t])   rules.push(`${p}button:hover {\n  background-color: ${o.buttonHover[t]} !important;\n}`);
+        });
+        if (o.backgroundImage) {
+            rules.push(`.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative {\n  background-image: url('${o.backgroundImage}') !important;\n  background-size: cover !important;\n  background-position: center !important;\n  background-repeat: no-repeat !important;\n  background-attachment: fixed !important;\n}`);
+        }
+        return rules.length ? `/* S.AI Toolkit - Style tab overrides */\n${rules.join('\n\n')}` : '';
+    }
+
+    // ---- Legacy Custom Style -> SpicyChat native style share link ----
+    // Format reverse-engineered from spicychat.ai's own encoder/decoder:
+    //   https://spicychat.ai/share/style/<base64url(JSON)>
+    //   { v: 1, n: name(<=40), d: {dark overrides}, l: {light overrides}, ... }
+    // Override keys: narration, dialogue, text, bold, highlight, command,
+    // botBubble, userBubble, background. Values MUST be #RRGGBB — the decoder
+    // silently drops anything else, and rejects a link with nothing valid left.
+    const SPICYCHAT_STYLE_SHARE_BASE = 'https://spicychat.ai/share/style/';
+    // Page background each theme's translucent colors are blended onto (dark
+    // measured off the live site's chat wrapper; light is the white page).
+    const SPICYCHAT_THEME_BASE_RGB = { dark: [15, 15, 15], light: [255, 255, 255] };
+
+    // Any CSS color -> '#rrggbb', alpha-blended onto the theme background.
+    // Returns null for empty/invalid input.
+    function cssColorToOpaqueHex(color, theme) {
+        if (!color || typeof color !== 'string') return null;
+        const ctx = document.createElement('canvas').getContext('2d');
+        if (!ctx) return null;
+        // An invalid color leaves fillStyle unchanged: test against two sentinels.
+        ctx.fillStyle = '#010203'; ctx.fillStyle = color.trim();
+        const a = ctx.fillStyle;
+        ctx.fillStyle = '#040506'; ctx.fillStyle = color.trim();
+        const b = ctx.fillStyle;
+        if (a !== b) return null;
+        let r, g, bl, alpha = 1;
+        if (a.startsWith('#')) {
+            r = parseInt(a.slice(1, 3), 16); g = parseInt(a.slice(3, 5), 16); bl = parseInt(a.slice(5, 7), 16);
+        } else {
+            const m = a.match(/rgba?\(([^)]+)\)/);
+            if (!m) return null;
+            const parts = m[1].split(',').map(x => parseFloat(x));
+            [r, g, bl] = parts; alpha = parts.length > 3 ? parts[3] : 1;
+        }
+        const base = SPICYCHAT_THEME_BASE_RGB[theme] || SPICYCHAT_THEME_BASE_RGB.dark;
+        const mix = (c, bc) => Math.round(c * alpha + bc * (1 - alpha));
+        return '#' + [mix(r, base[0]), mix(g, base[1]), mix(bl, base[2])]
+            .map(n => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0')).join('');
+    }
+
+    // Builds the share link from a stored customStyleValues. Only colors that
+    // differ from the built-in (native-matching) defaults are included, so an
+    // untouched theme doesn't override SpicyChat's own look. Returns null when
+    // nothing differs (the site would reject the link as "empty").
+    function buildSpicyChatStyleShareUrl(rawValues) {
+        const v = normalizeCustomStyleValues(rawValues);
+        const map = [
+            ['botBubble',  (p) => p.aiMessageBg],
+            ['userBubble', (p) => p.userMessageBg],
+            ['text',       (p) => p.bot.bodyColor],
+            ['dialogue',   (p) => p.bot.spanQuoteColor],
+            ['narration',  (p) => p.bot.narrationColor],
+            ['highlight',  (p) => p.highlightBgColor]
+        ];
+        const payload = { v: 1, n: 'Toolkit Custom Style' };
+        ['dark', 'light'].forEach((t) => {
+            const overrides = {};
+            map.forEach(([key, get]) => {
+                const val = get(v[t]);
+                if (!val || val === get(DEFAULT_CUSTOM_STYLE[t])) return;
+                const hex = cssColorToOpaqueHex(val, t);
+                if (hex) overrides[key] = hex;
+            });
+            if (Object.keys(overrides).length) payload[t === 'dark' ? 'd' : 'l'] = overrides;
+        });
+        if (!payload.d && !payload.l) return null;
+
+        // What SpicyChat styles can't express, so the user knows what's left behind.
+        const notCarried = [];
+        const differs = (k) => JSON.stringify(v[k]) !== JSON.stringify(DEFAULT_CUSTOM_STYLE[k]);
+        if (['light', 'dark'].some(t => JSON.stringify(v[t].user) !== JSON.stringify(DEFAULT_CUSTOM_STYLE[t].user))) notCarried.push('separate text colors for your own messages (SpicyChat uses one set for both sides)');
+        if (['light', 'dark'].some(t => v[t].highlightTextColor !== DEFAULT_CUSTOM_STYLE[t].highlightTextColor)) notCarried.push('highlight text color');
+        if (['bodyFontWeight', 'bodyFontStyle', 'bodyTextDecoration', 'spanQuoteFontWeight', 'spanQuoteFontStyle',
+             'spanQuoteTextDecoration', 'narrationFontWeight', 'narrationFontStyle', 'narrationTextDecoration',
+             'highlightFontWeight', 'highlightFontStyle', 'highlightTextDecoration'].some(differs)) notCarried.push('font weight/style/decoration');
+        if (differs('fontSize') || differs('fontFamily')) notCarried.push('font size/family');
+
+        const bytes = new TextEncoder().encode(JSON.stringify(payload));
+        let bin = '';
+        bytes.forEach(b => { bin += String.fromCharCode(b); });
+        const code = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        return { url: SPICYCHAT_STYLE_SHARE_BASE + code, payload, notCarried };
+    }
+
+    // =============================================================================
+    // STORAGE MIGRATION: Custom Style retirement + removed-feature cleanup
+    // =============================================================================
+    // 1) First run after the update: derive styleOverrides from the legacy Custom
+    //    Style. Legacy enableCustomStyle/customStyleValues are left in place (they
+    //    back the Style tab's Export/Clear buttons) until the user clears them.
+    // 2) Drop storage for features that no longer exist.
+    //
+    // STYLE_MIGRATION_VERSION gates step 1 so it runs once per rule change.
+    // v3: colors are copied as stored (built-in values included) and Custom
+    // Style's on/off state becomes the "Custom Message Colors" checkbox. (v1/v2
+    // skipped built-in values, which left the fields empty for most people.)
+    // Stored overrides that already hold values are never overwritten.
+    const STYLE_MIGRATION_KEY = 'styleOverridesMigration';
+    const STYLE_MIGRATION_VERSION = 3;
+    async function migrateRetiredStyleFeatures() {
+        const state = await storage.getMultiple({ [STYLE_OVERRIDES_KEY]: null, [STYLE_MIGRATION_KEY]: 0 });
+        const existing = state[STYLE_OVERRIDES_KEY];
+        const existingNorm = normalizeStyleOverrides(existing);
+        const existingIsEmpty = existing === null ||
+            (!styleOverridesHaveColors(existingNorm) && !existingNorm.backgroundImage);
+        if (state[STYLE_MIGRATION_KEY] !== STYLE_MIGRATION_VERSION) {
+            await storage.set(STYLE_MIGRATION_KEY, STYLE_MIGRATION_VERSION);
+        }
+        if (existingIsEmpty && state[STYLE_MIGRATION_KEY] !== STYLE_MIGRATION_VERSION) {
+            const legacy = await storage.getMultiple({ enableCustomStyle: false, customStyleValues: null });
+            const derived = deriveStyleOverridesFromLegacy(legacy.enableCustomStyle === true, legacy.customStyleValues);
+            // Only persist when something was actually carried over. Writing an
+            // EMPTY object here would make a fresh install "have" local style
+            // settings, and Drive sync (local wins over remote) would then wipe
+            // the Style settings synced from the user's other devices.
+            if (JSON.stringify(derived) !== JSON.stringify(EMPTY_STYLE_OVERRIDES)) {
+                await storage.set(STYLE_OVERRIDES_KEY, JSON.stringify(derived));
+                debugLog('[Migration] Style overrides derived from legacy Custom Style:', derived);
+            }
+        }
+        await storage.remove([
+            'enableClassicLayout', 'enableClassicStyle', 'enableThemeCustomization',
+            'enableSmallProfileImages', 'enableWysiwygEditor', 'messageContainerMaxWidth'
+        ]);
+    }
+    await migrateRetiredStyleFeatures();
     
     // =============================================================================
     // TIMING CONSTANTS - Centralized delay/timeout values (Issue #15)
@@ -1167,12 +1338,7 @@ ${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
     // PERFORMANCE: Batch all early CSS settings into a single storage read
     const earlySettings = await storage.getMultiple({
         [SIDEBAR_LAYOUT_KEY]: false,
-        [CLASSIC_LAYOUT_KEY]: false,
-        [CLASSIC_STYLE_KEY]: false,
-        [CUSTOM_STYLE_KEY]: false,
-        [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
-        [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
-        [SMALL_PROFILE_IMAGES_KEY]: false,
+        [STYLE_OVERRIDES_KEY]: null,
         [ROUNDED_PROFILE_IMAGES_KEY]: false,
         [SWAP_CHECKBOX_POSITION_KEY]: false,
         [SQUARE_MESSAGE_EDGES_KEY]: false,
@@ -1182,10 +1348,6 @@ ${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
     });
     
     const sidebarEnabled = earlySettings[SIDEBAR_LAYOUT_KEY];
-    const classicLayoutEnabled = earlySettings[CLASSIC_LAYOUT_KEY];
-    const classicStyleEnabled = earlySettings[CLASSIC_STYLE_KEY];
-    const customStyleEnabled = earlySettings[CUSTOM_STYLE_KEY];
-    const customStyleValues = earlySettings[CUSTOM_STYLE_VALUES_KEY];
     
     // Check if current page should have sidebar layout disabled.
     // Allowlist rather than denylist: Sidebar Layout only applies on chat and Story
@@ -1295,188 +1457,44 @@ ${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
         startObserverWhenReady();
     }
     
-    // Inject Classic Layout CSS early if enabled
-    if (classicLayoutEnabled) {
-        const injectClassicLayoutCSS = () => {
+    // Inject the Style tab's overrides (bubble BGs, button hover, background image)
+    const styleOverridesCSS = getStyleOverridesCSSEarly(earlySettings[STYLE_OVERRIDES_KEY]);
+    if (styleOverridesCSS) {
+        const injectStyleOverridesCSS = () => {
             if (!document.head) {
                 if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', injectClassicLayoutCSS, { once: true });
+                    document.addEventListener('DOMContentLoaded', injectStyleOverridesCSS, { once: true });
                 } else {
-                    setTimeout(injectClassicLayoutCSS, 10);
+                    setTimeout(injectStyleOverridesCSS, TIMING.CSS_RETRY_SHORT);
                 }
                 return;
             }
-            
-            if (document.getElementById('sai-toolkit-classic-layout-early')) {
+
+            if (document.getElementById('sai-toolkit-style-overrides-early')) {
                 return;
             }
-            
+
             const style = document.createElement('style');
-            style.id = 'sai-toolkit-classic-layout-early';
-            style.textContent = getClassicLayoutCSSEarly();
-            
+            style.id = 'sai-toolkit-style-overrides-early';
+            style.textContent = styleOverridesCSS;
+
             if (document.head.firstChild) {
                 document.head.insertBefore(style, document.head.firstChild);
             } else {
                 document.head.appendChild(style);
             }
-            
-            debugLog('[Core] Classic Layout CSS injected EARLY (before React initialization)');
-        };
-        
-        injectClassicLayoutCSS();
-    }
-    
-    // Inject Classic Style CSS early if enabled
-    if (classicStyleEnabled) {
-        const injectClassicStyleCSS = () => {
-            if (!document.head) {
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', injectClassicStyleCSS, { once: true });
-                } else {
-                    setTimeout(injectClassicStyleCSS, TIMING.CSS_RETRY_SHORT);
-                }
-                return;
-            }
-            
-            if (document.getElementById('sai-toolkit-classic-style-early')) {
-                return;
-            }
-            
-            const style = document.createElement('style');
-            style.id = 'sai-toolkit-classic-style-early';
-            style.textContent = getClassicStyleCSSEarly();
-            
-            if (document.head.firstChild) {
-                document.head.insertBefore(style, document.head.firstChild);
-            } else {
-                document.head.appendChild(style);
-            }
-            
-            debugLog('[Core] Classic Style CSS injected EARLY (before React initialization)');
-        };
-        
-        injectClassicStyleCSS();
-    }
-    
-    // Inject Custom Style CSS early if enabled
-    if (customStyleEnabled) {
-        const injectCustomStyleCSS = () => {
-            if (!document.head) {
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', injectCustomStyleCSS, { once: true });
-                } else {
-                    setTimeout(injectCustomStyleCSS, TIMING.CSS_RETRY_SHORT);
-                }
-                return;
-            }
-            
-            if (document.getElementById('sai-toolkit-custom-style-early')) {
-                return;
-            }
-            
-            const style = document.createElement('style');
-            style.id = 'sai-toolkit-custom-style-early';
-            style.textContent = getCustomStyleCSSEarly(customStyleValues);
-            
-            if (document.head.firstChild) {
-                document.head.insertBefore(style, document.head.firstChild);
-            } else {
-                document.head.appendChild(style);
-            }
-            
-            debugLog('[Core] Custom Style CSS injected EARLY (before React initialization)');
-        };
-        
-        injectCustomStyleCSS();
-    }
-    
-    // Inject Message Container Max Width CSS - inject into BODY to override HEAD stylesheets
-    // PERFORMANCE: Use value from batched earlySettings read above
-    const messageContainerMaxWidth = earlySettings[MESSAGE_CONTAINER_MAX_WIDTH_KEY];
-    if (messageContainerMaxWidth) {
-        const injectMessageContainerMaxWidthCSS = () => {
-            // For this specific CSS, we inject into body, not head
-            // This ensures it loads AFTER all external stylesheets in <head>
-            const target = document.body || document.head;
-            if (!target) {
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', injectMessageContainerMaxWidthCSS, { once: true });
-                } else {
-                    setTimeout(injectMessageContainerMaxWidthCSS, TIMING.CSS_RETRY_SHORT);
-                }
-                return;
-            }
 
-            // Remove existing style if present (to re-inject at end)
-            const existing = document.getElementById('sai-toolkit-message-container-width');
-            if (existing) {
-                existing.remove();
-            }
-
-            const style = document.createElement('style');
-            style.id = 'sai-toolkit-message-container-width';
-            style.textContent = getMessageContainerMaxWidthCSS(messageContainerMaxWidth);
-
-            // Append to body (or head if body not ready) - this ensures it comes AFTER all head stylesheets
-            if (document.body) {
-                document.body.appendChild(style);
-                debugLog('[Core] Message Container Max Width CSS injected into BODY:', messageContainerMaxWidth);
-            } else {
-                document.head.appendChild(style);
-                debugLog('[Core] Message Container Max Width CSS injected into HEAD (body not ready):', messageContainerMaxWidth);
-            }
+            debugLog('[Core] Style overrides CSS injected EARLY (before React initialization)');
         };
 
-        // Inject immediately if possible
-        injectMessageContainerMaxWidthCSS();
-
-        // Also re-inject after page is fully loaded to ensure we override all stylesheets
-        if (document.readyState !== 'complete') {
-            window.addEventListener('load', () => {
-                setTimeout(injectMessageContainerMaxWidthCSS, 100);
-            }, { once: true });
-        }
+        injectStyleOverridesCSS();
     }
-    
+
     // Load new layout options from storage
     // PERFORMANCE: Use values from batched earlySettings read above
-    const smallProfileImagesEnabled = earlySettings[SMALL_PROFILE_IMAGES_KEY];
     const roundedProfileImagesEnabled = earlySettings[ROUNDED_PROFILE_IMAGES_KEY];
     const swapCheckboxPositionEnabled = earlySettings[SWAP_CHECKBOX_POSITION_KEY];
     const squareMessageEdgesEnabled = earlySettings[SQUARE_MESSAGE_EDGES_KEY];
-
-    // Inject Small Profile Images CSS early if enabled
-    if (smallProfileImagesEnabled) {
-        const injectSmallProfileImagesCSS = () => {
-            if (!document.head) {
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', injectSmallProfileImagesCSS, { once: true });
-                } else {
-                    setTimeout(injectSmallProfileImagesCSS, TIMING.CSS_RETRY_SHORT);
-                }
-                return;
-            }
-
-            if (document.getElementById('sai-toolkit-small-profile-images-early')) {
-                return;
-            }
-
-            const style = document.createElement('style');
-            style.id = 'sai-toolkit-small-profile-images-early';
-            style.textContent = getSmallProfileImagesCSSEarly();
-
-            if (document.head.firstChild) {
-                document.head.insertBefore(style, document.head.firstChild);
-            } else {
-                document.head.appendChild(style);
-            }
-
-            debugLog('[Core] Small Profile Images CSS injected EARLY');
-        };
-
-        injectSmallProfileImagesCSS();
-    }
 
     // Inject Rounded Profile Images CSS early if enabled
     if (roundedProfileImagesEnabled) {
@@ -2268,25 +2286,6 @@ div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
     }
 
     // =============================================================================
-    // CSS GENERATION FUNCTIONS - Small Profile Images
-    // =============================================================================
-    function getSmallProfileImagesCSSEarly() {
-        return `
-/* Smaller PFP */
-.w-11 {
-    width: 2rem !important;
-    height: 2rem !important;
-}
-
-p.dark\\:text-gray-12:is(.dark *) {
-    line-height: 20px !important;
-    font-size: 14px !important;
-    opacity: 60% !important;
-}
-`;
-    }
-
-    // =============================================================================
     // CSS GENERATION FUNCTIONS - Rounded Profile Images
     // =============================================================================
     function getRoundedProfileImagesCSSEarly() {
@@ -2371,360 +2370,6 @@ button[data-testid="ContextCapIndicator-Button"] {
         }
         
         return ''; // No customization needed
-    }
-
-    // =============================================================================
-    // CSS GENERATION FUNCTIONS - Classic Style  
-    // =============================================================================
-    // FUNCTION: getClassicStyleCSSEarly()
-    // PURPOSE: Applies classic color scheme to messages (blue/gray backgrounds)
-    // FEATURE: "Classic Style" checkbox (colors only, no layout changes)
-    // 
-    // HISTORY:
-    // - Originally part of "Classic Theme" (combined layout + colors)
-    // - Separated Nov 2024 to allow independent control
-    // - Enables users to use classic colors with modern staggered layout
-    // 
-    // WHY NEEDED:
-    // - Some users prefer the classic blue/gray color scheme
-    // - Default SpicyChat colors may have too much contrast
-    // - Classic colors are more subtle and less visually distracting
-    // - Provides aesthetic choice without forcing layout change
-    // 
-    // WHAT IT DOES:
-    // - AI messages: Blue background (rgba(0, 100, 255, .1))
-    // - User messages: Gray background (rgba(100, 100, 100, .1))
-    // - NO layout changes (messages remain in their default positions)
-    // 
-    // CSS SELECTORS:
-    // - .py-md.rounded-\\[4px_20px_20px_20px] = AI/bot messages
-    // - .py-md.rounded-\\[20px_4px_20px_20px] = User messages
-    // - Uses double-escaped brackets (\\\\[) because CSS is in JS string
-    // 
-    // WORKS WITH:
-    // - Can combine with Classic Layout for full classic experience
-    // - Can use standalone with modern layout (staggered messages)
-    // - Independent of Sidebar Layout feature
-    // 
-    // UPDATE DETECTION:
-    // - When upgrading from old "Classic Theme", this key won't exist
-    // - content.js detects missing key and shows settings modal
-    // - Allows user to enable new Classic Style feature after update
-    // 
-    // COLOR RATIONALE:
-    // - Blue (AI): Distinguishes AI responses, traditional chatbot color
-    // - Gray (User): Neutral color for user input
-    // - Low opacity (.1): Subtle, doesn't overpower text content
-    // - RGBA format: Allows transparency to work with any background
-    // =============================================================================
-    function getClassicStyleCSSEarly() {
-        return `
-/* Text Color */
-
-body, html {
-  color: #fff !important;
-}
-
-/* Story Mode's body-text span carries its own native text-color utility
-   class, which wins over the inherited body/html color above regardless of
-   !important (inheritance is never a match for a rule that targets the
-   element directly) — so it needs pointing at directly, same as the quote
-   fix below. */
-${STORY_MODE_WRAPPER_SELECTOR} span.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\] {
-  color: #fff !important;
-}
-
-em, i, .narration, .styled {
-  color: #06B7DB !important;
-  font-style: italic !important;
-}
-
-.dark .text-colorQuote,
-q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900,
-q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300 {
-  color: #fff !important;
-}
-
-button:hover {
-  background-color: #292929 !important;
-}
-
-/* Message Boxes - Colors Only */
-
-.py-md.rounded-\\[4px_20px_20px_20px\\] {
-  background-color: rgba(100, 100, 100, .1) !important;
-}
-
-.py-md.rounded-\\[20px_4px_20px_20px\\] {
-  background-color: rgba(0, 100, 255, .1) !important;
-}
-`;
-    }
-
-    // =============================================================================
-    // CSS GENERATION FUNCTIONS - Message Container Max Width
-    // =============================================================================
-    // FUNCTION: getMessageContainerMaxWidthCSS()
-    // PURPOSE: Applies custom max-width to message container
-    // FEATURE: "Message Container Max Width" setting (independent of other styles)
-    // 
-    // WHY NEEDED:
-    // - Allows users to control the width of the message container independently
-    // - Works with or without Custom Style/Classic Layout enabled
-    // - Useful for wide screens or narrow reading preferences
-    // 
-    // PARAMETERS:
-    // - maxWidth: CSS width value (e.g., '800px', '90%', '1200px')
-    // =============================================================================
-    function getMessageContainerMaxWidthCSS(maxWidth) {
-        if (!maxWidth) return '';
-        
-        // Use extremely high specificity selectors that will override everything
-        // Including site's external CSS files that load after our injection
-        return `
-/* Message Container Max Width - Override ALL constraints */
-/* Injected into BODY to ensure it loads AFTER all HEAD stylesheets */
-
-/* Set a CSS variable for the max width */
-:root {
-  --sai-message-max-width: ${maxWidth};
-}
-
-/* ULTRA HIGH SPECIFICITY: Target message containers with multiple selector chains */
-/* The inline style="max-width: 800px" needs !important to override */
-
-/* AI messages (justify-start) - multiple specificity layers */
-html body div.flex-shrink-0.py-0.w-full div div.flex div.flex.flex-col div.w-full.flex.mb-lg.bg-transparent.items-center.justify-start[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-
-/* User messages (justify-between) - multiple specificity layers */
-html body div.flex-shrink-0.py-0.w-full div div.flex div.flex.flex-col div.w-full.flex.mb-lg.bg-transparent.items-center.justify-between[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Generic fallback with ultra-high specificity */
-html body div.flex-shrink-0 div div div div div.w-full.flex.mb-lg.bg-transparent.items-center[style] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Target via attribute selector - catches all inline max-width styles */
-html body div[style*="max-width: 800px"].w-full.flex.mb-lg,
-html body div[style*="max-width:800px"].w-full.flex.mb-lg {
-  max-width: ${maxWidth} !important;
-}
-
-/* Override Tailwind max-w-[800px] class with high specificity */
-html body .max-w-\\[800px\\] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Override the inner message bubble max-width (often 650px or 800px) */
-html body div.flex.flex-col.gap-md.w-full[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Target message input container at bottom */
-html body div.flex.flex-col.items-center.p-md.w-full div[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Override max-w-[620px] content containers */
-html body .max-w-\\[620px\\] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Sidebar layout context - even higher specificity */
-html body div.bg-gray-2 div.w-full.flex.mb-lg.bg-transparent.items-center[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-
-/* Classic layout context */
-html body div.p-0 div.w-full.flex.mb-lg.bg-transparent.items-center[style*="max-width"] {
-  max-width: ${maxWidth} !important;
-}
-`;
-    }
-
-    // =============================================================================
-    // CSS GENERATION FUNCTIONS - Classic Layout
-    // =============================================================================
-    // FUNCTION: getClassicLayoutCSSEarly()
-    // PURPOSE: Restores classic message box layout (centered, full-width)
-    // FEATURE: "Classic Chat Layout" checkbox (layout only, no colors)
-    // 
-    // HISTORY:
-    // - Originally part of "Classic Theme" (combined layout + colors)
-    // - Separated Nov 2024 to allow independent control
-    // - Users wanted classic layout WITHOUT classic colors
-    // 
-    // WHY NEEDED:
-    // - SpicyChat's default layout has messages staggered left/right
-    // - Classic layout centers all messages in a single column
-    // - Provides more consistent, readable chat experience
-    // - Similar to ChatGPT/Claude interface style
-    // 
-    // WHAT IT DOES:
-    // - Centers user messages (normally right-aligned)
-    // - Centers AI messages (normally left-aligned)
-    // - Sets max-width to 800px for optimal reading
-    // - Adds auto margins for horizontal centering
-    // - Maintains message bubble shapes (no color changes)
-    // 
-    // CSS SELECTORS:
-    // - .py-md.rounded-[20px_4px_20px_20px] = AI messages (top-left square corner)
-    // - .py-md.rounded-[4px_20px_20px_20px] = User messages (top-right square corner)
-    // 
-    // WORKS WITH:
-    // - Can combine with Classic Style (colors) for full classic experience
-    // - Can combine with Sidebar Layout for centered messages in sidebar mode
-    // - Can use standalone for modern colors + classic layout
-    // 
-    // TECHNICAL NOTES:
-    // - Uses escaped bracket syntax for Tailwind classes: \\[ and \\]
-    // - !important required to override React's inline styles
-    // - 100% width ensures messages span available container width
-    // =============================================================================
-    function getClassicLayoutCSSEarly() {
-        return `
-/* Message Boxes - Layout Only */
-
-.py-md.rounded-\\[20px_4px_20px_20px\\] {
-  margin-left: auto !important;
-  margin-right: auto !important;
-  width: 100% !important;
-  max-width: var(--sai-message-max-width, 800px) !important;
-  box-sizing: border-box !important;
-  border-radius: 20px !important;
-}
-
-.py-md.rounded-\\[4px_20px_20px_20px\\] {
-  margin-left: auto !important;
-  margin-right: auto !important;
-  width: 100% !important;
-  max-width: var(--sai-message-max-width, 800px) !important;
-  box-sizing: border-box !important;
-  border-radius: 20px !important;
-}
-
-.px-\\[13px\\] {
-  padding-left: 16px !important;
-  padding-right: 16px !important;
-}
-
-.flex-row-reverse { 
-  flex-direction: row !important;
-}
-
-.items-end {
-  align-items: flex-start !important;
-}
-
-/* Fix main container flexbox shrinking */
-div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] {
-  flex-shrink: 0 !important;
-  min-width: 0 !important;
-}
-
-/* Fix the bg-gray-2 child inside .p-0 */
-div.p-0 > div.bg-gray-2.flex.grow.flex-col {
-  min-width: 100% !important;
-  width: 100% !important;
-}
-
-/* Fix the max-w-[620px] content container that's constraining width */
-div.bg-gray-2 .max-w-\[620px\] {
-  max-width: 100% !important;
-}
-
-/* More specific selector for the max-w-[620px] container */
-div.p-0 div.bg-gray-2 div.max-w-\[620px\],
-div.max-w-\[620px\] {
-  max-width: none !important;
-  width: 100% !important;
-}
-
-
-/* ===== Composer layout & icon placement ===== */
-/* Target the outer composer container with image button */
-div.flex.items-end.gap-sm[style*="margin-left"] {
-  align-items: center !important;
-}
-
-/* Target ONLY the composer input row, NOT persona grid containers */
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) {
-  display: flex !important;
-  flex-direction: row !important;
-  align-items: center !important;  /* Align icons to center of textarea */
-  flex-wrap: nowrap !important;
-  gap: 0.5rem !important;
-  width: 100% !important;
-  max-width: none !important;
-  box-sizing: border-box !important;
-}
-
-/* Make button wrapper divs stretch to full height */
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) > div.inline-flex {
-  height: 100% !important;
-  align-items: center !important;
-}
-
-/* Remove margin from image generation button and other composer buttons */
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 > div.flex.justify-undefined.items-undefined:has(input, textarea) button {
-  margin-bottom: 0 !important;
-}
-
-/* Also remove margin from the image button outside the input row */
-div.flex.items-end.gap-sm[style*="margin-left"] button {
-  margin-bottom: 0 !important;
-}
-
-/* ===== Center message input container ===== */
-/* Parent container for the input area */
-div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full {
-  width: 100% !important;
-  max-width: 100% !important;
-  box-sizing: border-box !important;
-}
-
-/* The container with inline style max-width: 800px */
-div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full
-  > div.flex.justify-undefined.items-undefined.bg-transparent.w-full[style*="max-width"] {
-  width: 100% !important;
-  max-width: var(--sai-message-max-width, 800px) !important;
-  margin-left: auto !important;
-  margin-right: auto !important;
-  box-sizing: border-box !important;
-}
-
-/* Also ensure the inner wrapper stays centered */
-div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
-  max-width: var(--sai-message-max-width, 800px) !important;
-  margin-left: auto !important;
-  margin-right: auto !important;
-  box-sizing: border-box !important;
-}
-
-/* Fix bottom spacing when header disappears on narrow screens */
-@media (max-width: 990px) {
-  /* Remove bottom padding/margin that was compensating for desktop header */
-  div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
-    padding-bottom: 0 !important;
-  }
-  
-  /* Ensure composer area sits at the very bottom */
-  div.flex.flex-col.justify-undefined.items-undefined.items-center.p-md.w-full {
-    padding-bottom: 1rem !important;
-  }
-}
-
-/* Constrain image width in message bubbles to match max-w-[404px] */
-.py-md.rounded-\\[4px_20px_20px_20px\\] img.rounded-lg,
-.py-md.rounded-\\[20px_4px_20px_20px\\] img.rounded-lg {
-  max-width: 500px !important;
-  width: auto !important;
-}
-`;
     }
 
     // =============================================================================
@@ -3234,10 +2879,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (characterId) {
             try {
                 const res = await sendStatsMessage('SAI_STATS_GET_CHARACTER', { characterId });
-                if (res && res.success && res.stats) map = res.stats;
+                if (res && res.success && res.stats) {
+                    map = res.stats;
+                    if (_heldStatsMayExist) flushHeldStats();   // background is alive: catch up
+                }
             } catch (e) {
                 debugLog('[Stats] loadCharacterStats failed:', e && e.message);
             }
+            // Overlay records still parked in the holding list, so messages keep
+            // their stats on screen while the background page is down.
+            const held = await getHeldStatsForCharacter(characterId);
+            Object.keys(held).forEach((id) => {
+                const base = map[id] || {};
+                const merged = { ...base };
+                STATS_RECORD_FIELDS.forEach((f) => {
+                    if (held[id][f] !== null) merged[f] = held[id][f];
+                    else if (merged[f] === undefined) merged[f] = null;
+                });
+                map[id] = merged;
+            });
         }
         cachedCharStats = map;
         cachedCharStatsId = characterId;
@@ -3258,6 +2918,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function deleteStatsEntry(messageId, explicitConversationId = null) {
         await (statsWriteQueue = statsWriteQueue.catch(() => {}).then(async () => {
             try {
+                await removeHeldStats(messageId);
                 await sendStatsMessage('SAI_STATS_DELETE', { messageId });
                 invalidateStatsCache();
                 debugLog('[Stats] deleteStatsEntry: removed entry for', messageId.substring(0, 8));
@@ -3430,13 +3091,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
         // Serialise through the write queue so concurrent handlers keep send ordering.
         await (statsWriteQueue = statsWriteQueue.catch(() => {}).then(async () => {
-            try {
-                await sendStatsMessage('SAI_STATS_PUT', { record });
-                invalidateStatsCache();
-                debugLog('[Stats] Stored stats for character:', characterId, 'message:', messageId, record);
-            } catch (e) {
-                debugLog('[Stats] storeStatsForMessage failed:', e && e.message);
-            }
+            // Delivered to the background store, or parked in the holding list if the
+            // background page isn't answering (see putStatsRecordDurably).
+            const outcome = await putStatsRecordDurably(record);
+            invalidateStatsCache();
+            debugLog('[Stats]', outcome === 'stored' ? 'Stored' : 'Held (background unavailable)',
+                'stats for character:', characterId, 'message:', messageId, record);
         }));
     }
 
@@ -5068,7 +4728,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // =============================================================================
 
     // Feature Management  
-    // Note: All storage key constants (SIDEBAR_LAYOUT_KEY, CLASSIC_LAYOUT_KEY, CLASSIC_STYLE_KEY, etc.) 
+    // Note: All storage key constants (SIDEBAR_LAYOUT_KEY, STYLE_OVERRIDES_KEY, etc.) 
     // are defined at the top of the file for early injection and shared use
     const HIDE_FOR_YOU_KEY = 'enableHideForYou';
     const PAGE_JUMP_KEY = 'enablePageJump';
@@ -5078,8 +4738,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     
     let sidebarStyleElement = null;
     let composerLayoutStyleElement = null; // Composer CSS: same "chat pages only" gating as Sidebar Layout, see toggleSidebarLayout
-    let classicLayoutStyleElement = null;
-    let classicStyleStyleElement = null;
     let compactGenerationStyleElement = null;
     let hideForYouObserver = null;
     let hideForYouUrlObserver = null;
@@ -5246,51 +4904,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }, 300);
     }
 
-    // Apply or remove theme customization CSS
-    async function toggleClassicLayout(enable) {
-        if (enable) {
-            if (!classicLayoutStyleElement) {
-                // Check if early-injected element exists
-                classicLayoutStyleElement = document.getElementById('sai-toolkit-classic-layout-early');
-                
-                if (!classicLayoutStyleElement) {
-                    classicLayoutStyleElement = document.createElement('style');
-                    classicLayoutStyleElement.id = 'sai-toolkit-classic-layout';
-                    classicLayoutStyleElement.textContent = getClassicLayoutCSSEarly();
-                    document.head.appendChild(classicLayoutStyleElement);
-                }
-            }
-            classicLayoutStyleElement.disabled = false;
-        } else {
-            if (classicLayoutStyleElement) {
-                classicLayoutStyleElement.disabled = true;
-            }
-        }
-        await storage.set(CLASSIC_LAYOUT_KEY, enable);
-    }
-    
-    async function toggleClassicStyle(enable) {
-        if (enable) {
-            if (!classicStyleStyleElement) {
-                // Check if early-injected element exists
-                classicStyleStyleElement = document.getElementById('sai-toolkit-classic-style-early');
-                
-                if (!classicStyleStyleElement) {
-                    classicStyleStyleElement = document.createElement('style');
-                    classicStyleStyleElement.id = 'sai-toolkit-classic-style';
-                    classicStyleStyleElement.textContent = getClassicStyleCSSEarly();
-                    document.head.appendChild(classicStyleStyleElement);
-                }
-            }
-            classicStyleStyleElement.disabled = false;
-        } else {
-            if (classicStyleStyleElement) {
-                classicStyleStyleElement.disabled = true;
-            }
-        }
-        await storage.set(CLASSIC_STYLE_KEY, enable);
-    }
-    
     // CSS for compact generation settings
     function getCompactGenerationCSS() {
         // Use a data attribute to specifically target the Generation Settings modal
@@ -5841,2062 +5454,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         await storage.set(PAGE_JUMP_KEY, enable);
     }
     
-    // =============================================================================
-    // WYSIWYG EDITOR - Live formatting preview in textareas
-    // =============================================================================
-    
-    let wysiwygObserver = null;
-    let wysiwygActive = false;
-    const WYSIWYG_EDITOR_CLASS = 'sai-wysiwyg-editor';
-
-    // Robust Apple-touch-device detection. iOS browser wrappers like Orion do
-    // NOT put iPhone/iPad/iPod in navigator.userAgent, so a UA-only check misses
-    // them and silently skips the iOS-specific React #185 guards (remove editor
-    // before send, backspace-in-empty-editor). Mirror the detection already used
-    // by the send interceptor and setup paths so it can't drift out of sync again.
-    function isAppleTouchDevice() {
-        return /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-               /iPhone|iPad|iPod/i.test(navigator.platform) ||
-               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    }
-    
-    // CSS for the WYSIWYG contenteditable editor
-    // Uses a contenteditable div that syncs back to the hidden textarea
-    // This ensures cursor alignment because the formatted text IS the editable content
-    // IMPORTANT: We insert the editor as a sibling, NOT wrapping the textarea,
-    // to avoid breaking React's DOM reconciliation
-    const WYSIWYG_CSS = `
-        /* Ensure the Suggest/autogenerate button wrapper stays at the LEFT of the flex container */
-        /* This button has data-tooltip-id and contains the autogenerate/lightbulb button */
-        /* It must remain before the editor in visual order, never getting pushed right */
-        .sai-wysiwyg-editor ~ textarea.sai-wysiwyg-hidden {
-            /* Already handled below */
-        }
-        
-        /* When WYSIWYG is active, ensure the Suggest button wrapper stays left */
-        /* The wrapper is the div with data-tooltip-id that contains aria-label="autogenerate" */
-        /* During generation, React replaces the wrapper with a direct button element */
-        .flex:has(.sai-wysiwyg-editor) > .inline-flex:has(button[aria-label="autogenerate"]),
-        .flex:has(.sai-wysiwyg-editor) > div[data-tooltip-id]:has(button[aria-label="autogenerate"]),
-        .flex:has(.sai-wysiwyg-editor) > button[aria-label="autogenerate"] {
-            flex: 0 0 auto !important;
-            order: -1 !important;
-        }
-        
-        /* The contenteditable editor - visible, receives input */
-        /* Inserted as sibling BEFORE the textarea, not wrapping it */
-        .sai-wysiwyg-editor {
-            white-space: pre-wrap !important;
-            word-wrap: break-word !important;
-            overflow-wrap: break-word !important;
-            overflow: auto !important;
-            box-sizing: border-box !important;
-            background: transparent !important;
-            color: var(--wysiwyg-body-color, #ffffff) !important;
-            font-weight: var(--wysiwyg-body-font-weight, normal) !important;
-            font-style: var(--wysiwyg-body-font-style, normal) !important;
-            text-decoration: var(--wysiwyg-body-text-decoration, none) !important;
-            outline: none !important;
-            cursor: text !important;
-            flex: 1 1 0% !important;
-            min-width: 0 !important;
-            min-height: 24px !important;
-            width: 100% !important;
-            align-self: center !important;
-            /* DO NOT use display: flex on contenteditable - it causes column layout! */
-            display: block !important;
-            /* Editor appears after the Suggest button (which has order: -1) */
-            order: 0 !important;
-            
-            /* Default CSS variables for colors */
-            --wysiwyg-body-color: #ffffff;
-            --wysiwyg-body-font-weight: normal;
-            --wysiwyg-body-font-style: normal;
-            --wysiwyg-body-text-decoration: none;
-            --wysiwyg-dialogue-color: #ffffff;
-            --wysiwyg-dialogue-font-weight: normal;
-            --wysiwyg-dialogue-font-style: normal;
-            --wysiwyg-dialogue-text-decoration: none;
-            --wysiwyg-narration-color: #7dd3fc;
-            --wysiwyg-narration-font-weight: normal;
-            --wysiwyg-narration-font-style: italic;
-            --wysiwyg-narration-text-decoration: none;
-            --wysiwyg-highlight-bg: #ffdd6d;
-            --wysiwyg-highlight-text: #000000;
-            --wysiwyg-highlight-font-weight: normal;
-            --wysiwyg-highlight-font-style: normal;
-            --wysiwyg-highlight-text-decoration: none;
-        }
-        
-        /* Narration: uses custom style settings */
-        .sai-wysiwyg-editor .wysiwyg-narration {
-            color: var(--wysiwyg-narration-color);
-            font-weight: var(--wysiwyg-narration-font-weight);
-            font-style: var(--wysiwyg-narration-font-style);
-            text-decoration: var(--wysiwyg-narration-text-decoration);
-        }
-        
-        /* Dialogue: uses custom style settings */
-        .sai-wysiwyg-editor .wysiwyg-dialogue {
-            color: var(--wysiwyg-dialogue-color);
-            font-weight: var(--wysiwyg-dialogue-font-weight);
-            font-style: var(--wysiwyg-dialogue-font-style);
-            text-decoration: var(--wysiwyg-dialogue-text-decoration);
-        }
-        
-        /* Reset narration styles for nested elements */
-        .sai-wysiwyg-editor .wysiwyg-narration .wysiwyg-dialogue {
-            font-style: var(--wysiwyg-dialogue-font-style);
-            font-weight: var(--wysiwyg-dialogue-font-weight);
-            text-decoration: var(--wysiwyg-dialogue-text-decoration);
-        }
-        .sai-wysiwyg-editor .wysiwyg-narration .wysiwyg-highlight {
-            font-style: var(--wysiwyg-highlight-font-style);
-            font-weight: var(--wysiwyg-highlight-font-weight);
-            text-decoration: var(--wysiwyg-highlight-text-decoration);
-        }
-        
-        /* Bold: body color but bold */
-        .sai-wysiwyg-editor .wysiwyg-bold {
-            color: var(--wysiwyg-body-color);
-            font-weight: bold;
-        }
-        
-        /* Bold narration: narration color but bold */
-        .sai-wysiwyg-editor .wysiwyg-bold-narration {
-            color: var(--wysiwyg-narration-color);
-            font-weight: bold;
-            font-style: var(--wysiwyg-narration-font-style);
-        }
-        
-        /* Highlight: uses custom style settings */
-        .sai-wysiwyg-editor .wysiwyg-highlight {
-            background-color: var(--wysiwyg-highlight-bg);
-            color: var(--wysiwyg-highlight-text);
-            font-weight: var(--wysiwyg-highlight-font-weight);
-            font-style: var(--wysiwyg-highlight-font-style);
-            text-decoration: var(--wysiwyg-highlight-text-decoration);
-            border-radius: 2px;
-        }
-
-        /* Horizontal separator: a standalone --- line, matching SpicyChat mobile */
-        .sai-wysiwyg-editor .wysiwyg-horizontal-rule {
-            display: inline-block;
-            width: 100%;
-            height: 1em;
-            color: transparent !important;
-            vertical-align: middle;
-            background: linear-gradient(
-                var(--wysiwyg-body-color),
-                var(--wysiwyg-body-color)
-            ) center / 100% 1px no-repeat;
-            opacity: 0.45;
-        }
-
-        /* Hide the original textarea when WYSIWYG is active */
-        /* Use position:absolute and zero dimensions to take it out of flex flow completely */
-        textarea.sai-wysiwyg-hidden {
-            position: absolute !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-            width: 0 !important;
-            height: 0 !important;
-            min-width: 0 !important;
-            min-height: 0 !important;
-            max-width: 0 !important;
-            max-height: 0 !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            border: none !important;
-            overflow: hidden !important;
-            flex: 0 0 0 !important;
-            z-index: -1 !important;
-        }
-        
-        /* Ensure parent container of WYSIWYG has position:relative for absolute positioning */
-        /* This is needed on /group/, /lorebook/, and /chatbot/ pages */
-        .flex.flex-col.gap-1\\.5:has(.sai-wysiwyg-editor) {
-            position: relative !important;
-        }
-        
-        /* On non-chat pages, make WYSIWYG overlay the textarea instead of sitting above it */
-        /* These pages have different flex layouts that don't hide the textarea properly */
-        .flex.flex-col.gap-1\\.5:has(.sai-wysiwyg-editor) > .sai-wysiwyg-editor {
-            position: relative !important;
-            z-index: 1 !important;
-        }
-        
-        /* Placeholder styling for empty editor */
-        .sai-wysiwyg-editor:empty::before {
-            content: attr(data-placeholder);
-            color: rgb(156, 163, 175);
-            pointer-events: none;
-        }
-        
-        /* When WYSIWYG is active inside a grid container (message editing), */
-        /* hide the auto-sizing ghost span that creates blank space above/below */
-        .grid:has(.sai-wysiwyg-editor) > span.invisible {
-            display: none !important;
-        }
-    `;
-    
-    let wysiwygStyleElement = null;
-    
-    function injectWysiwygCSS() {
-        if (!wysiwygStyleElement) {
-            wysiwygStyleElement = document.createElement('style');
-            wysiwygStyleElement.id = 'sai-toolkit-wysiwyg-css';
-            wysiwygStyleElement.textContent = WYSIWYG_CSS;
-            document.head.appendChild(wysiwygStyleElement);
-            debugLog('[WYSIWYG] Injected WYSIWYG CSS');
-        }
-    }
-    
-    function removeWysiwygCSS() {
-        if (wysiwygStyleElement) {
-            wysiwygStyleElement.remove();
-            wysiwygStyleElement = null;
-            debugLog('[WYSIWYG] Removed WYSIWYG CSS');
-        }
-    }
-    
-    /**
-     * Parse text and convert formatting markers to HTML
-     * Formatting rules (matching SpicyChat's renderer):
-     * - ***text*** → bold narration (italic cyan + bold)
-     * - **text** → bold body text (white + bold)
-     * - *text* → narration (italic, cyan) - can contain dialogue
-     * - "text" → dialogue (white) - supports various quote styles
-     * - `text` → highlight (cyan background)
-     * - Plain text → body text (white)
-     */
-    function parseFormattedText(text) {
-        if (!text) return '';
-        
-        // All opening quote characters using explicit Unicode to avoid encoding issues
-        // \u201C = " (left double quotation mark) - iOS smart quote opening
-        // \u201E = „ (double low-9 quotation mark)
-        // \u201F = ‟ (double high-reversed-9 quotation mark)
-        // \u0022 = " (straight double quote)
-        const OPENING_QUOTES = ['\u201C', '\u201E', '\u201F', '\u0022'];
-        
-        // All closing quote characters using explicit Unicode
-        // \u201D = " (right double quotation mark) - iOS smart quote closing
-        // \u0022 = " (straight double quote)
-        const CLOSING_QUOTES = ['\u201D', '\u0022'];
-        
-        // Check if char is any opening quote
-        const isOpeningQuote = (char) => OPENING_QUOTES.includes(char);
-        // Check if char is any closing quote
-        const isClosingQuote = (char) => CLOSING_QUOTES.includes(char);
-        // Find next closing quote position
-        const findClosingQuote = (str, startIdx) => {
-            for (let j = startIdx; j < str.length; j++) {
-                if (isClosingQuote(str[j])) return j;
-            }
-            return -1;
-        };
-        
-        // Helper to escape HTML in plain text
-        function escapeHtml(str) {
-            return str
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-        }
-        
-        // Helper to parse dialogue and highlights within text (for inside narration)
-        function parseInnerContent(str) {
-            let result = '';
-            let i = 0;
-            while (i < str.length) {
-                const char = str[i];
-                
-                // Check for highlight: `text`
-                if (char === '`') {
-                    const endIdx = str.indexOf('`', i + 1);
-                    if (endIdx !== -1) {
-                        const content = str.substring(i + 1, endIdx);
-                        result += '<span class="wysiwyg-highlight">`' + escapeHtml(content) + '`</span>';
-                        i = endIdx + 1;
-                        continue;
-                    }
-                }
-                
-                // Check for dialogue: any opening quote character
-                if (isOpeningQuote(char)) {
-                    const endIdx = findClosingQuote(str, i + 1);
-                    
-                    if (endIdx !== -1) {
-                        // Found closing quote
-                        const content = str.substring(i + 1, endIdx);
-                        const actualCloseQuote = str[endIdx];
-                        result += '<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + actualCloseQuote + '</span>';
-                        i = endIdx + 1;
-                        continue;
-                    } else {
-                        // No closing quote found - style rest as dialogue (unclosed)
-                        const content = str.substring(i + 1);
-                        result += '<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + '</span>';
-                        return result; // We've consumed the rest
-                    }
-                }
-                
-                // Plain character
-                if (char === '&') {
-                    result += '&amp;';
-                } else if (char === '<') {
-                    result += '&lt;';
-                } else if (char === '>') {
-                    result += '&gt;';
-                } else {
-                    result += char;
-                }
-                i++;
-            }
-            return result;
-        }
-        
-        const result = [];
-        let i = 0;
-        const len = text.length;
-        
-        // Check if text contains any quote character
-        const hasQuotes = OPENING_QUOTES.some(q => text.includes(q)) || CLOSING_QUOTES.some(q => text.includes(q));
-        if (hasQuotes) {
-            debugLog('[WYSIWYG-Text] parseFormattedText - text contains quotes');
-            debugLog('[WYSIWYG-Text] Text:', text);
-            debugLog('[WYSIWYG-Text] Text char codes:', Array.from(text).map(c => c.charCodeAt(0)));
-            debugLog('[WYSIWYG-Text] Opening quotes:', OPENING_QUOTES);
-            debugLog('[WYSIWYG-Text] Opening quotes char codes:', OPENING_QUOTES.map(c => c.charCodeAt(0)));
-            debugLog('[WYSIWYG-Text] Closing quotes:', CLOSING_QUOTES);
-            debugLog('[WYSIWYG-Text] Closing quotes char codes:', CLOSING_QUOTES.map(c => c.charCodeAt(0)));
-        }
-        
-        while (i < len) {
-            const char = text[i];
-
-            // Standalone --- line: render the same full-width separator shown on mobile.
-            // Keep the literal --- inside the span so syncing back to SpicyChat preserves
-            // the original message text exactly.
-            const isLineStart = i === 0 || text[i - 1] === '\n';
-            if (isLineStart && text.startsWith('---', i)) {
-                const afterRule = text[i + 3];
-                if (afterRule === undefined || afterRule === '\n' || afterRule === '\r') {
-                    result.push('<span class="wysiwyg-horizontal-rule">---</span>');
-                    i += 3;
-                    continue;
-                }
-            }
-
-            // Check for highlight: `text`
-            if (char === '`') {
-                const endIdx = text.indexOf('`', i + 1);
-                if (endIdx !== -1) {
-                    const content = text.substring(i + 1, endIdx);
-                    result.push('<span class="wysiwyg-highlight">`' + escapeHtml(content) + '`</span>');
-                    i = endIdx + 1;
-                    continue;
-                }
-            }
-
-            // Check for bold narration: ***text***
-            if (char === '*' && text[i + 1] === '*' && text[i + 2] === '*') {
-                const endIdx = text.indexOf('***', i + 3);
-                if (endIdx !== -1) {
-                    const content = text.substring(i + 3, endIdx);
-                    result.push('<span class="wysiwyg-bold-narration">***' + escapeHtml(content) + '***</span>');
-                    i = endIdx + 3;
-                    continue;
-                }
-            }
-            
-            // Check for bold: **text**
-            if (char === '*' && text[i + 1] === '*' && text[i + 2] !== '*') {
-                const endIdx = text.indexOf('**', i + 2);
-                if (endIdx !== -1 && text[endIdx + 2] !== '*') {
-                    const content = text.substring(i + 2, endIdx);
-                    result.push('<span class="wysiwyg-bold">**' + escapeHtml(content) + '**</span>');
-                    i = endIdx + 2;
-                    continue;
-                }
-            }
-            
-            // Check for narration: *text*
-            // Single * starts narration - find matching closing *
-            if (char === '*' && text[i + 1] !== '*') {
-                // Find the next single * (not part of ** or ***)
-                let endIdx = -1;
-                for (let j = i + 1; j < len; j++) {
-                    if (text[j] === '*') {
-                        // Check it's a single * (not ** or ***)
-                        const prevIsStar = j > 0 && text[j - 1] === '*';
-                        const nextIsStar = text[j + 1] === '*';
-                        if (!prevIsStar && !nextIsStar) {
-                            endIdx = j;
-                            break;
-                        }
-                        // Skip if it's part of ** or ***
-                        if (nextIsStar) {
-                            j++; // Skip the next *
-                            if (text[j + 1] === '*') j++; // Skip another if ***
-                        }
-                    }
-                    // Stop at double newline (paragraph break)
-                    if (text[j] === '\n' && text[j + 1] === '\n') {
-                        break;
-                    }
-                }
-                
-                if (endIdx !== -1) {
-                    const content = text.substring(i + 1, endIdx);
-                    // Parse inner content for dialogue/highlights
-                    const parsedContent = parseInnerContent(content);
-                    result.push('<span class="wysiwyg-narration">*' + parsedContent + '*</span>');
-                    i = endIdx + 1;
-                    continue;
-                }
-            }
-            
-            // Check for dialogue: any opening quote character (outside of narration)
-            if (isOpeningQuote(char)) {
-                const endIdx = findClosingQuote(text, i + 1);
-                
-                debugLog('[WYSIWYG-Text] Found opening quote:', char, 'at position', i);
-                debugLog('[WYSIWYG-Text] Looking for closing quote from position', i + 1);
-                debugLog('[WYSIWYG-Text] Found closing quote at:', endIdx);
-                
-                if (endIdx !== -1) {
-                    // Found closing quote
-                    const content = text.substring(i + 1, endIdx);
-                    const actualCloseQuote = text[endIdx];
-                    
-                    debugLog('[WYSIWYG-Text] Creating dialogue span with content:', content);
-                    
-                    result.push('<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + actualCloseQuote + '</span>');
-                    i = endIdx + 1;
-                    continue;
-                } else {
-                    // No closing quote found - style rest of text as dialogue (unclosed)
-                    const content = text.substring(i + 1);
-                    result.push('<span class="wysiwyg-dialogue">' + char + escapeHtml(content) + '</span>');
-                    break; // We've consumed the rest of the text
-                }
-            }
-            
-            // Plain character - escape if needed
-            if (char === '&') {
-                result.push('&amp;');
-            } else if (char === '<') {
-                result.push('&lt;');
-            } else if (char === '>') {
-                result.push('&gt;');
-            } else {
-                result.push(char);
-            }
-            i++;
-        }
-        
-        return result.join('');
-    }
-    
-    /**
-     * Create a WYSIWYG contenteditable editor for a textarea
-     * The editor displays formatted text and syncs plain text back to the hidden textarea
-     * IMPORTANT: We insert the editor as a sibling BEFORE the textarea, NOT wrapping it,
-     * to avoid breaking React's DOM reconciliation which causes crashes on hover/tooltips
-     */
-    function setupWysiwygOverlay(textarea) {
-        debugLog('[WYSIWYG] setupWysiwygOverlay called - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
-        // Skip if already set up
-        if (textarea.dataset.wysiwygSetup === 'true') {
-            debugLog('[WYSIWYG] setupWysiwygOverlay SKIPPED - already setup');
-            return;
-        }
-        
-        // EXCLUDE textareas inside modals/dialogs - these should not get WYSIWYG
-        // Modals typically have role="dialog" or are inside elements with certain classes
-        const isInModal = textarea.closest('[role="dialog"]') !== null ||
-                          textarea.closest('[role="alertdialog"]') !== null ||
-                          textarea.closest('.modal') !== null ||
-                          textarea.closest('[data-slot="base"]') !== null ||  // NextUI modal
-                          textarea.closest('[aria-modal="true"]') !== null;
-        
-        if (isInModal) {
-            debugLog('[WYSIWYG] Skipping textarea inside modal:', textarea);
-            return;
-        }
-        
-        // Check if this is a message editor (editing existing messages)
-        // These have .flex.flex-col.gap-1\.5 parent but are NOT in the main chat input container
-        const messageEditorContainer = textarea.closest('.flex.flex-col.gap-1\\.5');
-        const chatInputContainer = textarea.closest('.border-1.border-solid.rounded-\\[13px\\]');
-        const isMessageEditor = messageEditorContainer !== null && chatInputContainer === null;
-        
-        // Check if this is a group chat message editor (has placeholder "Enter something")
-        // Also matches regular message edits which use the same placeholder
-        const isGroupChatEdit = textarea.placeholder === 'Enter something' && 
-                                textarea.closest('.flex.flex-col.gap-1\\.5') !== null;
-        
-        // Chat input: main message input at bottom of chat
-        const isChatInput = textarea.classList.contains('flex-grow') && 
-                           chatInputContainer !== null;
-        
-        // Alternative selectors for chat input - must also be in the chat input container
-        const isChatInputAlt = textarea.placeholder === 'Message...' &&
-                              textarea.closest('.bg-gray-3') !== null;
-        
-        // Only apply WYSIWYG to: main chat input, message editors, or group chat editors
-        if (!isChatInput && !isChatInputAlt && !isMessageEditor && !isGroupChatEdit) {
-            return;
-        }
-        
-        debugLog('[WYSIWYG] Setting up contenteditable editor for textarea:', textarea,
-                 { isChatInput, isChatInputAlt, isMessageEditor, isGroupChatEdit });
-        
-        // Track active message editors globally so we can block arrow keys
-        // even when the editor is not focused (user clicked away to read something)
-        // Maps editorId -> the editor element itself (not just a Set of IDs) so
-        // the blocker below can verify an entry is still actually on the page.
-        if (!window._activeMessageEditors) {
-            window._activeMessageEditors = new Map();
-        }
-
-        // Install global arrow key blocker ONCE - blocks when ANY message editor is active
-        if (!window._wysiwygGlobalArrowBlockerInstalled) {
-            window._wysiwygGlobalArrowBlockerInstalled = true;
-
-            // Window capture phase - this fires FIRST before any element handlers
-            window.addEventListener('keydown', (e) => {
-                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' ||
-                    e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-
-                    // Check if any message editor is currently active (visible on page).
-                    // BUGFIX: teardown doesn't always reach the matching .delete() call
-                    // (e.g. the resize/danger-zone cleanup path skips it, and the
-                    // per-editor removal observer can miss an ancestor being removed
-                    // in one shot during a chat switch). A stale entry here used to
-                    // block arrow keys everywhere on the page forever. Validate each
-                    // entry against the live DOM instead of trusting the registry
-                    // blindly, and prune anything that's gone.
-                    let hasActiveMessageEditor = false;
-                    if (window._activeMessageEditors) {
-                        for (const [id, el] of window._activeMessageEditors) {
-                            if (el && el.isConnected) {
-                                hasActiveMessageEditor = true;
-                            } else {
-                                window._activeMessageEditors.delete(id);
-                            }
-                        }
-                    }
-
-                    // Check if the WYSIWYG editor itself is focused
-                    // If so, let arrow keys through for cursor movement
-                    const activeEl = document.activeElement;
-                    const isEditorFocused = activeEl && activeEl.classList.contains('sai-wysiwyg-editor');
-
-                    // Block arrow keys when a message editor is active BUT NOT focused
-                    // This prevents accidentally switching regenerations while editing
-                    // but allows cursor movement when typing in the editor
-                    if (hasActiveMessageEditor && !isEditorFocused) {
-                        e.stopPropagation();
-                        e.stopImmediatePropagation();
-                        e.preventDefault();
-                        return false;
-                    }
-                }
-            }, true); // Capture phase - fires first!
-        }
-        
-        textarea.dataset.wysiwygSetup = 'true';
-
-        // ── TEMP DIAGNOSTIC (React #185 bisection) — remove once root-caused ──────
-        // Five send-path fixes produced identical crash stacks, so the trigger is
-        // structural. Bisect it from the page console, then RELOAD between each:
-        //   localStorage.setItem('saiWysiwygDiag','off')            → no overlay at all (baseline: native textarea, no editor, no hiding)
-        //   localStorage.setItem('saiWysiwygDiag','editor-no-hide') → insert the editor but DON'T squash the textarea to 0×0
-        //   localStorage.setItem('saiWysiwygDiag','no-observers')   → normal, but the 3 textarea watchers are disabled
-        //   localStorage.removeItem('saiWysiwygDiag')               → back to normal
-        // Type + send in each mode and note which ones still crash with #185.
-        let __saiDiagMode = 'normal';
-        try { __saiDiagMode = (localStorage.getItem('saiWysiwygDiag') || 'normal').trim(); } catch (_) {}
-        if (__saiDiagMode !== 'normal') {
-            console.log('%c[WYSIWYG DIAG] active mode = ' + __saiDiagMode, 'color:#0bf;font-weight:bold;font-size:14px');
-        }
-        if (__saiDiagMode === 'off') {
-            console.log('%c[WYSIWYG DIAG] off — overlay skipped, native textarea left intact', 'color:#0bf;font-weight:bold');
-            return;
-        }
-
-        debugLog('[WYSIWYG] Marked textarea as setup, creating editor element');
-        debugLog('[WYSIWYG] Textarea:', textarea);
-        debugLog('[WYSIWYG] isMessageEditor:', isMessageEditor, 'isGroupChatEdit:', isGroupChatEdit);
-        
-        // Create contenteditable div that will be the visible editor
-        // This is inserted as a SIBLING before the textarea, not wrapping it
-        const editor = document.createElement('div');
-        editor.className = 'sai-wysiwyg-editor';
-        editor.contentEditable = 'true';
-        editor.setAttribute('data-placeholder', textarea.placeholder || 'Enter something');
-        
-        // Apply Custom/Classic style colors to this editor. Defined as a named closure
-        // (and exposed on the editor element) so it can be re-run LIVE when the style
-        // settings change — see the storage.onChanged listener in toggleWysiwygEditor().
-        async function applyEditorColors() {
-            // Reset the variables this function manages first, so toggling a style OFF
-            // reverts the editor to its built-in WYSIWYG defaults instead of leaving
-            // stale overrides behind.
-            [
-                '--wysiwyg-body-color', '--wysiwyg-body-font-weight', '--wysiwyg-body-font-style', '--wysiwyg-body-text-decoration',
-                '--wysiwyg-dialogue-color', '--wysiwyg-dialogue-font-weight', '--wysiwyg-dialogue-font-style', '--wysiwyg-dialogue-text-decoration',
-                '--wysiwyg-narration-color', '--wysiwyg-narration-font-weight', '--wysiwyg-narration-font-style', '--wysiwyg-narration-text-decoration',
-                '--wysiwyg-highlight-bg', '--wysiwyg-highlight-text', '--wysiwyg-highlight-font-weight', '--wysiwyg-highlight-font-style', '--wysiwyg-highlight-text-decoration'
-            ].forEach(v => editor.style.removeProperty(v));
-
-            const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
-            if (customStyleEnabled) {
-                const customStyleValuesRaw = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-                const shared = normalizeCustomStyleValues(customStyleValuesRaw);
-                // Mirror whichever profile matches the SITE's actual current theme
-                // (not the OS's prefers-color-scheme — see the settings modal's own
-                // theme-mismatch note), so the composer always looks like whichever
-                // one is really active instead of e.g. showing white dialogue text
-                // on a light background.
-                const isDark = document.documentElement.classList.contains('dark');
-                const c = isDark ? shared.dark : shared.light;
-
-                // Apply custom colors via CSS variables directly on editor.
-                // The composer is where the user types THEIR OWN message, so
-                // it previews with the "user" role's colors, not "bot" — that
-                // mismatch (previewing AI-bubble colors while composing your
-                // own dialogue) was the root of the original color-bleed bug.
-                if (c.user.bodyColor) {
-                    editor.style.setProperty('--wysiwyg-body-color', c.user.bodyColor);
-                    editor.style.setProperty('--wysiwyg-dialogue-color', c.user.bodyColor);
-                }
-                if (shared.bodyFontWeight) {
-                    editor.style.setProperty('--wysiwyg-body-font-weight', shared.bodyFontWeight);
-                }
-                if (shared.bodyFontStyle) {
-                    editor.style.setProperty('--wysiwyg-body-font-style', shared.bodyFontStyle);
-                }
-                if (shared.bodyTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-body-text-decoration', shared.bodyTextDecoration);
-                }
-
-                // Dialogue / Quote settings
-                if (c.user.spanQuoteColor) {
-                    editor.style.setProperty('--wysiwyg-dialogue-color', c.user.spanQuoteColor);
-                }
-                if (shared.spanQuoteFontWeight) {
-                    editor.style.setProperty('--wysiwyg-dialogue-font-weight', shared.spanQuoteFontWeight);
-                }
-                if (shared.spanQuoteFontStyle) {
-                    editor.style.setProperty('--wysiwyg-dialogue-font-style', shared.spanQuoteFontStyle);
-                }
-                if (shared.spanQuoteTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-dialogue-text-decoration', shared.spanQuoteTextDecoration);
-                }
-
-                // Narration settings
-                if (c.user.narrationColor) {
-                    editor.style.setProperty('--wysiwyg-narration-color', c.user.narrationColor);
-                }
-                if (shared.narrationFontWeight) {
-                    editor.style.setProperty('--wysiwyg-narration-font-weight', shared.narrationFontWeight);
-                }
-                if (shared.narrationFontStyle) {
-                    editor.style.setProperty('--wysiwyg-narration-font-style', shared.narrationFontStyle);
-                }
-                if (shared.narrationTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-narration-text-decoration', shared.narrationTextDecoration);
-                }
-
-                // Highlight settings
-                if (c.highlightBgColor) {
-                    editor.style.setProperty('--wysiwyg-highlight-bg', c.highlightBgColor);
-                }
-                if (c.highlightTextColor) {
-                    editor.style.setProperty('--wysiwyg-highlight-text', c.highlightTextColor);
-                }
-                if (shared.highlightFontWeight) {
-                    editor.style.setProperty('--wysiwyg-highlight-font-weight', shared.highlightFontWeight);
-                }
-                if (shared.highlightFontStyle) {
-                    editor.style.setProperty('--wysiwyg-highlight-font-style', shared.highlightFontStyle);
-                }
-                if (shared.highlightTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-highlight-text-decoration', shared.highlightTextDecoration);
-                }
-
-                debugLog('[WYSIWYG] Applied custom style settings (' + (isDark ? 'dark' : 'light') + ' profile):', c);
-            } else {
-                // No Custom Style — if Classic Style is on, mirror ITS fixed palette onto
-                // the live editor so the composer matches what Classic Style renders in sent
-                // messages. (Custom and Classic are mutually exclusive; Custom wins above.)
-                // Source of truth: getClassicStyleCSSEarly() — body/quote #fff, narration
-                // (em/i) #06B7DB italic. Highlight is left at the editor default (Classic
-                // doesn't restyle highlights). Without this the editor fell back to the
-                // WYSIWYG default narration #7dd3fc, which doesn't match Classic's #06B7DB.
-                const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
-                if (classicStyleEnabled) {
-                    editor.style.setProperty('--wysiwyg-body-color', '#ffffff');
-                    editor.style.setProperty('--wysiwyg-dialogue-color', '#ffffff');
-                    editor.style.setProperty('--wysiwyg-narration-color', '#06B7DB');
-                    editor.style.setProperty('--wysiwyg-narration-font-style', 'italic');
-                    debugLog('[WYSIWYG] Applied Classic Style colors to editor');
-                } else if (!document.documentElement.classList.contains('dark')) {
-                    // BUGFIX: neither Custom nor Classic Style active, so the editor
-                    // falls back to .sai-wysiwyg-editor's own CSS variable defaults —
-                    // #ffffff dialogue/body, tuned only for dark mode. In Light Mode
-                    // that's white text on a white composer: invisible. Dark Mode
-                    // already looks right via those same defaults, so only Light Mode
-                    // needs an override here.
-                    editor.style.setProperty('--wysiwyg-body-color', '#000000');
-                    editor.style.setProperty('--wysiwyg-dialogue-color', '#000000');
-                    editor.style.setProperty('--wysiwyg-narration-color', '#316185');
-                    editor.style.setProperty('--wysiwyg-narration-font-style', 'italic');
-                    debugLog('[WYSIWYG] Applied Light Mode default colors to editor');
-                }
-            }
-        }
-        // Expose for live re-application (storage.onChanged) and run once now.
-        editor._wysiwygApplyColors = applyEditorColors;
-        applyEditorColors();
-        
-        // Get computed styles from textarea
-        const computedStyle = window.getComputedStyle(textarea);
-        
-        // Copy ALL relevant styles from textarea to editor
-        editor.style.fontFamily = computedStyle.fontFamily;
-        editor.style.fontSize = computedStyle.fontSize;
-        editor.style.fontWeight = computedStyle.fontWeight;
-        editor.style.lineHeight = computedStyle.lineHeight;
-        editor.style.letterSpacing = computedStyle.letterSpacing;
-        editor.style.wordSpacing = computedStyle.wordSpacing;
-        editor.style.textAlign = computedStyle.textAlign;
-        editor.style.textIndent = computedStyle.textIndent;
-        editor.style.textTransform = computedStyle.textTransform;
-        editor.style.padding = computedStyle.padding;
-        editor.style.border = computedStyle.border;
-        editor.style.borderRadius = computedStyle.borderRadius;
-        editor.style.background = computedStyle.background;
-        editor.style.backgroundColor = computedStyle.backgroundColor;
-        editor.style.minHeight = computedStyle.height;
-        editor.style.maxHeight = computedStyle.maxHeight || '188px'; // Match textarea's max-h-[188px]
-        editor.style.boxSizing = 'border-box';
-        
-        // Copy ring/outline styles
-        editor.style.boxShadow = computedStyle.boxShadow;
-        
-        // Set caret color
-        editor.style.caretColor = 'white';
-        
-        // IMPORTANT: Insert editor as a sibling BEFORE the textarea
-        // Do NOT wrap/move the textarea - this would break React's DOM reconciliation
-        // and cause crashes when React tries to show tooltips or update the UI
-        debugLog('[WYSIWYG] *** CRITICAL: About to insert editor into DOM ***');
-        debugLog('[WYSIWYG] Timestamp:', Date.now());
-        debugLog('[WYSIWYG] Parent node:', textarea.parentNode);
-        debugLog('[WYSIWYG] Parent node class:', textarea.parentNode?.className);
-        debugLog('[WYSIWYG] Sibling count before insert:', textarea.parentNode?.childNodes.length);
-        
-        try {
-            textarea.parentNode.insertBefore(editor, textarea);
-            debugLog('[WYSIWYG] *** Editor successfully inserted into DOM ***');
-            debugLog('[WYSIWYG] Timestamp:', Date.now());
-            debugLog('[WYSIWYG] Sibling count after insert:', textarea.parentNode?.childNodes.length);
-        } catch (error) {
-            console.error('[WYSIWYG] ERROR inserting editor:', error);
-            debugLog('[WYSIWYG] ERROR inserting editor:', error.message, error.stack);
-            return; // Abort if insertion fails
-        }
-        
-        // CRITICAL: Check if window width is in React's danger zone (around 768px breakpoint)
-        // If so, remove editor immediately to prevent React Error 185
-        const windowWidth = window.innerWidth;
-        const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
-        
-        if (inDangerZone) {
-            debugLog('[WYSIWYG] Window width in danger zone (' + windowWidth + 'px), aborting editor setup');
-            editor.remove();
-            // Don't hide textarea - keep it visible
-            return;
-        }
-        
-        // Ensure parent container has position:relative for absolute positioning of hidden textarea
-        const parentContainer = textarea.parentNode;
-        if (parentContainer) {
-            parentContainer.style.setProperty('position', 'relative', 'important');
-        }
-        
-        // Hide the original textarea visually but keep it in its original DOM position
-        // Apply inline styles directly to ensure it's hidden on all pages.
-        // DIAG: 'editor-no-hide' skips this squashing so we can tell whether the
-        // invasive 0×0 !important hiding (which fights SpicyChat's auto-grow textarea)
-        // is what triggers #185, vs. the foreign contenteditable sibling itself.
-        if (__saiDiagMode !== 'editor-no-hide') {
-            textarea.classList.add('sai-wysiwyg-hidden');
-            textarea.style.setProperty('position', 'absolute', 'important');
-            textarea.style.setProperty('opacity', '0', 'important');
-            textarea.style.setProperty('pointer-events', 'none', 'important');
-            textarea.style.setProperty('width', '0', 'important');
-            textarea.style.setProperty('height', '0', 'important');
-            textarea.style.setProperty('min-width', '0', 'important');
-            textarea.style.setProperty('min-height', '0', 'important');
-            textarea.style.setProperty('max-width', '0', 'important');
-            textarea.style.setProperty('max-height', '0', 'important');
-            textarea.style.setProperty('padding', '0', 'important');
-            textarea.style.setProperty('margin', '0', 'important');
-            textarea.style.setProperty('border', 'none', 'important');
-            textarea.style.setProperty('overflow', 'hidden', 'important');
-            textarea.style.setProperty('z-index', '-1', 'important');
-        }
-        
-        // For message editors: Register as active so global arrow key blocker knows
-        // This allows blocking arrow keys even when editor is not focused
-        if (isMessageEditor || isGroupChatEdit) {
-            // Generate unique ID for this editor
-            const editorId = 'wysiwyg-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-            editor._wysiwygEditorId = editorId;
-            textarea._wysiwygEditorId = editorId;
-            
-            // Register as active (store the element so liveness can be verified later)
-            window._activeMessageEditors.set(editorId, editor);
-            
-            // Watch for editor removal (when user cancels edit or saves)
-            const removalObserver = new MutationObserver((mutations) => {
-                // Check if editor was removed from DOM
-                if (!document.body.contains(editor)) {
-                    window._activeMessageEditors.delete(editorId);
-                    removalObserver.disconnect();
-                }
-            });
-            // Observe parent's parent for child removal
-            const observeTarget = editor.parentNode?.parentNode || editor.parentNode || document.body;
-            removalObserver.observe(observeTarget, { childList: true, subtree: true });
-            textarea._wysiwygRemovalObserver = removalObserver;
-        }
-        
-        // For message editors: Add capture-phase arrow key blocker on parent container
-        // This intercepts arrow key events before they bubble up to React's handlers
-        // that switch between message regenerations (legacy - kept as backup)
-        if (isMessageEditor || isGroupChatEdit) {
-            const messageContainer = textarea.closest('.flex.flex-col.gap-1\\.5');
-            if (messageContainer && !messageContainer._arrowKeyBlockerInstalled) {
-                messageContainer._arrowKeyBlockerInstalled = true;
-                messageContainer.addEventListener('keydown', (e) => {
-                    const isArrowKey = e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
-                                       e.key === 'ArrowUp' || e.key === 'ArrowDown';
-                    const editorFocused = document.activeElement === editor;
-                    
-                    // Block arrow keys when the WYSIWYG editor is focused
-                    if (isArrowKey && editorFocused) {
-                        e.stopPropagation();
-                        e.stopImmediatePropagation();
-                        // Don't preventDefault - let cursor move in editor
-                    }
-                }, true); // Capture phase
-            }
-        }
-        
-        // Watch for autogenerate/suggest button clicks to clear and lock editor during generation
-        const suggestButton = textarea.parentNode?.querySelector('button[aria-label="autogenerate"]');
-        if (suggestButton) {
-            suggestButton.addEventListener('click', () => {
-                // Clear editor and show loading state using safe DOM methods
-                while (editor.firstChild) {
-                    editor.removeChild(editor.firstChild);
-                }
-                const loadingSpan = document.createElement('span');
-                loadingSpan.style.cssText = 'color: #888; font-style: italic;';
-                loadingSpan.textContent = 'Generating suggestion...';
-                editor.appendChild(loadingSpan);
-                
-                editor.contentEditable = 'false';
-                editor.style.pointerEvents = 'none';
-                editor.style.opacity = '0.6';
-            });
-        }
-        
-        // Track if we're programmatically updating to avoid loops
-        let isUpdating = false;
-        
-        // Get plain text from contenteditable (preserving line breaks)
-        function getPlainText() {
-            // Clone to avoid modifying the actual DOM
-            const clone = editor.cloneNode(true);
-            
-            // Chromium uses a lone <br> inside an otherwise-empty block as a
-            // placeholder for a blank line. The block boundary already represents
-            // that line break, so counting the placeholder <br> as another newline
-            // would add an extra blank line when pasting/editing multi-paragraph text.
-            clone.querySelectorAll('div, p').forEach(block => {
-                const childNodes = Array.from(block.childNodes);
-                const isPlaceholderOnly = childNodes.length === 1 &&
-                    childNodes[0].nodeType === Node.ELEMENT_NODE &&
-                    childNodes[0].tagName === 'BR';
-                if (isPlaceholderOnly) {
-                    childNodes[0].remove();
-                }
-            });
-
-            // Replace real <br> elements with newlines
-            clone.querySelectorAll('br').forEach(br => {
-                br.replaceWith('\n');
-            });
-            
-            // Replace block elements with newlines
-            clone.querySelectorAll('div, p').forEach(block => {
-                if (block.previousSibling) {
-                    block.insertBefore(document.createTextNode('\n'), block.firstChild);
-                }
-            });
-            
-            return clone.textContent || '';
-        }
-        
-        // Save cursor position
-        function saveCursorPosition() {
-            const selection = window.getSelection();
-            if (!selection.rangeCount) return null;
-            
-            const range = selection.getRangeAt(0);
-            
-            // Get text offset from start
-            const preCaretRange = range.cloneRange();
-            preCaretRange.selectNodeContents(editor);
-            preCaretRange.setEnd(range.startContainer, range.startOffset);
-            const startOffset = preCaretRange.toString().length;
-            
-            preCaretRange.setEnd(range.endContainer, range.endOffset);
-            const endOffset = preCaretRange.toString().length;
-            
-            return { start: startOffset, end: endOffset };
-        }
-        
-        // Restore cursor position
-        function restoreCursorPosition(savedPos) {
-            if (!savedPos) return;
-            
-            const selection = window.getSelection();
-            const range = document.createRange();
-            
-            let charCount = 0;
-            let startNode = null, startOffset = 0;
-            let endNode = null, endOffset = 0;
-            
-            function traverseNodes(node) {
-                if (node.nodeType === Node.TEXT_NODE) {
-                    const nextCount = charCount + node.textContent.length;
-                    
-                    if (!startNode && savedPos.start <= nextCount) {
-                        startNode = node;
-                        startOffset = savedPos.start - charCount;
-                    }
-                    if (!endNode && savedPos.end <= nextCount) {
-                        endNode = node;
-                        endOffset = savedPos.end - charCount;
-                    }
-                    
-                    charCount = nextCount;
-                } else {
-                    for (const child of node.childNodes) {
-                        traverseNodes(child);
-                        if (startNode && endNode) return;
-                    }
-                }
-            }
-            
-            traverseNodes(editor);
-            
-            // Fallback: place cursor at end
-            if (!startNode) {
-                range.selectNodeContents(editor);
-                range.collapse(false);
-            } else {
-                range.setStart(startNode, startOffset);
-                range.setEnd(endNode || startNode, endOffset || startOffset);
-            }
-            
-            selection.removeAllRanges();
-            selection.addRange(range);
-        }
-        
-        // Safely set HTML content using DOMParser (avoids innerHTML security warnings)
-        // The HTML is generated by parseFormattedText which already escapes user content
-        // DOMParser creates an isolated document that doesn't execute scripts
-        function safeSetHTML(element, html) {
-            // Clear existing content
-            while (element.firstChild) {
-                element.removeChild(element.firstChild);
-            }
-            
-            if (!html) return;
-            
-            // Use DOMParser to safely parse HTML - this creates nodes without executing scripts
-            // Wrap in a div to handle multiple top-level nodes and text nodes
-            const parser = new DOMParser();
-            const doc = parser.parseFromString('<div>' + html + '</div>', 'text/html');
-            const wrapper = doc.body.firstChild;
-            
-            // Move all children from the parsed wrapper to our element
-            while (wrapper.firstChild) {
-                element.appendChild(document.adoptNode(wrapper.firstChild));
-            }
-        }
-        
-        // Update editor display with formatted HTML
-        function updateEditorDisplay() {
-            if (isUpdating) return;
-            isUpdating = true;
-            
-            const savedPos = saveCursorPosition();
-            const plainText = getPlainText();
-            const formattedHtml = parseFormattedText(plainText);
-            
-            debugLog('[WYSIWYG-Text] updateEditorDisplay called');
-            debugLog('[WYSIWYG-Text] Plain text:', plainText);
-            debugLog('[WYSIWYG-Text] Formatted HTML:', formattedHtml);
-            
-            safeSetHTML(editor, formattedHtml);
-
-            restoreCursorPosition(savedPos);
-
-            // Deferred to a microtask rather than cleared synchronously: the
-            // editorMutationObserver (below) watches for exactly this kind of DOM
-            // write, and MutationObserver callbacks run as microtasks queued at
-            // mutation time — guaranteed to run before this .then() — so isUpdating
-            // is still true when that callback checks it, and it correctly ignores
-            // the mutation this safeSetHTML call just produced instead of treating
-            // it as an external edit and rescheduling another reformat.
-            Promise.resolve().then(() => { isUpdating = false; });
-        }
-        
-        // Sync editor content to textarea.
-        // ROOT-CAUSE FIX for the iOS/WebKit React #185 send crash: write through React's
-        // NATIVE prototype value setter, not `textarea.value =`.
-        //
-        // React installs a tracker-wrapping setter on the textarea INSTANCE; a plain
-        // `textarea.value = x` runs that wrapper and updates React's _valueTracker to x
-        // BEFORE we dispatch 'input'. React's ChangeEventPlugin then compares tracker(x)
-        // === node.value(x), sees "no change", and SUPPRESSES onChange. So React's
-        // controlled state never learns the typed text — its prop stays "" while the DOM
-        // holds the text. That standing prop↔DOM desync is the one invariant behind every
-        // observed #185 crash (tap and Enter, editor mounted or removed, observers live or
-        // suspended): during the send commit React's controlled-input restore-state
-        // machinery keeps trying to reconcile the mismatch and recurses past its
-        // nested-update limit (50) on WebKit.
-        //
-        // Calling the native prototype setter writes the DOM WITHOUT touching the tracker,
-        // so the dispatched 'input' registers as a real change, React's onChange fires, and
-        // React's state tracks the typed text on every keystroke. By send time prop === DOM,
-        // so restore short-circuits (updateWrapper's `if (newValue !== node.value)` guard)
-        // and the recursion has no fuel. The `if (isUpdating) return` guard below prevents
-        // the resulting onChange-driven re-render from recursing back into this function.
-        const nativeTextareaValueSetter = (() => {
-            try {
-                return Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set || null;
-            } catch (_) {
-                return null;
-            }
-        })();
-        function syncToTextarea() {
-            if (isUpdating) return;
-
-            const plainText = getPlainText();
-            if (textarea.value !== plainText) {
-                if (nativeTextareaValueSetter) {
-                    nativeTextareaValueSetter.call(textarea, plainText);
-                } else {
-                    textarea.value = plainText;
-                }
-
-                // Single 'input' only — React derives a textarea's onChange from 'input',
-                // so a 'change' dispatch is redundant and just adds re-entrancy pressure.
-                textarea.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-        }
-        
-        // Initialize editor with textarea content
-        function initializeEditor() {
-            const formattedHtml = parseFormattedText(textarea.value);
-            // Same isUpdating guard as updateEditorDisplay: this safeSetHTML call is
-            // our own programmatic write, not an external edit, so the
-            // editorMutationObserver (below) must be able to tell the two apart.
-            isUpdating = true;
-            safeSetHTML(editor, formattedHtml);
-            Promise.resolve().then(() => { isUpdating = false; });
-
-            // Restore editor to editable state (in case it was locked during generation)
-            editor.contentEditable = 'true';
-            editor.style.pointerEvents = '';
-            editor.style.opacity = '';
-
-            // Auto-focus the editor when it becomes visible and enabled
-            // Check if the editor is visible (not hidden by React)
-            const isVisible = editor.offsetParent !== null &&
-                             editor.offsetWidth > 0 &&
-                             editor.offsetHeight > 0;
-
-            // Focus the editor if it's visible, editable, and not currently focused
-            if (isVisible && editor.contentEditable === 'true' && document.activeElement !== editor) {
-                // Use requestAnimationFrame to ensure DOM is fully updated
-                requestAnimationFrame(() => {
-                    editor.focus();
-                    // Place cursor at the end of content
-                    const selection = window.getSelection();
-                    const range = document.createRange();
-                    range.selectNodeContents(editor);
-                    range.collapse(false); // false = collapse to end
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                });
-            }
-        }
-        
-        // Initialize
-        initializeEditor();
-        
-        // Track last known textarea value for change detection
-        let lastKnownValue = textarea.value;
-        
-        // Track IME composition state (critical for mobile keyboards and non-Latin input)
-        let isComposing = false;
-        
-        // Detect Android mobile for performance optimization (glitch prevention)
-        const isAndroidMobile = /Android/i.test(navigator.userAgent) && /Mobile/i.test(navigator.userAgent);
-        // Detect iOS for backspace fix (separate issue from Android glitching)
-        // NOTE: use the robust detector — Orion (iOS) is absent from the UA string,
-        // and a UA-only check here was leaving the editor mounted during send on
-        // Orion, which crashed the page with React #185 (max update depth).
-        const isIOS = isAppleTouchDevice();
-        const debounceDelay = isAndroidMobile ? 1000 : 150; // 1s for Android mobile, 150ms for desktop/iOS
-        
-        editor.addEventListener('compositionstart', () => {
-            isComposing = true;
-            editor._isComposing = true; // Also store on element for access from intervals
-            debugLog('[WYSIWYG] Composition started (IME/mobile keyboard)');
-        });
-        
-        editor.addEventListener('compositionend', () => {
-            isComposing = false;
-            editor._isComposing = false;
-            debugLog('[WYSIWYG] Composition ended (IME/mobile keyboard)');
-            // Sync after composition completes
-            syncToTextarea();
-            lastKnownValue = textarea.value;
-            // Update formatting after composition (critical for iOS smart quote formatting)
-            updateEditorDisplay();
-        });
-        
-        // Handle input - update formatting and sync to textarea
-        let inputDebounceTimer = null;
-        let lastInputTime = 0;
-        editor.addEventListener('input', () => {
-            // Skip sync during IME composition to prevent cursor jumping on mobile
-            if (isComposing) {
-                debugLog('[WYSIWYG] Input during composition - skipping sync');
-                return;
-            }
-            
-            lastInputTime = Date.now();
-            
-            // Sync to textarea immediately
-            syncToTextarea();
-            lastKnownValue = textarea.value;
-            
-            // Use adaptive debounce: longer for Android mobile to prevent glitches, shorter for desktop/iOS
-            clearTimeout(inputDebounceTimer);
-            inputDebounceTimer = setTimeout(() => {
-                // Double-check we're not in composition when the timer fires
-                if (!isComposing) {
-                    updateEditorDisplay();
-                }
-            }, debounceDelay);
-        });
-
-        // Watch for editor DOM edits that arrive WITHOUT an 'input' event.
-        // Grammarly (and similar extensions) apply a suggestion in two steps: insert
-        // the corrected text, then remove the original text in a later step that
-        // doesn't dispatch 'input'. The 'input' handler above only resets the
-        // updateEditorDisplay() debounce on 'input', so if that removal lands more
-        // than one debounce window after the insert, updateEditorDisplay() fires on
-        // the transient "both texts present" DOM state and bakes the duplicate in
-        // permanently via safeSetHTML — at which point Grammarly's removal targets
-        // nodes safeSetHTML already replaced and silently does nothing. Treating any
-        // editor mutation like an 'input' event closes that gap.
-        const editorMutationObserver = new MutationObserver(() => {
-            if (isUpdating || isComposing) return;
-            if (editor._wysiwygSending) return;
-
-            lastInputTime = Date.now();
-            syncToTextarea();
-            lastKnownValue = textarea.value;
-
-            clearTimeout(inputDebounceTimer);
-            inputDebounceTimer = setTimeout(() => {
-                if (!isComposing) {
-                    updateEditorDisplay();
-                }
-            }, debounceDelay);
-        });
-        editorMutationObserver.observe(editor, { childList: true, characterData: true, subtree: true });
-        
-        // Handle paste - strip formatting and paste as plain text
-        editor.addEventListener('paste', (e) => {
-            e.preventDefault();
-            const text = (e.clipboardData || window.clipboardData)?.getData('text/plain') || '';
-            document.execCommand('insertText', false, text);
-            // iOS/WebKit FIX: execCommand('insertText') after preventDefault does NOT
-            // reliably fire the editor's 'input' event, so the live re-format never ran
-            // after a paste until a later blur/focus. Drive the same sync + debounced
-            // re-format the 'input' handler does. (Harmless if 'input' also fires — the
-            // shared debounce timer coalesces to a single updateEditorDisplay.)
-            if (!isComposing) {
-                lastInputTime = Date.now();
-                syncToTextarea();
-                lastKnownValue = textarea.value;
-                clearTimeout(inputDebounceTimer);
-                inputDebounceTimer = setTimeout(() => {
-                    if (!isComposing) updateEditorDisplay();
-                }, debounceDelay);
-            }
-        });
-        
-        // Handle keydown for special keys
-        editor.addEventListener('keydown', (e) => {
-            // Skip during IME composition - let mobile keyboard handle everything
-            if (isComposing) {
-                return;
-            }
-            
-            // iOS FIX: Prevent backspace in empty editor from triggering React Error 185
-            // iOS Safari/WebKit seems to trigger React re-renders when backspace is pressed in empty contenteditable
-            if (e.key === 'Backspace' && isIOS) {
-                const plainText = editor.textContent || '';
-                if (plainText.trim() === '') {
-                    // Editor is empty, prevent the backspace from doing anything
-                    e.preventDefault();
-                    e.stopPropagation();
-                    e.stopImmediatePropagation();
-                    return;
-                }
-            }
-            
-            // ARROW KEY FIX: Stop propagation for arrow keys to prevent
-            // switching between regenerations when editing messages
-            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
-                e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-                // Don't preventDefault - let the cursor move normally within the editor
-            }
-            
-            // Handle Enter key
-            if (e.key === 'Enter') {
-                if (e.shiftKey) {
-                    // Shift+Enter always adds a newline
-                    e.preventDefault();
-                    document.execCommand('insertLineBreak');
-                } else if (isMessageEditor || isGroupChatEdit) {
-                    // For message editor / group chat edit: Enter adds newline (like native textarea)
-                    e.preventDefault();
-                    document.execCommand('insertLineBreak');
-                } else {
-                    // For chat input: Enter sends the message
-                    e.preventDefault();
-                    
-                    // Sync to textarea first
-                    syncToTextarea();
-                    
-                    // Send-time editor handling differs by platform (see the iOS block below):
-                    // - iOS/WebKit: keep the editor mounted + suspend its watchers, defer the click.
-                    // - Desktop: only remove the editor in the narrow 700-850px danger zone.
-                    const windowWidth = window.innerWidth;
-                    const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
-                    // iOS (incl. Orion) React #185 fix: do NOT remove the editor before
-                    // send. Removing it blurs the focused contenteditable mid-event which,
-                    // together with the synchronous synthesized click below, drove React's
-                    // controlled-input restore/commit past its nested-update limit (#185) on
-                    // WebKit. Instead, suspend this editor's watchers for the send window
-                    // (same as the tap path) and defer the click out of the keydown stack
-                    // (see below). Desktop keeps the narrow danger-zone removal — note isIOS
-                    // is always false on desktop, so this is behavior-identical there.
-                    const shouldRemoveBeforeSend = inDangerZone;
-                    if (isIOS) {
-                        editor._wysiwygSending = true;
-                        setTimeout(() => {
-                            editor._wysiwygSending = false;
-                            if (textarea.value === '' || textarea.value !== getPlainText()) {
-                                editor.replaceChildren();
-                                lastKnownValue = '';
-                            }
-                        }, WYSIWYG_SEND_SUSPEND_MS);
-                    }
-                    
-                    if (shouldRemoveBeforeSend) {
-                        debugLog('[WYSIWYG] Removing editor before send - isIOS:', isIOS, 'inDangerZone:', inDangerZone, 'width:', windowWidth);
-                        
-                        // Clean up this specific editor's observers and intervals.
-                        // These are stored on `textarea`, not `editor` — see the
-                        // "Store references for cleanup" block below.
-                        if (textarea._wysiwygResizeObserver) {
-                            textarea._wysiwygResizeObserver.disconnect();
-                            delete textarea._wysiwygResizeObserver;
-                        }
-                        if (textarea._wysiwygMutationObserver) {
-                            textarea._wysiwygMutationObserver.disconnect();
-                            delete textarea._wysiwygMutationObserver;
-                        }
-                        if (textarea._wysiwygEditorMutationObserver) {
-                            textarea._wysiwygEditorMutationObserver.disconnect();
-                            delete textarea._wysiwygEditorMutationObserver;
-                        }
-                        if (textarea._wysiwygValueCheckInterval) {
-                            clearInterval(textarea._wysiwygValueCheckInterval);
-                            delete textarea._wysiwygValueCheckInterval;
-                        }
-                        
-                        // Make textarea visible again and restore its value
-                        textarea.style.display = '';
-                        textarea.style.visibility = '';
-                        textarea.style.position = '';
-                        textarea.style.left = '';
-                        textarea.style.top = '';
-                        textarea.style.width = '';
-                        textarea.style.height = '';
-                        textarea.style.opacity = '';
-                        textarea.style.pointerEvents = '';
-                        textarea.style.zIndex = '';
-                        textarea.style.minHeight = '';
-                        textarea.style.maxHeight = '';
-                        textarea.style.overflow = '';
-                        textarea.style.resize = '';
-                        
-                        // Remove editor from DOM
-                        editor.remove();
-                        
-                        // Clear wysiwygSetup flag so it can be recreated later.
-                        // Must clear dataset.wysiwygSetup (the marker setupWysiwygOverlay
-                        // actually checks) — the old `textarea.wysiwygSetup` set a stray
-                        // property and left the dataset flag at 'true', so after one send
-                        // the editor was never rebuilt until a full page reload.
-                        textarea.dataset.wysiwygSetup = '';
-                    }
-                    
-                    // Find and click the send button - try multiple selectors for different layouts
-                    // Old layout: button[aria-label="send-message"] in .flex.justify-between
-                    // New layout: may have different button structure
-                    let sendButton = null;
-                    
-                    // Try 1: Old layout - send-message button near editor
-                    sendButton = editor.closest('.flex.justify-between')?.querySelector('button[aria-label="send-message"]');
-                    
-                    // Try 2: Search up the DOM tree for any button with send-message
-                    if (!sendButton) {
-                        sendButton = document.querySelector('button[aria-label="send-message"]');
-                    }
-                    
-                    // Try 3: New layout - look for buttons in composer area siblings
-                    // Check parent containers for buttons (may be in flex container next to textarea)
-                    if (!sendButton) {
-                        const parent = editor.parentElement;
-                        const grandparent = parent?.parentElement;
-                        const greatGrandparent = grandparent?.parentElement;
-                        
-                        // Look for any button in the immediate composer area
-                        if (greatGrandparent) {
-                            const siblings = greatGrandparent.querySelectorAll('button');
-                            // Find an enabled button that's not aria-label="record-voice" or other non-send buttons
-                            for (const btn of siblings) {
-                                const ariaLabel = btn.getAttribute('aria-label') || '';
-                                const isDisabled = btn.disabled;
-                                const isHidden = btn.style.display === 'none' || btn.classList.contains('hidden');
-                                
-                                // Skip voice record button and other known non-send buttons
-                                if (!isDisabled && !isHidden && ariaLabel !== 'record-voice' && 
-                                    ariaLabel !== 'autogenerate' && ariaLabel !== 'generate-image') {
-                                    // Check if it looks like a send button (primary action button, not disabled)
-                                    if (btn.className && !btn.className.includes('opacity-60') && 
-                                        !btn.className.includes('cursor-not-allowed')) {
-                                        sendButton = btn;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // If still not found, try to find ANY enabled button near the textarea that's not disabled.
-                    // Walk backwards from the last button so we skip known non-send controls
-                    // (voice/mic, autogenerate, image-gen) instead of blindly grabbing whatever
-                    // is visually last — on some mobile layouts (reported on Firefox Android)
-                    // a voice-record button sits after the send button in DOM order, so taking
-                    // the literal last enabled button was toggling the mic instead of sending.
-                    if (!sendButton) {
-                        const parentContainer = editor.closest('.flex.flex-col') || editor.parentElement;
-                        if (parentContainer) {
-                            const allButtons = Array.from(parentContainer.querySelectorAll('button:not([disabled])'));
-                            for (let i = allButtons.length - 1; i >= 0; i--) {
-                                const btn = allButtons[i];
-                                const ariaLabel = btn.getAttribute('aria-label') || '';
-                                if (ariaLabel !== 'record-voice' && ariaLabel !== 'autogenerate' &&
-                                    ariaLabel !== 'generate-image') {
-                                    sendButton = btn;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (sendButton && !sendButton.disabled) {
-                        debugLog('[WYSIWYG] Found send button, clicking it:', {
-                            ariaLabel: sendButton.getAttribute('aria-label'),
-                            className: sendButton.className
-                        });
-                        if (isIOS) {
-                            // Defer the click out of the keydown call stack so it runs as
-                            // its own top-level discrete event rather than nested inside this
-                            // keydown. The nested synchronous click is what let React's send
-                            // commit interleave with the still-open keydown batch and trip
-                            // #185 on WebKit. Re-query the button inside the frame in case a
-                            // render swapped it. (Editor clear is handled by the suspend
-                            // timeout above, so the 50ms clear below is a desktop concern.)
-                            const btn = sendButton;
-                            requestAnimationFrame(() => {
-                                const fresh = document.querySelector('button[aria-label="send-message"]') || btn;
-                                if (fresh && !fresh.disabled) fresh.click();
-                            });
-                        } else {
-                            sendButton.click();
-                        }
-
-                        // Clear the editor after a short delay (after message is sent)
-                        setTimeout(() => {
-                            if (textarea.value === '' || textarea.value !== getPlainText()) {
-                                editor.replaceChildren();
-                                lastKnownValue = '';
-                            }
-                        }, 50);
-                    } else {
-                        debugLog('[WYSIWYG] Could not find send button', {
-                            sendButton: !!sendButton,
-                            disabled: sendButton?.disabled
-                        });
-                    }
-                }
-            }
-            
-            // Handle Tab
-            if (e.key === 'Tab') {
-                e.preventDefault();
-                document.execCommand('insertText', false, '\t');
-            }
-        });
-        
-        // Focus handling - when editor is focused, ensure it's ready
-        editor.addEventListener('focus', () => {
-            debugLog('[WYSIWYG] Editor focus event - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
-            // Skip during resize to prevent React 185 error
-            if (isResizing || sidebarWidthTransitionPending) {
-                debugLog('[WYSIWYG] Focus handler SKIPPED due to resize in progress');
-                return;
-            }
-            // Editor and textarea disagree — decide which side is authoritative before
-            // touching anything. This is the exact discriminator the value-check interval
-            // uses: `lastKnownValue` is the textarea value as of our last sync.
-            //
-            //   textarea.value !== lastKnownValue  → the TEXTAREA changed since we last
-            //     synced, i.e. an EXTERNAL actor wrote it (React draft-load, the "suggest"
-            //     feature, undo/redo, send-clear). The editor must catch up → rebuild it.
-            //
-            //   textarea.value === lastKnownValue  → the textarea is untouched since our
-            //     last sync, so the divergence is the EDITOR being the fresher side. That
-            //     is what Grammarly (or any similar extension) does: it edits the
-            //     contenteditable directly, which hasn't synced back to the textarea yet.
-            //     Rebuilding from the stale textarea here would (a) silently wipe the
-            //     correction and (b) destroy the very DOM nodes Grammarly is mid-
-            //     replacement on — observed in debug logs as Grammarly "replacement fail"
-            //     immediately after a "Focus handler calling initializeEditor" line. Sync
-            //     editor→textarea instead and let the debounced reformat run afterward.
-            //
-            // The earlier (1.2.4) attempt gated this on `lastInputTime` ("did the user type
-            // recently?"), but accepting a Grammarly suggestion involves no typing, so that
-            // guard was always false for the exact case it was meant to catch.
-            if (textarea.value !== getPlainText()) {
-                if (textarea.value !== lastKnownValue) {
-                    debugLog('[WYSIWYG] Focus handler: textarea changed externally, rebuilding editor');
-                    initializeEditor();
-                    lastKnownValue = textarea.value;
-                } else {
-                    debugLog('[WYSIWYG] Focus handler: editor is fresher (external contenteditable edit), syncing out instead of rebuilding');
-                    syncToTextarea();
-                    lastKnownValue = textarea.value;
-                }
-            }
-        });
-        
-        // Watch for external changes to textarea (e.g., from undo/redo or message send clearing)
-        const activeTypingThreshold = isAndroidMobile ? 1500 : 500; // Longer threshold for Android mobile only
-        const textareaObserver = new MutationObserver(() => {
-            // React #185 guard: stay silent while a send is in flight (flag set by
-            // the send interceptor). React's controlled-value restore wakes this
-            // observer; calling initializeEditor() here would re-enter React mid-
-            // flush and form the observer<->restore loop that throws #185 on iOS.
-            if (__saiDiagMode === 'no-observers') return; // DIAG
-            if (editor._wysiwygSending) return;
-            debugLog('[WYSIWYG] Textarea MutationObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending, 'isUpdating:', isUpdating);
-            // Skip during resize to prevent React 185 error
-            if (isResizing || sidebarWidthTransitionPending) {
-                debugLog('[WYSIWYG] Textarea MutationObserver SKIPPED due to resize in progress');
-                return;
-            }
-            
-            // Skip if user is actively typing to prevent constant re-initialization on mobile
-            const timeSinceInput = Date.now() - lastInputTime;
-            if (timeSinceInput < activeTypingThreshold) {
-                return;
-            }
-            
-            if (!isUpdating) {
-                debugLog('[WYSIWYG] Textarea MutationObserver calling initializeEditor');
-                lastKnownValue = textarea.value;
-                initializeEditor();
-            }
-        });
-        textareaObserver.observe(textarea, { attributes: true, attributeFilter: ['value'] });
-        
-        // Watch for value property changes (polling as backup)
-        const valueCheckInterval = setInterval(() => {
-            // React #185 guard: see textareaObserver. Suspended during send so the
-            // post-send textarea clear doesn't drive initializeEditor() into React's
-            // restore flush. The interceptor clears the editor itself, and this
-            // interval self-heals once the suspend flag lifts.
-            if (__saiDiagMode === 'no-observers') return; // DIAG
-            if (editor._wysiwygSending) return;
-            // Skip during resize to prevent React 185 error
-            if (isResizing || sidebarWidthTransitionPending) {
-                // Don't log every skip or it will flood the console
-                return;
-            }
-            
-            // Skip during IME composition to prevent cursor jumping on mobile
-            if (editor._isComposing) {
-                return;
-            }
-            
-            // Skip if user is actively typing - adaptive threshold based on platform
-            const timeSinceInput = Date.now() - lastInputTime;
-            if (timeSinceInput < activeTypingThreshold) {
-                return;
-            }
-            
-            if (!document.body.contains(textarea)) {
-                debugLog('[WYSIWYG] Value check interval - textarea removed from DOM');
-                clearInterval(valueCheckInterval);
-                return;
-            }
-            // Always check, even when editor is focused - important for message send clearing
-            if (textarea.value !== lastKnownValue) {
-                debugLog('[WYSIWYG] Value check interval detected change - old:', lastKnownValue?.substring(0, 50), 'new:', textarea.value?.substring(0, 50));
-                lastKnownValue = textarea.value;
-                // Only update display if textarea was cleared or changed externally
-                if (!isUpdating) {
-                    debugLog('[WYSIWYG] Value check interval calling initializeEditor');
-                    initializeEditor();
-                }
-            }
-        }, 100); // Check more frequently for responsive clearing
-        
-        // Handle resize - observe the editor since we don't have a container anymore
-        // Debounced to avoid expensive getComputedStyle calls on every resize event
-        // CRITICAL: Skip during window resize to prevent React 185 error
-        let resizeDebounceTimer = null;
-        const resizeObserver = new ResizeObserver(() => {
-            // React #185 guard: see textareaObserver. Suspended during send.
-            if (__saiDiagMode === 'no-observers') return; // DIAG
-            if (editor._wysiwygSending) return;
-            debugLog('[WYSIWYG] ResizeObserver fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
-            // Skip entirely during window resize to prevent React 185 error
-            if (isResizing || sidebarWidthTransitionPending) {
-                debugLog('[WYSIWYG] ResizeObserver SKIPPED due to resize in progress');
-                return;
-            }
-            
-            clearTimeout(resizeDebounceTimer);
-            resizeDebounceTimer = setTimeout(() => {
-                debugLog('[WYSIWYG] ResizeObserver debounce timer fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
-                // Double-check resize state when timer fires
-                if (isResizing || sidebarWidthTransitionPending) {
-                    debugLog('[WYSIWYG] ResizeObserver debounce SKIPPED due to resize in progress');
-                    return;
-                }
-                debugLog('[WYSIWYG] ResizeObserver updating editor minHeight');
-                const style = window.getComputedStyle(textarea);
-                editor.style.minHeight = style.height;
-                debugLog('[WYSIWYG] ResizeObserver minHeight updated to:', style.height);
-            }, 16); // ~60fps max
-        });
-        // Observe the textarea's parent for layout changes
-        if (textarea.parentNode) {
-            resizeObserver.observe(textarea.parentNode);
-        }
-        
-        // Store references for cleanup
-        textarea._wysiwygEditor = editor;
-        textarea._wysiwygResizeObserver = resizeObserver;
-        textarea._wysiwygMutationObserver = textareaObserver;
-        textarea._wysiwygEditorMutationObserver = editorMutationObserver;
-        textarea._wysiwygValueCheckInterval = valueCheckInterval;
-        textarea._wysiwygInputDebounceTimer = inputDebounceTimer;
-    }
-    
-    /**
-     * Remove WYSIWYG editor from a textarea
-     */
-    function removeWysiwygOverlay(textarea) {
-        if (textarea.dataset.wysiwygSetup !== 'true') return;
-        
-        textarea.dataset.wysiwygSetup = '';
-        textarea.classList.remove('sai-wysiwyg-hidden');
-        
-        // Unregister from active message editors (for global arrow key blocking)
-        if (textarea._wysiwygEditorId && window._activeMessageEditors) {
-            window._activeMessageEditors.delete(textarea._wysiwygEditorId);
-        }
-        
-        // Clean up removal observer
-        if (textarea._wysiwygRemovalObserver) {
-            textarea._wysiwygRemovalObserver.disconnect();
-        }
-        
-        // Clean up editor
-        if (textarea._wysiwygEditor) {
-            textarea._wysiwygEditor.remove();
-        }
-        
-        // Clean up resize observer
-        if (textarea._wysiwygResizeObserver) {
-            textarea._wysiwygResizeObserver.disconnect();
-        }
-        
-        // Clean up mutation observer
-        if (textarea._wysiwygMutationObserver) {
-            textarea._wysiwygMutationObserver.disconnect();
-        }
-
-        // Clean up editor mutation observer
-        if (textarea._wysiwygEditorMutationObserver) {
-            textarea._wysiwygEditorMutationObserver.disconnect();
-        }
-
-        // Clean up value check interval
-        if (textarea._wysiwygValueCheckInterval) {
-            clearInterval(textarea._wysiwygValueCheckInterval);
-        }
-        
-        // Clean up debounce timer
-        if (textarea._wysiwygInputDebounceTimer) {
-            clearTimeout(textarea._wysiwygInputDebounceTimer);
-        }
-        
-        // No need to unwrap from container since we don't use one anymore
-        // The textarea stays in its original position in the DOM
-        
-        // Clear inline styles that were added to hide the textarea
-        textarea.style.removeProperty('position');
-        textarea.style.removeProperty('opacity');
-        textarea.style.removeProperty('pointer-events');
-        textarea.style.removeProperty('width');
-        textarea.style.removeProperty('height');
-        textarea.style.removeProperty('min-width');
-        textarea.style.removeProperty('min-height');
-        textarea.style.removeProperty('max-width');
-        textarea.style.removeProperty('max-height');
-        textarea.style.removeProperty('padding');
-        textarea.style.removeProperty('margin');
-        textarea.style.removeProperty('border');
-        textarea.style.removeProperty('overflow');
-        textarea.style.removeProperty('z-index');
-        
-        // Clear references
-        delete textarea._wysiwygEditor;
-        delete textarea._wysiwygEditorId;
-        delete textarea._wysiwygResizeObserver;
-        delete textarea._wysiwygMutationObserver;
-        delete textarea._wysiwygEditorMutationObserver;
-        delete textarea._wysiwygValueCheckInterval;
-        delete textarea._wysiwygInputDebounceTimer;
-    }
-    
-    /**
-     * Find and setup all relevant textareas
-     */
-    function findAndSetupWysiwygTextareas() {
-        const timestamp = Date.now();
-        debugLog('[WYSIWYG] ========================================');
-        debugLog('[WYSIWYG] findAndSetupWysiwygTextareas called at', timestamp);
-        debugLog('[WYSIWYG] - isResizing:', isResizing);
-        debugLog('[WYSIWYG] - sidebarWidthTransitionPending:', sidebarWidthTransitionPending);
-        debugLog('[WYSIWYG] - document.readyState:', document.readyState);
-        debugLog('[WYSIWYG] - wysiwygActive:', wysiwygActive);
-        debugLog('[WYSIWYG] ========================================');
-
-        // BUGFIX: respect the user's setting. The resize handler and the body
-        // mutation observer both call this function unconditionally, so without
-        // this gate WYSIWYG editors get rebuilt on top of the textarea after a
-        // window resize / zoom even when the feature is disabled — which leaves
-        // the composer unusable until reload (the textarea is pinned invisible
-        // and the contenteditable that mounted on top isn't being maintained).
-        // If editors exist while the feature is off, tear them down to recover
-        // any user that's already in the broken state.
-        if (!wysiwygActive) {
-            const stale = document.querySelectorAll('.sai-wysiwyg-editor');
-            if (stale.length > 0) {
-                debugLog('[WYSIWYG] Feature disabled but', stale.length, 'editor(s) present — tearing down');
-                removeAllWysiwygOverlays();
-            } else {
-                debugLog('[WYSIWYG] Feature disabled, skipping setup');
-            }
-            return;
-        }
-
-        // STORY MODE: Skip WYSIWYG setup as Story Mode has native WYSIWYG
-        if (isStoryMode()) {
-            debugLog('[WYSIWYG] Skipping setup - Story Mode has native WYSIWYG');
-            return;
-        }
-        
-        // Find message editor textareas (in edit mode)
-        const messageEditorTextareas = document.querySelectorAll('.flex.flex-col.gap-1\\.5 textarea');
-        debugLog('[WYSIWYG] Found', messageEditorTextareas.length, 'message editor textareas');
-        messageEditorTextareas.forEach((ta, i) => {
-            debugLog('[WYSIWYG] Processing message editor textarea', i + 1, 'of', messageEditorTextareas.length);
-            setupWysiwygOverlay(ta);
-        });
-        
-        // Find chat input textareas
-        const chatInputTextareas = document.querySelectorAll('.border-1.border-solid.rounded-\\[13px\\] textarea');
-        debugLog('[WYSIWYG] Found', chatInputTextareas.length, 'chat input textareas');
-        chatInputTextareas.forEach((ta, i) => {
-            debugLog('[WYSIWYG] Processing chat input textarea', i + 1, 'of', chatInputTextareas.length);
-            setupWysiwygOverlay(ta);
-        });
-        
-        // Alternative: find by placeholder
-        const messageTextareas = document.querySelectorAll('textarea[placeholder="Message..."], textarea[placeholder="Enter something"]');
-        debugLog('[WYSIWYG] Found', messageTextareas.length, 'textareas by placeholder');
-        messageTextareas.forEach((ta, i) => {
-            debugLog('[WYSIWYG] Processing placeholder textarea', i + 1, 'of', messageTextareas.length);
-            setupWysiwygOverlay(ta);
-        });
-        
-        debugLog('[WYSIWYG] findAndSetupWysiwygTextareas COMPLETE at', Date.now());
-    }
-    
-    /**
-     * Remove all WYSIWYG overlays.
-     * Selector note: setupWysiwygOverlay marks textareas with
-     * dataset.wysiwygSetup='true' and the .sai-wysiwyg-hidden class — there is
-     * no .sai-wysiwyg-active class anywhere, so the previous selector matched
-     * nothing and this helper was a silent no-op. Use the dataset attribute,
-     * which is the authoritative marker.
-     */
-    function removeAllWysiwygOverlays() {
-        const activeTextareas = document.querySelectorAll('textarea[data-wysiwyg-setup="true"]');
-        activeTextareas.forEach(removeWysiwygOverlay);
-    }
-    
-    // Global send button interceptor reference (for cleanup)
-    let wysiwygSendInterceptor = null;
-    // Installed once: re-applies editor colors live when Custom/Classic style settings change.
-    let wysiwygStyleListenerInstalled = false;
-    // Timestamp of the last handled send tap. iOS/WebKit fires touchend AND click
-    // for one tap, so the interceptor runs twice; we coalesce within this window.
-    let lastWysiwygSendTime = 0;
-    // How long to suspend an editor's watchers while React commits the send. Must
-    // outlast React's synchronous restore-state flush; the send teardown is fast
-    // (well under this), and a user cannot realistically send again within it.
-    const WYSIWYG_SEND_SUSPEND_MS = 500;
-    
-    /**
-     * Toggle WYSIWYG editor feature
-     */
-    async function toggleWysiwygEditor(enable) {
-        // STORY MODE: Skip WYSIWYG toggle as Story Mode has native WYSIWYG
-        if (isStoryMode()) {
-            debugLog('[WYSIWYG] Skipping toggle - Story Mode has native WYSIWYG');
-            return;
-        }
-        
-        if (enable) {
-            debugLog('[WYSIWYG] Enabling WYSIWYG editor');
-            wysiwygActive = true;
-            injectWysiwygCSS();
-            
-            // iOS FIX: Install global send button interceptor.
-            // On iOS, users tap the send button directly (not the Enter key), so this
-            // capture-phase listener runs BEFORE React handles the send. Its job is to
-            // open a brief "suspend" window that quiets this editor's watchers while
-            // React commits the send — preventing the observer<->restore-state loop
-            // that throws React #185 on iOS. It does NOT sync the value (already synced
-            // on each keystroke) and does NOT remove the editor.
-
-            // Live style reaction: when Custom/Classic style settings change (toggle,
-            // import, or Drive sync), re-apply colors to every mounted editor without
-            // requiring a reload. Installed once.
-            if (!wysiwygStyleListenerInstalled && typeof storage.onChanged === 'function') {
-                wysiwygStyleListenerInstalled = true;
-                storage.onChanged((changes) => {
-                    if (!changes) return;
-                    if (changes[CUSTOM_STYLE_KEY] || changes[CLASSIC_STYLE_KEY] || changes[CUSTOM_STYLE_VALUES_KEY]) {
-                        document.querySelectorAll('.sai-wysiwyg-editor').forEach((el) => {
-                            if (typeof el._wysiwygApplyColors === 'function') el._wysiwygApplyColors();
-                        });
-                        debugLog('[WYSIWYG] Style setting changed — re-applied editor colors live');
-                    }
-                });
-            }
-
-            if (!wysiwygSendInterceptor) {
-                const isIOSDevice = isAppleTouchDevice();
-
-                wysiwygSendInterceptor = (e) => {
-                    // Check if this is a send button being clicked/tapped
-                    const clickedElement = e.target;
-                    if (!clickedElement || !clickedElement.closest) return;
-                    
-                    const target = clickedElement.closest('button[aria-label="send-message"], button[aria-label="send"]');
-                    if (!target) return;
-                    
-                    // Check if any WYSIWYG editor is active
-                    const activeEditors = document.querySelectorAll('.sai-wysiwyg-editor');
-                    if (activeEditors.length === 0) return;
-                    
-                    // iOS/WebKit fires BOTH touchend and click for a single tap, so
-                    // this handler runs twice per send. Coalesce to one logical send
-                    // to avoid doubling the re-entrancy that contributes to #185.
-                    const nowTs = Date.now();
-                    if (nowTs - lastWysiwygSendTime < WYSIWYG_SEND_SUSPEND_MS) return;
-                    lastWysiwygSendTime = nowTs;
-
-                    debugLog('[WYSIWYG] Send interceptor triggered - opening suspend window. isIOS:', isIOSDevice);
-
-                    // ROOT-CAUSE FIX for React #185 (max update depth) on tap-to-send:
-                    // When React commits the send it synchronously restores the
-                    // controlled textarea's value from props. That write wakes this
-                    // editor's MutationObserver / valueCheckInterval / ResizeObserver,
-                    // each of which calls initializeEditor() -> editor.focus()/safeSetHTML,
-                    // which re-enters React's controlled/selection path during the SAME
-                    // synchronous flush and mutates the textarea again -> re-wakes the
-                    // observers. On iOS WebKit that observer<->restore cycle exceeds
-                    // React's nested-update limit (50) and crashes the page. Suspend
-                    // this editor's watchers for the send window so the cycle can't form.
-                    //
-                    // We deliberately do NOT write textarea.value or dispatch synthetic
-                    // input/change events here: the typed text was already synced on each
-                    // keystroke (syncToTextarea), and dispatching a fresh discrete input
-                    // inside React's own gesture is itself a #185 trigger. (The old code
-                    // read editor.previousElementSibling, which never matched the textarea
-                    // — the editor is inserted BEFORE it — so that block was a dead no-op.)
-                    activeEditors.forEach(editorEl => {
-                        editorEl._wysiwygSending = true;
-                        setTimeout(() => {
-                            editorEl._wysiwygSending = false;
-                            // Reflect the now-sent (cleared) textarea; the resumed
-                            // watchers also self-heal, but clear eagerly for snappy UX.
-                            // The textarea is the editor's NEXT sibling (the editor was
-                            // inserted via insertBefore(editor, textarea)).
-                            const ta = editorEl.nextElementSibling;
-                            if (ta && ta.tagName === 'TEXTAREA' && ta.value === '') {
-                                editorEl.replaceChildren();
-                            }
-                        }, WYSIWYG_SEND_SUSPEND_MS);
-                    });
-
-                    // On desktop in danger zone, remove editors to prevent layout issues
-                    // On iOS/mobile, NEVER remove - let them stay in place
-                    const windowWidth = window.innerWidth;
-                    const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
-                    
-                    if (!isIOSDevice && inDangerZone) {
-                        debugLog('[WYSIWYG] Desktop danger zone - removing editors');
-                        // Remove all WYSIWYG overlays
-                        removeAllWysiwygOverlays();
-                        
-                        debugLog('[WYSIWYG] All editors removed before send');
-                    }
-                };
-                
-                // Use capture phase to intercept BEFORE React sees the event
-                // Wrap in try-catch for safety (iOS compatibility)
-                try {
-                    if (document && document.addEventListener) {
-                        document.addEventListener('click', wysiwygSendInterceptor, true);
-                        document.addEventListener('touchend', wysiwygSendInterceptor, true);
-                        debugLog('[WYSIWYG] Send button interceptor installed');
-                    } else {
-                        debugLog('[WYSIWYG] Warning: document not ready for event listeners');
-                    }
-                } catch (error) {
-                    console.error('[WYSIWYG] Error installing send interceptor:', error);
-                }
-            }
-            
-            // Initial setup
-            // iOS/Mobile FIX: Much longer delay to ensure React fully finishes rendering
-            // React 185 crash happens when we inject DOM elements while React is still rendering
-            // The chat page has multiple render cycles on load, so we need to wait for them all
-            
-            debugLog('[WYSIWYG] ======== DEVICE DETECTION START ========');
-            debugLog('[WYSIWYG] navigator.userAgent:', navigator.userAgent);
-            debugLog('[WYSIWYG] navigator.platform:', navigator.platform);
-            debugLog('[WYSIWYG] navigator.maxTouchPoints:', navigator.maxTouchPoints);
-            debugLog('[WYSIWYG] window.innerWidth:', window.innerWidth);
-            debugLog('[WYSIWYG] ontouchstart in window:', 'ontouchstart' in window);
-            
-            // Robust mobile/iOS detection - Orion browser on iOS doesn't include standard iOS UA strings
-            const isIOSDevice = isAppleTouchDevice();
-            const isMobileDevice = isIOSDevice ||
-                                   /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
-                                   (window.innerWidth < 768 && 'ontouchstart' in window);
-            
-            debugLog('[WYSIWYG] isIOSDevice:', isIOSDevice);
-            debugLog('[WYSIWYG] isMobileDevice:', isMobileDevice);
-            debugLog('[WYSIWYG] ======== DEVICE DETECTION END ========');
-            
-            // MOBILE COOLDOWN: Block ALL WYSIWYG setup (including from observer) during initial page load
-            // This prevents the MutationObserver from triggering setup while React is rendering
-            let wysiwygMobileCooldown = isMobileDevice;
-            if (isMobileDevice) {
-                const cooldownTime = Date.now();
-                debugLog('[WYSIWYG] ======== MOBILE COOLDOWN STARTING ========');
-                debugLog('[WYSIWYG] Cooldown started at:', cooldownTime);
-                debugLog('[WYSIWYG] Mobile detected - blocking observer triggers for 6 seconds');
-                setTimeout(() => {
-                    wysiwygMobileCooldown = false;
-                    debugLog('[WYSIWYG] ======== MOBILE COOLDOWN ENDED ========');
-                    debugLog('[WYSIWYG] Cooldown ended at:', Date.now());
-                    debugLog('[WYSIWYG] Observer can now trigger setup');
-                }, 6000);
-            } else {
-                debugLog('[WYSIWYG] Desktop detected - no cooldown needed');
-            }
-            
-            const setupDelay = isMobileDevice ? 6000 : 500; // 6s on mobile, 500ms on desktop
-            debugLog('[WYSIWYG] ======== SCHEDULING INITIAL SETUP ========');
-            debugLog('[WYSIWYG] Setup will run in', setupDelay, 'ms');
-            debugLog('[WYSIWYG] Setup scheduled at:', Date.now());
-            debugLog('[WYSIWYG] Setup will execute at approximately:', Date.now() + setupDelay);
-            setTimeout(findAndSetupWysiwygTextareas, setupDelay);
-            
-            // Watch for new textareas
-            if (!wysiwygObserver) {
-                wysiwygObserver = new MutationObserver((mutations) => {
-                    debugLog('[WYSIWYG] Main observer fired - isResizing:', isResizing, 'sidebarWidthTransitionPending:', sidebarWidthTransitionPending, 'mutations:', mutations.length);
-                    // Skip during resize to prevent React 185 error
-                    if (isResizing || sidebarWidthTransitionPending) {
-                        debugLog('[WYSIWYG] Main observer SKIPPED due to resize in progress');
-                        return;
-                    }
-                    
-                    // Mobile FIX: Skip during cooldown period after page load
-                    if (wysiwygMobileCooldown) {
-                        debugLog('[WYSIWYG] *** OBSERVER BLOCKED BY COOLDOWN ***');
-                        debugLog('[WYSIWYG] Timestamp:', Date.now());
-                        debugLog('[WYSIWYG] Observer saw', mutations.length, 'mutations but cooldown is active');
-                        return;
-                    }
-                    
-                    let needsSetup = false;
-                    for (const mutation of mutations) {
-                        if (mutation.addedNodes.length > 0) {
-                            for (const node of mutation.addedNodes) {
-                                if (node.nodeType === 1) {
-                                    // Check if node is a textarea
-                                    if (node.tagName === 'TEXTAREA') {
-                                        debugLog('[WYSIWYG] Main observer found new TEXTAREA');
-                                        needsSetup = true;
-                                        break;
-                                    }
-                                    // Check if node contains a textarea
-                                    if (node.querySelector && node.querySelector('textarea')) {
-                                        debugLog('[WYSIWYG] Main observer found node containing textarea');
-                                        needsSetup = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (needsSetup) break;
-                    }
-                    if (needsSetup) {
-                        // Double-check resize state before scheduling setup
-                        if (!isResizing && !sidebarWidthTransitionPending) {
-                            // Mobile FIX: Use longer delay on mobile to avoid React 185 crash
-                            const isMobile = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
-                                             /iPhone|iPad|iPod/i.test(navigator.platform) ||
-                                             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
-                                             (window.innerWidth < 768 && 'ontouchstart' in window);
-                            const observerDelay = isMobile ? 3000 : 100; // 3s on mobile, 100ms on desktop
-                            debugLog('[WYSIWYG] Main observer scheduling findAndSetupWysiwygTextareas with delay:', observerDelay, 'ms (isMobile:', isMobile, ')');
-                            setTimeout(findAndSetupWysiwygTextareas, observerDelay);
-                        } else {
-                            debugLog('[WYSIWYG] Main observer skipped scheduling due to resize state');
-                        }
-                    }
-                });
-                wysiwygObserver.observe(document.body, { childList: true, subtree: true });
-                debugLog('[WYSIWYG] Main observer started watching document.body');
-            }
-        } else {
-            debugLog('[WYSIWYG] Disabling WYSIWYG editor');
-            wysiwygActive = false;
-            
-            // Clean up observer
-            if (wysiwygObserver) {
-                wysiwygObserver.disconnect();
-                wysiwygObserver = null;
-            }
-            
-            // Clean up send button interceptor
-            if (wysiwygSendInterceptor) {
-                document.removeEventListener('click', wysiwygSendInterceptor, true);
-                document.removeEventListener('touchend', wysiwygSendInterceptor, true);
-                wysiwygSendInterceptor = null;
-                debugLog('[WYSIWYG] Send button interceptor removed');
-            }
-            
-            // Remove all overlays
-            removeAllWysiwygOverlays();
-            removeWysiwygCSS();
-        }
-        
-        await storage.set(WYSIWYG_EDITOR_KEY, enable);
-    }
-    
     // Initialize features on page load
     async function initializeStyles() {
         // PERFORMANCE: Batch all feature settings into a single storage read
         const featureSettings = await storage.getMultiple({
             [SIDEBAR_LAYOUT_KEY]: false,
-            [CLASSIC_LAYOUT_KEY]: false,
-            [CLASSIC_STYLE_KEY]: false,
             [HIDE_FOR_YOU_KEY]: false,
             [PAGE_JUMP_KEY]: false,
             [COMPACT_GENERATION_KEY]: false,
-            [WYSIWYG_EDITOR_KEY]: false,
             [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH
         });
         
         const sidebarEnabled = featureSettings[SIDEBAR_LAYOUT_KEY];
-        const classicLayoutEnabled = featureSettings[CLASSIC_LAYOUT_KEY];
-        const classicStyleEnabled = featureSettings[CLASSIC_STYLE_KEY];
         const hideForYouEnabled = featureSettings[HIDE_FOR_YOU_KEY];
         const pageJumpEnabled = featureSettings[PAGE_JUMP_KEY];
         const compactGenerationEnabled = featureSettings[COMPACT_GENERATION_KEY];
-        const wysiwygEnabled = featureSettings[WYSIWYG_EDITOR_KEY];
         
         // Load sidebar minimum width setting
         sidebarMinWidth = featureSettings[SIDEBAR_MIN_WIDTH_KEY];
@@ -7904,12 +5476,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Core] Initializing with settings:', {
             sidebar: sidebarEnabled,
             sidebarMinWidth: sidebarMinWidth,
-            classicLayout: classicLayoutEnabled,
-            classicStyle: classicStyleEnabled,
             hideForYou: hideForYouEnabled,
             pageJump: pageJumpEnabled,
-            compactGeneration: compactGenerationEnabled,
-            wysiwygEditor: wysiwygEnabled
+            compactGeneration: compactGenerationEnabled
         });
         
         // Initialize sidebarUserEnabled for responsive sidebar tracking
@@ -7966,42 +5535,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Re-apply the non-chat-page restriction on SPA navigation (chat <-> chatbot/edit etc.)
         initSidebarLayoutPageWatcher();
 
-        // Classic Layout CSS is already injected early if enabled
-        // Just get a reference to the existing element
-        if (classicLayoutEnabled) {
-            classicLayoutStyleElement = document.getElementById('sai-toolkit-classic-layout-early');
-            if (classicLayoutStyleElement) {
-                debugLog('[Core] Using early-injected Classic Layout CSS');
-                classicLayoutStyleElement.disabled = false;
-            }
-        } else {
-            // If disabled but early CSS was injected, disable it
-            const earlyElement = document.getElementById('sai-toolkit-classic-layout-early');
-            if (earlyElement) {
-                earlyElement.disabled = true;
-                classicLayoutStyleElement = earlyElement;
-                debugLog('[Core] Disabled early-injected Classic Layout CSS');
-            }
-        }
-        
-        // Classic Style CSS is already injected early if enabled
-        // Just get a reference to the existing element
-        if (classicStyleEnabled) {
-            classicStyleStyleElement = document.getElementById('sai-toolkit-classic-style-early');
-            if (classicStyleStyleElement) {
-                debugLog('[Core] Using early-injected Classic Style CSS');
-                classicStyleStyleElement.disabled = false;
-            }
-        } else {
-            // If disabled but early CSS was injected, disable it
-            const earlyElement = document.getElementById('sai-toolkit-classic-style-early');
-            if (earlyElement) {
-                earlyElement.disabled = true;
-                classicStyleStyleElement = earlyElement;
-                debugLog('[Core] Disabled early-injected Classic Style CSS');
-            }
-        }
-        
         if (compactGenerationEnabled) {
             await toggleCompactGeneration(true);
         }
@@ -8016,19 +5549,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
         if (pageJumpEnabled) {
             await togglePageJump(true);
-        }
-        if (wysiwygEnabled) {
-            // iOS FIX: Delay WYSIWYG initialization on iOS to prevent React 185 during page load
-            // On iOS, React is slower and we need to wait for the initial render cycle to fully complete
-            // before injecting any DOM elements near React-controlled textareas
-            const isIOSDevice = isAppleTouchDevice();
-            if (isIOSDevice) {
-                debugLog('[WYSIWYG] Delaying initialization on iOS by 4s to avoid React conflicts');
-                // Use 4s delay - this ensures React's initial render + any re-renders have completed
-                setTimeout(() => toggleWysiwygEditor(true), 4000);
-            } else {
-                await toggleWysiwygEditor(true);
-            }
         }
     }
 
@@ -9491,12 +7011,23 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         }
     }
     
-    // Resolves the style settings that are actually active in the S.AI Toolkit
-    // Settings modal at export time (Classic Style / Custom Style / native
-    // SpicyChat colors), matched to the live page's current light/dark mode,
-    // so the exported HTML looks like the chat actually looked when exported.
-    function resolveExportStyle({ classicStyleEnabled, customStyleEnabled, customStyleValues, isDarkMode }) {
-        const sharedDefaults = {
+    // Resolves the colors the exported HTML should use: SpicyChat's native
+    // palette for the live page's light/dark mode (DEFAULT_CUSTOM_STYLE holds
+    // values measured off the native site), with the Style tab's Bot/User
+    // Message BG overrides layered on top — so the export looks like the chat
+    // did at export time. (Text colors/fonts now come from SpicyChat's own
+    // chat styles, which the export can't read, so it uses native defaults.)
+    function resolveExportStyle({ styleOverrides, isDarkMode }) {
+        const theme = isDarkMode ? 'dark' : 'light';
+        const base = DEFAULT_CUSTOM_STYLE[theme];
+        return {
+            isDark: isDarkMode,
+            aiMessageBg: (styleOverrides.enabled && styleOverrides.botMessageBg[theme]) || base.aiMessageBg,
+            userMessageBg: (styleOverrides.enabled && styleOverrides.userMessageBg[theme]) || base.userMessageBg,
+            bot: { ...base.bot },
+            user: { ...base.user },
+            highlightBgColor: base.highlightBgColor,
+            highlightTextColor: base.highlightTextColor,
             bodyFontWeight: DEFAULT_CUSTOM_STYLE.bodyFontWeight,
             bodyFontStyle: DEFAULT_CUSTOM_STYLE.bodyFontStyle,
             bodyTextDecoration: DEFAULT_CUSTOM_STYLE.bodyTextDecoration,
@@ -9512,55 +7043,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             fontSize: DEFAULT_CUSTOM_STYLE.fontSize,
             fontFamily: DEFAULT_CUSTOM_STYLE.fontFamily
         };
-
-        // Classic Style forces a fixed dark-reading palette (white body text,
-        // #06B7DB narration, blue/gray bubbles) regardless of the live theme —
-        // mirrors getClassicStyleCSSEarly(). It never touches typography.
-        if (classicStyleEnabled) {
-            return {
-                isDark: true,
-                aiMessageBg: 'rgba(100, 100, 100, 0.1)',
-                userMessageBg: 'rgba(0, 100, 255, 0.1)',
-                bot: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#06B7DB' },
-                user: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#06B7DB' },
-                highlightBgColor: DEFAULT_CUSTOM_STYLE.dark.highlightBgColor,
-                highlightTextColor: DEFAULT_CUSTOM_STYLE.dark.highlightTextColor,
-                ...sharedDefaults
-            };
-        }
-
-        // Custom Style off: DEFAULT_CUSTOM_STYLE's light/dark profiles are
-        // measured directly off native SpicyChat colors (see their own
-        // comment above), so they're the correct "off" palette to mirror.
-        const active = customStyleEnabled
-            ? customStyleValues[isDarkMode ? 'dark' : 'light']
-            : DEFAULT_CUSTOM_STYLE[isDarkMode ? 'dark' : 'light'];
-
-        return {
-            isDark: isDarkMode,
-            aiMessageBg: active.aiMessageBg,
-            userMessageBg: active.userMessageBg,
-            bot: { ...active.bot },
-            user: { ...active.user },
-            highlightBgColor: active.highlightBgColor,
-            highlightTextColor: active.highlightTextColor,
-            ...(customStyleEnabled ? {
-                bodyFontWeight: customStyleValues.bodyFontWeight,
-                bodyFontStyle: customStyleValues.bodyFontStyle,
-                bodyTextDecoration: customStyleValues.bodyTextDecoration,
-                spanQuoteFontWeight: customStyleValues.spanQuoteFontWeight,
-                spanQuoteFontStyle: customStyleValues.spanQuoteFontStyle,
-                spanQuoteTextDecoration: customStyleValues.spanQuoteTextDecoration,
-                narrationFontWeight: customStyleValues.narrationFontWeight,
-                narrationFontStyle: customStyleValues.narrationFontStyle,
-                narrationTextDecoration: customStyleValues.narrationTextDecoration,
-                highlightFontWeight: customStyleValues.highlightFontWeight,
-                highlightFontStyle: customStyleValues.highlightFontStyle,
-                highlightTextDecoration: customStyleValues.highlightTextDecoration,
-                fontSize: customStyleValues.fontSize,
-                fontFamily: customStyleValues.fontFamily
-            } : sharedDefaults)
-        };
     }
 
     // Export chat as formatted HTML with embedded images (data URLs)
@@ -9568,17 +7050,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         try {
             debugLog('[Export] Starting HTML export...');
 
-            // Resolve whichever style is actually active in the Settings modal
-            // right now (Classic Style / Custom Style / native), matched to the
-            // live page's current light/dark mode, so the export matches what
-            // the chat looked like at export time.
-            const classicStyleEnabled = await storage.get(CLASSIC_STYLE_KEY, false);
-            const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
-            const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-            const customStyleValues = normalizeCustomStyleValues(customStyleValuesStr);
+            // Native palette for the live light/dark mode + the Style tab's
+            // bubble BG overrides (see resolveExportStyle).
+            const styleOverrides = normalizeStyleOverrides(await storage.get(STYLE_OVERRIDES_KEY, null));
             const isDarkMode = document.documentElement.classList.contains('dark') ||
                                 window.matchMedia('(prefers-color-scheme: dark)').matches;
-            const exportStyle = resolveExportStyle({ classicStyleEnabled, customStyleEnabled, customStyleValues, isDarkMode });
+            const exportStyle = resolveExportStyle({ styleOverrides, isDarkMode });
 
             const { messages, character } = await fetchAllChatMessages();
             
@@ -10383,8 +7860,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function showToolkitSettingsModal() {
     debugLog('[Core] ===== OPENING SETTINGS MODAL =====');
     debugLog('[Core] Current Sidebar Layout enabled?', await storage.get(SIDEBAR_LAYOUT_KEY, false));
-    debugLog('[Core] Current Classic Layout enabled?', await storage.get(CLASSIC_LAYOUT_KEY, false));
-    debugLog('[Core] Current Classic Style enabled?', await storage.get(CLASSIC_STYLE_KEY, false));
     // Create or get a dedicated container with SHADOW DOM for complete isolation
         let toolkitRoot = document.getElementById('toolkit-modal-root');
         if (!toolkitRoot) {
@@ -10655,6 +8130,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     color: #6b7280;
                     margin-bottom: 0.5rem;
                 }
+                /* Style tab: its sections are standalone groups, so their headings
+                   are larger than the small labels used on the other tabs. */
+                #tab-style .section-title {
+                    font-size: 15px;
+                    font-weight: 700;
+                    margin-top: 1.1rem;
+                    margin-bottom: 0.5rem;
+                    color: #111827;
+                }
+                #tab-style .custom-style-section:first-child .section-title { margin-top: 0.25rem; }
+                @media (prefers-color-scheme: dark) {
+                    #tab-style .section-title { color: #f3f4f6; }
+                }
                 .drive-sync-status {
                     font-size: 11px;
                     color: #9ca3af;
@@ -10869,67 +8357,58 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     background: #2563eb;
                 }
                 
-                /* Custom Style Options */
-                /* BUGFIX: this section was the only one in the modal with no light-mode
-                   colors — every value below was tuned for a dark modal only, so in
-                   Light Mode the labels rendered as low-contrast light-gray text and the
-                   container background was nearly invisible on white. Base values below
-                   are the light-mode colors (matching .setting-desc/.section-title
-                   elsewhere in this stylesheet); the original dark-tuned values now live
-                   in the @media (prefers-color-scheme: dark) overrides, same pattern used
-                   throughout the rest of this modal. */
-                .custom-style-options {
-                    display: flex;
-                    flex-direction: column;
+                /* Style tab: Light/Dark value pairs (label | light | dark) */
+                .style-pair-header,
+                .style-pair-row {
+                    display: grid;
+                    grid-template-columns: 110px 1fr 1fr;
                     gap: 0.5rem;
-                    padding: 0.75rem;
-                    background: rgba(0,0,0,0.04);
-                    border-radius: 8px;
-                    border: 1px solid rgba(0,0,0,0.08);
-                    margin-top: 0.25rem;
+                    align-items: center;
+                }
+                .style-pair-row { margin-bottom: 0.4rem; }
+                .style-pair-header { margin-bottom: 0.35rem; }
+                .style-pair-header span {
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #374151;
                 }
                 @media (prefers-color-scheme: dark) {
-                    .custom-style-options { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); }
+                    .style-pair-header span { color: #e5e7eb; }
                 }
-                .theme-switch-row {
+                /* Square icon button (bin) that sits in front of the file picker */
+                .icon-btn-danger {
+                    /* The modal's generic \`button { flex: 1 }\` rule would stretch
+                       this across the row - pin it to a fixed square instead. */
+                    flex: 0 0 36px;
+                    width: 36px;
+                    height: 36px;
+                    box-sizing: border-box;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 0;
+                    background: transparent;
+                    border: 1px solid #dc2626;
+                    color: #dc2626;
+                    border-radius: 6px;
+                    cursor: pointer;
+                    touch-action: manipulation;
+                    transition: background-color 0.2s, color 0.2s;
+                }
+                .icon-btn-danger:hover {
+                    background: #dc2626;
+                    color: #fff;
+                }
+                .icon-btn-danger svg { width: 18px; height: 18px; pointer-events: none; }
+                .style-pair-cell {
                     display: flex;
                     align-items: center;
-                    gap: 0.5rem;
-                    margin-bottom: 0.25rem;
+                    gap: 0.35rem;
+                    min-width: 0;
                 }
-                .theme-switch-label {
-                    font-size: 11px;
-                    color: #6b7280;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .theme-switch-label { color: #9ca3af; }
-                }
-                .theme-switch {
-                    display: flex;
-                    gap: 0.2rem;
-                    background: rgba(0,0,0,0.05);
-                    border-radius: 6px;
-                    padding: 2px;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .theme-switch { background: rgba(255,255,255,0.08); }
-                }
-                .theme-switch-btn {
-                    flex: none !important;
-                    padding: 0.25rem 0.6rem !important;
-                    border: none;
-                    border-radius: 4px;
-                    background: transparent;
-                    color: #6b7280;
-                    font-size: 11px !important;
-                    cursor: pointer;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .theme-switch-btn { color: #9ca3af; }
-                }
-                .theme-switch-btn.active {
-                    background: #3b82f6;
-                    color: white;
+                @media (max-width: 420px) {
+                    .style-pair-header,
+                    .style-pair-row { grid-template-columns: 80px 1fr 1fr; }
                 }
                 .style-input-row {
                     display: flex;
@@ -10946,67 +8425,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 @media (prefers-color-scheme: dark) {
                     .style-label { color: #d1d5db; }
                 }
-                .style-label-sub {
-                    min-width: 100px;
-                    flex-shrink: 0;
-                    color: #6b7280;
-                    font-size: 11px;
-                    font-weight: 400;
-                    padding-left: 1rem;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .style-label-sub { color: #9ca3af; }
-                }
                 @media (max-width: 380px) {
                     .style-label { min-width: 80px; font-size: 11px; }
-                    .style-label-sub { min-width: 70px; font-size: 10px; }
-                }
-
-                /* Text Type Sections (Collapsible) */
-                .text-type-section {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 0.25rem;
-                    padding: 0.5rem;
-                    background: rgba(0,0,0,0.04);
-                    border-radius: 6px;
-                    border: 1px solid rgba(0,0,0,0.08);
-                }
-                @media (prefers-color-scheme: dark) {
-                    .text-type-section { background: rgba(0,0,0,0.2); border-color: rgba(255,255,255,0.05); }
-                }
-                .text-type-header {
-                    display: flex;
-                    align-items: center;
-                    gap: 0.5rem;
-                    cursor: pointer;
-                    user-select: none;
-                }
-                .text-type-header:hover {
-                    opacity: 0.8;
-                }
-                .text-type-caret {
-                    font-size: 10px;
-                    color: #6b7280;
-                    transition: transform 0.2s;
-                    flex-shrink: 0;
-                    width: 12px;
-                }
-                @media (prefers-color-scheme: dark) {
-                    .text-type-caret { color: #9ca3af; }
-                }
-                .text-type-caret.expanded {
-                    transform: rotate(90deg);
-                }
-                .text-type-options {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 0.5rem;
-                    padding-left: 1.5rem;
-                    padding-top: 0.5rem;
-                }
-                .text-type-options.hidden {
-                    display: none;
                 }
                 .style-input {
                     flex: 1;
@@ -11018,32 +8438,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     border-radius: 6px;
                     font-size: 12px;
                     font-family: 'Courier New', monospace;
-                }
-                .style-select {
-                    flex: 1;
-                    min-width: 0;
-                    padding: 0.5rem;
-                    background: #2a2a2a;
-                    border: 1px solid #555;
-                    color: #fff;
-                    border-radius: 6px;
-                    font-size: 12px;
-                }
-                .clear-btn {
-                    padding: 0.4rem 0.75rem;
-                    background: #ef4444;
-                    border: none;
-                    color: #fff;
-                    border-radius: 6px;
-                    font-size: 11px;
-                    font-weight: 500;
-                    cursor: pointer;
-                    white-space: nowrap;
-                    transition: background-color 0.2s;
-                    flex-shrink: 0;
-                }
-                .clear-btn:hover {
-                    background: #dc2626;
                 }
                 .color-preview {
                     width: 24px;
@@ -11060,34 +8454,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     width: 100%;
                     height: 100%;
                     border-radius: 3px;
-                }
-                .font-preview-page {
-                    padding: 0.75rem;
-                    background: #1a1a1a;
-                    border-radius: 6px;
-                    margin-top: 0.5rem;
-                }
-                .font-preview {
-                    padding: 0.5rem 0.75rem;
-                    background: #1a1a1a;
-                    border: 1px solid #555;
-                    border-radius: 6px;
-                    text-align: left;
-                }
-                .font-preview-text {
-                    color: #fff;
-                    font-size: 16px;
-                    line-height: 1.6;
-                }
-                .preview-quote {
-                    color: #fff;
-                }
-                .preview-narration {
-                    font-style: italic;
-                }
-                .preview-highlight {
-                    padding: 0 0.25em;
-                    border-radius: 2px;
                 }
             `;
             shadow.appendChild(style);
@@ -11109,10 +8475,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             [SIDEBAR_LAYOUT_KEY]: false,
             [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH,
             [COMPACT_GENERATION_KEY]: false,
-            [CLASSIC_LAYOUT_KEY]: false,
-            [CLASSIC_STYLE_KEY]: false,
-            [CUSTOM_STYLE_KEY]: false,
-            [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
+            [STYLE_OVERRIDES_KEY]: JSON.stringify(EMPTY_STYLE_OVERRIDES),
             [HIDE_FOR_YOU_KEY]: false,
             [PAGE_JUMP_KEY]: false,
             'showGenerationStats': false,
@@ -11129,13 +8492,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             'showChatNameInTitle': false,
             'nsfwToggleEnabled': false,
             'messageRecoveryEnabled': false,
-            [WYSIWYG_EDITOR_KEY]: false,
             [ENABLE_GENERATION_PROFILES_KEY]: false,
-            [SMALL_PROFILE_IMAGES_KEY]: false,
             [ROUNDED_PROFILE_IMAGES_KEY]: false,
             [SWAP_CHECKBOX_POSITION_KEY]: false,
             [SQUARE_MESSAGE_EDGES_KEY]: false,
-            [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
             [MEMORY_DOT_ENABLED_KEY]: true,
             [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
             [HIDE_CREATOR_KEY]: false
@@ -11144,17 +8504,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let sidebarEnabled = modalSettings[SIDEBAR_LAYOUT_KEY];
         let sidebarMinWidthValue = modalSettings[SIDEBAR_MIN_WIDTH_KEY];
         let compactGenerationEnabled = modalSettings[COMPACT_GENERATION_KEY];
-        let classicLayoutEnabled = modalSettings[CLASSIC_LAYOUT_KEY];
-        let classicStyleEnabled = modalSettings[CLASSIC_STYLE_KEY];
-        let customStyleEnabled = modalSettings[CUSTOM_STYLE_KEY];
-        let customStyleValues = normalizeCustomStyleValues(modalSettings[CUSTOM_STYLE_VALUES_KEY]);
-        // Which profile the Custom Style panel is currently showing/editing.
-        // Defaults to whatever the site is actually rendering right now, so the
-        // panel opens already showing what you're looking at.
-        let editingStyleProfile = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
-        // Which role's Body/Dialogue/Narration colors the panel is currently
-        // showing/editing — independent of editingStyleProfile above.
-        let editingStyleRole = 'bot';
+        // Style tab's individual color/background overrides (see STYLE_OVERRIDES_KEY)
+        const styleOverrides = normalizeStyleOverrides(modalSettings[STYLE_OVERRIDES_KEY]);
         let hideForYouEnabled = modalSettings[HIDE_FOR_YOU_KEY];
         let pageJumpEnabled = modalSettings[PAGE_JUMP_KEY];
         let showStatsEnabled = modalSettings['showGenerationStats'];
@@ -11171,18 +8522,15 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let showChatNameInTitleEnabled = modalSettings['showChatNameInTitle'];
         let nsfwToggleEnabled = modalSettings['nsfwToggleEnabled'];
         let messageRecoveryEnabled = modalSettings['messageRecoveryEnabled'];
-        let wysiwygEnabled = modalSettings[WYSIWYG_EDITOR_KEY];
         let enableGenerationProfilesEnabled = modalSettings[ENABLE_GENERATION_PROFILES_KEY];
-        let smallProfileImagesEnabled = modalSettings[SMALL_PROFILE_IMAGES_KEY];
         let roundedProfileImagesEnabled = modalSettings[ROUNDED_PROFILE_IMAGES_KEY];
         let swapCheckboxPositionEnabled = modalSettings[SWAP_CHECKBOX_POSITION_KEY];
         let squareMessageEdgesEnabled = modalSettings[SQUARE_MESSAGE_EDGES_KEY];
-        let messageContainerMaxWidth = modalSettings[MESSAGE_CONTAINER_MAX_WIDTH_KEY];
         let memoryDotEnabled = modalSettings[MEMORY_DOT_ENABLED_KEY];
         let memoryDotColor = modalSettings[MEMORY_DOT_COLOR_KEY];
         let hideCreatorEnabled = modalSettings[HIDE_CREATOR_KEY];
 
-        debugLog('[Core] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
+        debugLog('[Core] Modal state - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', sidebarMinWidthValue, 'CompactGeneration:', compactGenerationEnabled, 'StyleOverrides:', styleOverrides, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
         
         // Create backdrop
         debugLog('[Core] Creating backdrop and modal elements');
@@ -11257,20 +8605,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </div>
                     <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="classic-layout-checkbox" autocomplete="off">
-                        <div class="setting-text">
-                            <div class="setting-title">Classic Chat Layout</div>
-                            <div class="setting-desc">Centered message boxes with proper sizing (by MssAcc)</div>
-                        </div>
-                    </label>
-                    <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="small-profile-images-checkbox" autocomplete="off">
-                        <div class="setting-text">
-                            <div class="setting-title">Small Profile Images</div>
-                            <div class="setting-desc">Smaller profile images in chat messages</div>
-                        </div>
-                    </label>
-                    <label class="setting-row">
                         <input type="checkbox" class="setting-checkbox" id="rounded-profile-images-checkbox" autocomplete="off">
                         <div class="setting-text">
                             <div class="setting-title">Rounded Profile Images</div>
@@ -11295,292 +8629,65 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 
                 <!-- Style Tab -->
                 <div class="tab-content" id="tab-style">
-                    <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="classic-style-checkbox" autocomplete="off">
-                        <div class="setting-text">
-                            <div class="setting-title">Classic Style</div>
-                            <div class="setting-desc">Classic colors and styling (by MssAcc)</div>
-                        </div>
-                    </label>
-                    <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="custom-style-checkbox" autocomplete="off">
-                        <div class="setting-text">
-                            <div class="setting-title">Custom Style</div>
-                            <div class="setting-desc">Custom colors and fonts (only one style at a time)</div>
-                        </div>
-                    </label>
-                    <div id="custom-style-options" class="custom-style-options hidden">
-                        <div class="theme-switch-row">
-                            <span class="theme-switch-label">Editing colors for:</span>
-                            <div class="theme-switch">
-                                <button type="button" class="theme-switch-btn" id="theme-switch-light" data-theme="light">☀ Light</button>
-                                <button type="button" class="theme-switch-btn" id="theme-switch-dark" data-theme="dark">🌙 Dark</button>
+                    <!-- Message Colors: each has its own Light + Dark value. Empty = SpicyChat's own color. -->
+                    <div class="custom-style-section">
+                        <div class="section-title">Message Colors</div>
+                        <label class="setting-row" style="margin-bottom: 12px;">
+                            <input type="checkbox" class="setting-checkbox" id="style-colors-enabled" autocomplete="off">
+                            <div class="setting-text">
+                                <div class="setting-title">Custom Message Colors</div>
+                                <div class="setting-desc">Use your own message bubble and button hover colors</div>
+                            </div>
+                        </label>
+                        <div id="style-colors-fields" class="hidden">
+                        <div class="style-pair-header"><span></span><span>☀ Light</span><span>🌙 Dark</span></div>
+                        <div class="style-pair-row">
+                            <label class="style-label">Bot Message BG:</label>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-bot-bg-light" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-bot-bg-light-preview"></div></div>
+                            </div>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-bot-bg-dark" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-bot-bg-dark-preview"></div></div>
                             </div>
                         </div>
-                        <div class="theme-switch-row">
-                            <span class="theme-switch-label">Colors for:</span>
-                            <div class="theme-switch">
-                                <button type="button" class="theme-switch-btn" id="role-switch-bot" data-role="bot">🤖 Bot</button>
-                                <button type="button" class="theme-switch-btn" id="role-switch-user" data-role="user">🙂 You</button>
+                        <div class="style-pair-row">
+                            <label class="style-label">User Message BG:</label>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-user-bg-light" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-user-bg-light-preview"></div></div>
+                            </div>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-user-bg-dark" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-user-bg-dark-preview"></div></div>
                             </div>
                         </div>
-                        <div class="style-input-row" id="bot-message-bg-row">
-                            <label class="style-label">Message BG:</label>
-                            <input type="text" id="custom-ai-bg" class="style-input" placeholder="rgba(100, 100, 100, 0.1)">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-ai-bg"></div></div>
-                        </div>
-                        <div class="style-input-row hidden" id="user-message-bg-row">
-                            <label class="style-label">Message BG:</label>
-                            <input type="text" id="custom-user-bg" class="style-input" placeholder="rgba(0, 100, 255, 0.1)">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-user-bg"></div></div>
-                        </div>
-
-                        <!-- Body Text Section -->
-                        <div class="text-type-section">
-                            <div class="text-type-header" data-target="body-text-options">
-                                <span class="text-type-caret">▶</span>
-                                <label class="style-label">Body Text:</label>
-                                <input type="text" id="custom-body-color" class="style-input" placeholder="#ffffff">
-                                <div class="color-preview"><div class="color-preview-inner" id="preview-body-color"></div></div>
-                            </div>
-                            <div class="text-type-options hidden" id="body-text-options">
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Weight:</label>
-                                    <select id="custom-body-font-weight" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="bold">Bold</option>
-                                        <option value="lighter">Lighter</option>
-                                        <option value="100">100</option>
-                                        <option value="200">200</option>
-                                        <option value="300">300</option>
-                                        <option value="400">400</option>
-                                        <option value="500">500</option>
-                                        <option value="600">600</option>
-                                        <option value="700">700</option>
-                                        <option value="800">800</option>
-                                        <option value="900">900</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Style:</label>
-                                    <select id="custom-body-font-style" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="italic">Italic</option>
-                                        <option value="oblique">Oblique</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Text Decoration:</label>
-                                    <select id="custom-body-text-decoration" class="style-select">
-                                        <option value="none">None</option>
-                                        <option value="underline">Underline</option>
-                                        <option value="overline">Overline</option>
-                                        <option value="line-through">Line Through</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Dialogue Section -->
-                        <div class="text-type-section">
-                            <div class="text-type-header" data-target="dialogue-options">
-                                <span class="text-type-caret">▶</span>
-                                <label class="style-label">Dialogue:</label>
-                                <input type="text" id="custom-span-quote-color" class="style-input" placeholder="#ffffff">
-                                <div class="color-preview"><div class="color-preview-inner" id="preview-quote-color"></div></div>
-                            </div>
-                            <div class="text-type-options hidden" id="dialogue-options">
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Weight:</label>
-                                    <select id="custom-quote-font-weight" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="bold">Bold</option>
-                                        <option value="lighter">Lighter</option>
-                                        <option value="100">100</option>
-                                        <option value="200">200</option>
-                                        <option value="300">300</option>
-                                        <option value="400">400</option>
-                                        <option value="500">500</option>
-                                        <option value="600">600</option>
-                                        <option value="700">700</option>
-                                        <option value="800">800</option>
-                                        <option value="900">900</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Style:</label>
-                                    <select id="custom-quote-font-style" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="italic">Italic</option>
-                                        <option value="oblique">Oblique</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Text Decoration:</label>
-                                    <select id="custom-quote-text-decoration" class="style-select">
-                                        <option value="none">None</option>
-                                        <option value="underline">Underline</option>
-                                        <option value="overline">Overline</option>
-                                        <option value="line-through">Line Through</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Narration Section -->
-                        <div class="text-type-section">
-                            <div class="text-type-header" data-target="narration-options">
-                                <span class="text-type-caret">▶</span>
-                                <label class="style-label">Narration:</label>
-                                <input type="text" id="custom-narration-color" class="style-input" placeholder="#06B7DB">
-                                <div class="color-preview"><div class="color-preview-inner" id="preview-narration-color"></div></div>
-                            </div>
-                            <div class="text-type-options hidden" id="narration-options">
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Weight:</label>
-                                    <select id="custom-narration-font-weight" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="bold">Bold</option>
-                                        <option value="lighter">Lighter</option>
-                                        <option value="100">100</option>
-                                        <option value="200">200</option>
-                                        <option value="300">300</option>
-                                        <option value="400">400</option>
-                                        <option value="500">500</option>
-                                        <option value="600">600</option>
-                                        <option value="700">700</option>
-                                        <option value="800">800</option>
-                                        <option value="900">900</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Style:</label>
-                                    <select id="custom-narration-font-style" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="italic">Italic</option>
-                                        <option value="oblique">Oblique</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Text Decoration:</label>
-                                    <select id="custom-narration-text-decoration" class="style-select">
-                                        <option value="none">None</option>
-                                        <option value="underline">Underline</option>
-                                        <option value="overline">Overline</option>
-                                        <option value="line-through">Line Through</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Highlight Section -->
-                        <div class="text-type-section">
-                            <div class="text-type-header" data-target="highlight-options">
-                                <span class="text-type-caret">▶</span>
-                                <label class="style-label">Highlight BG:</label>
-                                <input type="text" id="custom-highlight-bg-color" class="style-input" placeholder="#ffdd6d">
-                                <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-bg"></div></div>
-                            </div>
-                            <div class="text-type-options hidden" id="highlight-options">
-                                <div class="style-input-row">
-                                    <label class="style-label">Highlight Text:</label>
-                                    <input type="text" id="custom-highlight-text-color" class="style-input" placeholder="#000000">
-                                    <div class="color-preview"><div class="color-preview-inner" id="preview-highlight-text"></div></div>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Weight:</label>
-                                    <select id="custom-highlight-font-weight" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="bold">Bold</option>
-                                        <option value="lighter">Lighter</option>
-                                        <option value="100">100</option>
-                                        <option value="200">200</option>
-                                        <option value="300">300</option>
-                                        <option value="400">400</option>
-                                        <option value="500">500</option>
-                                        <option value="600">600</option>
-                                        <option value="700">700</option>
-                                        <option value="800">800</option>
-                                        <option value="900">900</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Font Style:</label>
-                                    <select id="custom-highlight-font-style" class="style-select">
-                                        <option value="normal">Normal</option>
-                                        <option value="italic">Italic</option>
-                                        <option value="oblique">Oblique</option>
-                                    </select>
-                                </div>
-                                <div class="style-input-row">
-                                    <label class="style-label-sub">Text Decoration:</label>
-                                    <select id="custom-highlight-text-decoration" class="style-select">
-                                        <option value="none">None</option>
-                                        <option value="underline">Underline</option>
-                                        <option value="overline">Overline</option>
-                                        <option value="line-through">Line Through</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="style-input-row">
-                            <label class="style-label">Font Size:</label>
-                            <input type="text" id="custom-font-size" class="style-input" placeholder="16px">
-                        </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Font Family:</label>
-                            <input type="text" id="custom-font-family" class="style-input" placeholder="Arial, sans-serif">
-                        </div>
-                        <div class="font-preview-page" id="font-preview-page">
-                            <div class="font-preview" id="font-preview-box">
-                                <div class="font-preview-text" id="font-preview-text"><span class="preview-quote" id="preview-text-quote">&quot;Go right ahead, dearie!&quot;</span> <span class="preview-narration" id="preview-text-narration">Elara smiles. Her phone buzzes.</span> <span class="preview-highlight" id="preview-text-highlight">The drop has been made.</span></div>
-                            </div>
-                        </div>
-                        <div class="style-input-row">
+                        <div class="style-pair-row">
                             <label class="style-label">Button Hover:</label>
-                            <input type="text" id="custom-hover-button-color" class="style-input" placeholder="#292929">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-hover-button"></div></div>
-                        </div>
-                        <div class="style-input-row">
-                            <label class="style-label">Creator Link:</label>
-                            <input type="text" id="custom-creator-link-color" class="style-input" placeholder="e.g. #6b7280">
-                            <div class="color-preview"><div class="color-preview-inner" id="preview-creator-link-color"></div></div>
-                        </div>
-
-                        <!-- Background Image Section -->
-                        <div class="text-type-section">
-                            <div class="style-input-row" style="margin-bottom: 0;">
-                                <label class="style-label">Background:</label>
-                                <input type="file" id="custom-background-image" class="style-input" accept="image/*">
-                                <button id="clear-background-image-btn" class="clear-btn">Clear</button>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-hover-light" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-hover-light-preview"></div></div>
                             </div>
-                            <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Upload an image for the chat background (converted to data URL)</div>
+                            <div class="style-pair-cell">
+                                <input type="text" id="style-hover-dark" class="style-input" placeholder="default">
+                                <div class="color-preview"><div class="color-preview-inner" id="style-hover-dark-preview"></div></div>
+                            </div>
                         </div>
-
-                        <!-- Reset to Defaults Button -->
-                        <div class="style-input-row" style="justify-content: center; margin-top: 16px;">
-                            <button id="reset-custom-style-btn" class="sai-button" style="padding: 8px 16px; background-color: #3b82f6; color: white; border-radius: 6px; cursor: pointer; font-weight: 500; border: none; transition: background-color 0.2s;" onmouseover="this.style.backgroundColor='#2563eb'" onmouseout="this.style.backgroundColor='#3b82f6'">
-                                Reset to Defaults
-                            </button>
+                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Any CSS color (e.g. #1e2b3e, rgba(0, 100, 255, 0.1)). Leave a field empty to use SpicyChat's own color for it. Text colors and fonts now live in SpicyChat's native chat Customize panel.</div>
                         </div>
                     </div>
-                    
-                    <!-- Message Container Section -->
+
+                    <!-- Background Image Section -->
                     <div class="custom-style-section">
-                        <div class="section-title">Message Container</div>
-                        <div class="style-input-row" style="align-items: center;">
-                            <label class="style-label">Max Width:</label>
-                            <input type="text" id="message-container-max-width" class="style-input" placeholder="e.g. 1200px, 90%" style="flex: 1; min-width: 0;">
+                        <div class="section-title">Background Image</div>
+                        <div class="style-input-row" style="margin-bottom: 0;">
+                            <input type="file" id="background-image-input" class="style-input" accept="image/*">
+                            <button id="clear-background-image-btn" class="icon-btn-danger" type="button" title="Remove background image" aria-label="Remove background image">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                            </button>
                         </div>
-                        <div id="message-container-max-width-preview" style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:#6b7280;">
-                            <span>Preview:</span>
-                            <span id="message-container-max-width-preview-value">—</span>
-                            <div id="message-container-max-width-preview-box" style="flex:1;background:#f3f4f6;height:8px;border-radius:4px;overflow:hidden;border:1px solid rgba(0,0,0,0.06);max-width:240px;">
-                                <div id="message-container-max-width-preview-inner" style="background:#3b82f6;height:100%;width:100%;transition:width 0.12s ease;"></div>
-                            </div>
-                        </div>
-                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Max width for message containers — leave empty for default 800px.</div>
+                        <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;"><span id="background-image-status"></span> Upload an image for the chat background (converted to data URL).</div>
                     </div>
                     
                     <!-- Memory Limit Indicator Section -->
@@ -11599,6 +8706,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="color-preview"><div class="color-preview-inner" id="preview-memory-dot-color"></div></div>
                         </div>
                         <div class="setting-desc" style="margin-top: 6px; font-size: 11px; color: #6b7280;">Customize the memory limit indicator color (default: red)</div>
+                    </div>
+
+                    <!-- Legacy Custom Style: only shown while old data exists -->
+                    <div class="custom-style-section hidden" id="legacy-custom-style-section">
+                        <div class="section-title">Your old Custom Style</div>
+                        <div class="setting-desc" style="font-size: 11px; color: #6b7280; margin-bottom: 8px;">Custom Style has been retired in favor of SpicyChat's own chat styles. Export yours as a SpicyChat style link to keep it, then clear the old data.</div>
+                        <div class="data-buttons">
+                            <button class="btn-data" id="export-custom-style-url-btn">Export Custom Style URL to SpicyChat</button>
+                            <button class="btn-data" id="clear-custom-style-data-btn" style="color: #dc2626; border-color: #dc2626;">Clear Custom Style data</button>
+                        </div>
+                        <div id="custom-style-url-result" class="setting-desc" style="margin-top: 6px; font-size: 11px;"></div>
                     </div>
                 </div>
                 
@@ -11716,13 +8834,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </label>
                     <label class="setting-row">
-                        <input type="checkbox" class="setting-checkbox" id="wysiwyg-checkbox" autocomplete="off">
-                        <div class="setting-text">
-                            <div class="setting-title">Live Text Formatting</div>
-                            <div class="setting-desc">WYSIWYG preview in message editor and chat input</div>
-                        </div>
-                    </label>
-                    <label class="setting-row">
                         <input type="checkbox" class="setting-checkbox" id="message-recovery-checkbox" autocomplete="off">
                         <div class="setting-text">
                             <div class="setting-title">Message Recovery</div>
@@ -11794,6 +8905,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     <div id="drive-sync-status" class="drive-sync-status">Checking…</div>
                     <div class="data-buttons" style="margin-top: 0.5rem;">
                         <button class="btn-data" id="drive-sync-btn">Sync Now</button>
+                        <button class="btn-data" id="drive-reconnect-btn" style="display: none; color: #d97706; border-color: #d97706;">Reconnect Google</button>
                         <button class="btn-data" id="drive-disconnect-btn" style="display: none; color: #dc2626; border-color: #dc2626;">Disconnect</button>
                     </div>
                     <div id="sync-progress-section" style="display: none; margin-top: 0.6rem;">
@@ -11816,13 +8928,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </div>
 
-                    <div class="section-title">Custom Style</div>
-                    <div class="section-desc">Export or import custom style settings</div>
-                    <div class="data-buttons">
-                        <button class="btn-data" id="export-custom-style-btn">Export</button>
-                        <button class="btn-data" id="import-custom-style-btn">Import</button>
-                    </div>
-                    
                     <div class="section-title">All Data</div>
                     <div class="section-desc">Export/import everything (settings, profiles, stats)</div>
                     <div class="data-buttons">
@@ -11863,12 +8968,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             </label>
                             <label class="debug-filter-label">
                                 <input type="checkbox" id="debug-filter-chattitle" checked> ChatTitle
-                            </label>
-                            <label class="debug-filter-label">
-                                <input type="checkbox" id="debug-filter-wysiwyg" checked> WYSIWYG
-                            </label>
-                            <label class="debug-filter-label">
-                                <input type="checkbox" id="debug-filter-wysiwyg-text"> WYSIWYG-Text
                             </label>
                             <label class="debug-filter-label">
                                 <input type="checkbox" id="debug-filter-profile" checked> Profile
@@ -11933,41 +9032,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Get checkbox elements within shadow DOM
         const sidebarCheckbox = shadow.querySelector('#sidebar-checkbox');
         const compactGenerationCheckbox = shadow.querySelector('#compact-generation-checkbox');
-        const classicLayoutCheckbox = shadow.querySelector('#classic-layout-checkbox');
-        const classicStyleCheckbox = shadow.querySelector('#classic-style-checkbox');
-        const customStyleCheckbox = shadow.querySelector('#custom-style-checkbox');
-        const customStyleOptions = shadow.querySelector('#custom-style-options');
-        const themeSwitchLightBtn = shadow.querySelector('#theme-switch-light');
-        const themeSwitchDarkBtn = shadow.querySelector('#theme-switch-dark');
-        const roleSwitchBotBtn = shadow.querySelector('#role-switch-bot');
-        const roleSwitchUserBtn = shadow.querySelector('#role-switch-user');
-        const customAiBgInput = shadow.querySelector('#custom-ai-bg');
-        const customUserBgInput = shadow.querySelector('#custom-user-bg');
-        const botMessageBgRow = shadow.querySelector('#bot-message-bg-row');
-        const userMessageBgRow = shadow.querySelector('#user-message-bg-row');
-        const smallProfileImagesCheckbox = shadow.querySelector('#small-profile-images-checkbox');
         const roundedProfileImagesCheckbox = shadow.querySelector('#rounded-profile-images-checkbox');
         const swapCheckboxPositionCheckbox = shadow.querySelector('#swap-checkbox-position-checkbox');
         const squareMessageEdgesCheckbox = shadow.querySelector('#square-message-edges-checkbox');
-        const customBodyColorInput = shadow.querySelector('#custom-body-color');
-        const customBodyFontWeightSelect = shadow.querySelector('#custom-body-font-weight');
-        const customBodyFontStyleSelect = shadow.querySelector('#custom-body-font-style');
-        const customBodyTextDecorationSelect = shadow.querySelector('#custom-body-text-decoration');
-        const customSpanQuoteColorInput = shadow.querySelector('#custom-span-quote-color');
-        const customQuoteFontWeightSelect = shadow.querySelector('#custom-quote-font-weight');
-        const customQuoteFontStyleSelect = shadow.querySelector('#custom-quote-font-style');
-        const customQuoteTextDecorationSelect = shadow.querySelector('#custom-quote-text-decoration');
-        const customNarrationColorInput = shadow.querySelector('#custom-narration-color');
-        const customNarrationFontWeightSelect = shadow.querySelector('#custom-narration-font-weight');
-        const customNarrationFontStyleSelect = shadow.querySelector('#custom-narration-font-style');
-        const customNarrationTextDecorationSelect = shadow.querySelector('#custom-narration-text-decoration');
-        const customHighlightBgColorInput = shadow.querySelector('#custom-highlight-bg-color');
-        const customHighlightTextColorInput = shadow.querySelector('#custom-highlight-text-color');
-        const customHighlightFontWeightSelect = shadow.querySelector('#custom-highlight-font-weight');
-        const customHighlightFontStyleSelect = shadow.querySelector('#custom-highlight-font-style');
-        const customHighlightTextDecorationSelect = shadow.querySelector('#custom-highlight-text-decoration');
-        const customFontSizeInput = shadow.querySelector('#custom-font-size');
-        const customFontFamilyInput = shadow.querySelector('#custom-font-family');
         const hideForYouCheckbox = shadow.querySelector('#hideforyou-checkbox');
         const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
@@ -11988,7 +9055,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const nsfwToggleCheckbox = shadow.querySelector('#nsfwtoggle-checkbox');
         const messageRecoveryCheckbox = shadow.querySelector('#message-recovery-checkbox');
         const hideCreatorCheckbox = shadow.querySelector('#hide-creator-checkbox');
-        const wysiwygCheckbox = shadow.querySelector('#wysiwyg-checkbox');
         const enableGenerationProfilesCheckbox = shadow.querySelector('#generation-profiles-checkbox');
         const generationProfilesRow = shadow.querySelector('#generation-profiles-row');
         const modelDetailsRow = shadow.querySelector('#generation-model-details-row');
@@ -11998,61 +9064,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const compactGenerationRow = shadow.querySelector('#compact-generation-row');
         const sidebarMinWidthRow = shadow.querySelector('#sidebar-min-width-row');
         const sidebarMinWidthInput = shadow.querySelector('#sidebar-min-width-input');
-        const customHoverButtonColorInput = shadow.querySelector('#custom-hover-button-color');
-        const customCreatorLinkColorInput = shadow.querySelector('#custom-creator-link-color');
-        const customBackgroundImageInput = shadow.querySelector('#custom-background-image');
+        const backgroundImageInput = shadow.querySelector('#background-image-input');
         const clearBackgroundImageBtn = shadow.querySelector('#clear-background-image-btn');
-        const messageContainerMaxWidthInput = shadow.querySelector('#message-container-max-width');
-        // Help/tooltip element for units and validation feedback (inserted after input if not present)
-        let messageContainerMaxWidthHelp = shadow.querySelector('#message-container-max-width-help');
-        if (!messageContainerMaxWidthHelp) {
-            messageContainerMaxWidthHelp = document.createElement('div');
-            messageContainerMaxWidthHelp.id = 'message-container-max-width-help';
-            messageContainerMaxWidthHelp.style.fontSize = '12px';
-            messageContainerMaxWidthHelp.style.color = '#6b7280';
-            messageContainerMaxWidthHelp.style.marginTop = '8px';
-            messageContainerMaxWidthHelp.style.padding = '8px 10px';
-            messageContainerMaxWidthHelp.style.background = 'rgba(59, 130, 246, 0.06)';
-            messageContainerMaxWidthHelp.style.border = '1px solid rgba(59, 130, 246, 0.2)';
-            messageContainerMaxWidthHelp.style.borderRadius = '6px';
-            messageContainerMaxWidthHelp.style.lineHeight = '1.5';
-            messageContainerMaxWidthHelp.style.display = 'none';
-            messageContainerMaxWidthHelp.setAttribute('aria-hidden', 'true');
-            // Insert after the input's row so it appears directly below the input
-            const inputRow = messageContainerMaxWidthInput ? messageContainerMaxWidthInput.closest('.style-input-row') : null;
-            if (inputRow && inputRow.parentNode) {
-                inputRow.parentNode.insertBefore(messageContainerMaxWidthHelp, inputRow.nextSibling);
-            } else if (messageContainerMaxWidthInput && messageContainerMaxWidthInput.parentNode) {
-                messageContainerMaxWidthInput.parentNode.insertBefore(messageContainerMaxWidthHelp, messageContainerMaxWidthInput.nextSibling);
-            } else if (shadow) {
-                shadow.appendChild(messageContainerMaxWidthHelp);
-            }
-        }
-
-        // Structured units help — shown when input is focused
-        const MESSAGE_MAX_WIDTH_HELP_HTML = `
-            <div style="font-weight:600;color:#374151;margin-bottom:6px;">Supported units</div>
-            <ul style="margin:0;padding-left:18px;list-style:disc;">
-                <li><strong>px</strong> — pixels (e.g. <code>800px</code>)</li>
-                <li><strong>%</strong> — percent of parent container (e.g. <code>90%</code>)</li>
-                <li><strong>vw</strong> — viewport width (e.g. <code>50vw</code>)</li>
-                <li><strong>rem</strong> / <strong>em</strong> — relative to font-size</li>
-                <li><strong>vmin</strong> / <strong>vmax</strong> — min/max of viewport dimensions</li>
-                <li><strong>ch</strong> — width of the "0" character</li>
-                <li><strong>cm</strong>, <strong>mm</strong>, <strong>in</strong>, <strong>pt</strong>, <strong>pc</strong> — absolute units</li>
-            </ul>
-            <div style="margin-top:6px;font-style:italic;color:#6b7280;">Unitless numbers are treated as px.</div>
-        `;
-
-        // Preview elements (created in template); query them
-        const messageContainerMaxWidthPreview = shadow.querySelector('#message-container-max-width-preview');
-        const messageContainerMaxWidthPreviewValue = shadow.querySelector('#message-container-max-width-preview-value');
-        const messageContainerMaxWidthPreviewInner = shadow.querySelector('#message-container-max-width-preview-inner');
         const memoryDotEnabledCheckbox = shadow.querySelector('#memory-dot-enabled-checkbox');
         const memoryDotColorInput = shadow.querySelector('#memory-dot-color');
         const previewMemoryDotColor = shadow.querySelector('#preview-memory-dot-color');
-        const previewHoverButton = shadow.querySelector('#preview-hover-button');
-        const previewCreatorLinkColor = shadow.querySelector('#preview-creator-link-color');
         const versionText = shadow.querySelector('#version-text');
         const viewWhatsNewBtn = shadow.querySelector('#view-whats-new-btn');
         const debugFiltersSection = shadow.querySelector('#debug-filters-section');
@@ -12083,8 +9099,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             Export: shadow.querySelector('#debug-filter-export'),
             NSFW: shadow.querySelector('#debug-filter-nsfw'),
             ChatTitle: shadow.querySelector('#debug-filter-chattitle'),
-            WYSIWYG: shadow.querySelector('#debug-filter-wysiwyg'),
-            'WYSIWYG-Text': shadow.querySelector('#debug-filter-wysiwyg-text'),
             Profile: shadow.querySelector('#debug-filter-profile'),
             Model: shadow.querySelector('#debug-filter-model'),
             Cache: shadow.querySelector('#debug-filter-cache'),
@@ -12254,114 +9268,67 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             }
             
             versionText.style.cursor = 'pointer';
-            
+            // iOS: rapid taps on plain text get treated as double-tap-to-zoom /
+            // text-selection gestures, and Safari then coalesces them into fewer
+            // `click` events - so 4 taps often only registered as 2-3.
+            // manipulation disables the double-tap gesture; the rest stops the
+            // selection callout from eating taps.
+            versionText.style.touchAction = 'manipulation';
+            versionText.style.userSelect = 'none';
+            versionText.style.webkitUserSelect = 'none';
+            versionText.style.webkitTouchCallout = 'none';
+            versionText.style.padding = '0.5rem 0'; // bigger target than 11px text
+
+            const toggleDebugMode = async () => {
+                DEBUG_MODE = !DEBUG_MODE;
+                await storage.set('debugMode', DEBUG_MODE);
+                window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
+                if (DEBUG_MODE) {
+                    versionText.style.color = '#4ade80'; // light green
+                    console.log('[Core] 🐛 Debug mode ENABLED (saved)');
+                    generationProfilesRow.classList.remove('hidden');
+                } else {
+                    versionText.style.color = ''; // reset to default
+                    console.log('[Core] Debug mode disabled (saved)');
+                    generationProfilesRow.classList.add('hidden');
+                }
+                await updateGenerationProfilesVisibility();
+                updateDebugFiltersVisibility();
+            };
+
             // Multi-tap detection
             let tapCount = 0;
             let tapTimer = null;
-            
-            versionText.addEventListener('click', async (e) => {
-                // Shift+click immediately toggles debug mode
-                if (e.shiftKey) {
-                    tapCount = 0; // Reset tap counter
+
+            // Count on pointerup, not click: pointerup fires once per physical
+            // tap on iOS even when Safari suppresses the synthesized click.
+            versionText.addEventListener('pointerup', async (e) => {
+                if (e.shiftKey || (e.pointerType === 'mouse' && e.button !== 0)) return;
+                tapCount++;
+                clearTimeout(tapTimer);
+                tapTimer = setTimeout(() => { tapCount = 0; }, 2000);
+                if (tapCount === 4) {
+                    tapCount = 0;
                     clearTimeout(tapTimer);
-                    
-                    DEBUG_MODE = !DEBUG_MODE;
-                    // Persist to storage
-                    await storage.set('debugMode', DEBUG_MODE);
-                    window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
-                    if (DEBUG_MODE) {
-                        versionText.style.color = '#4ade80'; // light green
-                        console.log('[Core] 🐛 Debug mode ENABLED (saved)');
-                        generationProfilesRow.classList.remove('hidden');
-                    } else {
-                        versionText.style.color = ''; // reset to default
-                        console.log('[Core] Debug mode disabled (saved)');
-                        generationProfilesRow.classList.add('hidden');
-                    }
-                    // Update generation profiles section visibility
-                    await updateGenerationProfilesVisibility();
-                    // Update debug filters visibility
-                    updateDebugFiltersVisibility();
-                } else {
-                    // Regular click - count taps
-                    tapCount++;
-                    
-                    // Reset tap counter after 2 seconds of inactivity
-                    clearTimeout(tapTimer);
-                    tapTimer = setTimeout(() => {
-                        tapCount = 0;
-                    }, 2000);
-                    
-                    // Toggle debug mode on 4th tap
-                    if (tapCount === 4) {
-                        tapCount = 0;
-                        clearTimeout(tapTimer);
-                        
-                        DEBUG_MODE = !DEBUG_MODE;
-                        // Persist to storage
-                        await storage.set('debugMode', DEBUG_MODE);
-                        window.__SAI_DEBUG_MODE__ = DEBUG_MODE;
-                        if (DEBUG_MODE) {
-                            versionText.style.color = '#4ade80'; // light green
-                            console.log('[Core] 🐛 Debug mode ENABLED (saved)');
-                            generationProfilesRow.classList.remove('hidden');
-                        } else {
-                            versionText.style.color = ''; // reset to default
-                            console.log('[Core] Debug mode disabled (saved)');
-                            generationProfilesRow.classList.add('hidden');
-                        }
-                        // Update generation profiles section visibility
-                        await updateGenerationProfilesVisibility();
-                        // Update debug filters visibility
-                        updateDebugFiltersVisibility();
-                    }
+                    await toggleDebugMode();
                 }
+            });
+
+            // Shift+click immediately toggles debug mode (desktop shortcut)
+            versionText.addEventListener('click', async (e) => {
+                if (!e.shiftKey) return;
+                tapCount = 0;
+                clearTimeout(tapTimer);
+                await toggleDebugMode();
             });
         }
         
         // Set checkbox states programmatically (safer than innerHTML with dynamic values)
         sidebarCheckbox.checked = sidebarEnabled;
         compactGenerationCheckbox.checked = compactGenerationEnabled;
-        classicLayoutCheckbox.checked = classicLayoutEnabled;
-        classicStyleCheckbox.checked = classicStyleEnabled;
-        customStyleCheckbox.checked = customStyleEnabled;
-        smallProfileImagesCheckbox.checked = smallProfileImagesEnabled;
         roundedProfileImagesCheckbox.checked = roundedProfileImagesEnabled;
         swapCheckboxPositionCheckbox.checked = swapCheckboxPositionEnabled;
         squareMessageEdgesCheckbox.checked = squareMessageEdgesEnabled;
-        // Color fields are populated per the current editingStyleProfile by
-        // applyStyleProfileToFields() below, once the preview elements it also
-        // updates have been declared. Shared (non-color) fields are set here.
-        customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
-        customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
-        customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
-        customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
-        customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
-        customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
-        customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
-        customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
-        customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
-        customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
-        customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
-        customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
-        customFontSizeInput.value = customStyleValues.fontSize;
-        customFontFamilyInput.value = customStyleValues.fontFamily || '';
-        messageContainerMaxWidthInput.value = messageContainerMaxWidth || '';
-        // Initialize preview display with current value (normalized)
-        try {
-            const previewNorm = (val) => {
-                let s = String(val || '').trim();
-                if (/^\d+(?:\.\d+)?$/.test(s)) s = `${s}px`;
-                return s;
-            };
-            const initNorm = previewNorm(messageContainerMaxWidth);
-            if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = initNorm || '—';
-            if (messageContainerMaxWidthPreviewInner && initNorm) {
-                messageContainerMaxWidthPreviewInner.style.width = initNorm;
-            }
-        } catch (err) {
-            // ignore preview init errors
-        }
         memoryDotEnabledCheckbox.checked = memoryDotEnabled;
         memoryDotColorInput.value = memoryDotColor || '#ff3b3b';
         hideForYouCheckbox.checked = hideForYouEnabled;
@@ -12391,7 +9358,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         nsfwToggleCheckbox.checked = nsfwToggleEnabled;
         messageRecoveryCheckbox.checked = messageRecoveryEnabled;
         hideCreatorCheckbox.checked = hideCreatorEnabled;
-        wysiwygCheckbox.checked = wysiwygEnabled;
         enableGenerationProfilesCheckbox.checked = enableGenerationProfilesEnabled;
         
         // Update generation profiles checkbox when it changes
@@ -12438,13 +9404,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Set sidebar minimum width input value
         sidebarMinWidthInput.value = sidebarMinWidthValue;
         
-        // Show/hide custom style options based on custom style checkbox
-        if (customStyleEnabled) {
-            customStyleOptions.classList.remove('hidden');
-        } else {
-            customStyleOptions.classList.add('hidden');
-        }
-        
         debugLog('[Core] Checkbox states set programmatically');
         
         // CRITICAL: Install event barrier at shadow root to prevent events from escaping to React
@@ -12481,33 +9440,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         });
         debugLog('[Core] Tab switching initialized');
         
-        // Collapsible text type sections
-        const textTypeHeaders = shadow.querySelectorAll('.text-type-header');
-        textTypeHeaders.forEach(header => {
-            header.addEventListener('click', (e) => {
-                // Only toggle if clicking the caret, label, or header itself
-                // Don't toggle when clicking input boxes or color previews
-                const clickedElement = e.target;
-                const isInput = clickedElement.classList.contains('style-input');
-                const isColorPreview = clickedElement.classList.contains('color-preview') || 
-                                      clickedElement.classList.contains('color-preview-inner');
-                
-                if (isInput || isColorPreview) {
-                    return; // Don't toggle, let the input/preview handle the click
-                }
-                
-                const targetId = header.dataset.target;
-                const optionsDiv = shadow.querySelector(`#${targetId}`);
-                const caret = header.querySelector('.text-type-caret');
-                
-                if (optionsDiv && caret) {
-                    optionsDiv.classList.toggle('hidden');
-                    caret.classList.toggle('expanded');
-                }
-            });
-        });
-        debugLog('[Core] Collapsible text type sections initialized');
-        
         // Get button and other elements within shadow DOM
         const cancelBtn = shadow.querySelector('#cancel-btn');
         const saveBtn = shadow.querySelector('#save-btn');
@@ -12515,14 +9447,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const importProfilesBtn = shadow.querySelector('#import-profiles-btn');
         const deleteProfilesBtn = shadow.querySelector('#delete-profiles-btn');
         const generationProfilesSection = shadow.querySelector('#generation-profiles-section');
-        const exportCustomStyleBtn = shadow.querySelector('#export-custom-style-btn');
-        const importCustomStyleBtn = shadow.querySelector('#import-custom-style-btn');
-        const resetCustomStyleBtn = shadow.querySelector('#reset-custom-style-btn');
         const exportAllBtn = shadow.querySelector('#export-all-btn');
         const importAllBtn = shadow.querySelector('#import-all-btn');
         const clearAllBtn = shadow.querySelector('#clear-all-btn');
         const driveSyncBtn = shadow.querySelector('#drive-sync-btn');
         const driveDisconnectBtn = shadow.querySelector('#drive-disconnect-btn');
+        const driveReconnectBtn = shadow.querySelector('#drive-reconnect-btn');
         const driveSyncStatus = shadow.querySelector('#drive-sync-status');
         const syncStatsToggle = shadow.querySelector('#sync-stats-toggle');
         const syncSettingsToggle = shadow.querySelector('#sync-settings-toggle');
@@ -12624,18 +9554,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Core] Compact Generation:', compactGenerationEnabled);
         };
         
-        classicLayoutCheckbox.onchange = (e) => {
-            debugLog('[Core] CLASSIC LAYOUT CHECKBOX CHANGED');
-            classicLayoutEnabled = e.target.checked;
-            debugLog('[Core] Classic Layout:', classicLayoutEnabled);
-        };
-        
-        smallProfileImagesCheckbox.onchange = (e) => {
-            debugLog('[Core] SMALL PROFILE IMAGES CHECKBOX CHANGED');
-            smallProfileImagesEnabled = e.target.checked;
-            debugLog('[Core] Small Profile Images:', smallProfileImagesEnabled);
-        };
-        
         roundedProfileImagesCheckbox.onchange = (e) => {
             debugLog('[Core] ROUNDED PROFILE IMAGES CHECKBOX CHANGED');
             roundedProfileImagesEnabled = e.target.checked;
@@ -12653,373 +9571,159 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             squareMessageEdgesEnabled = e.target.checked;
             debugLog('[Core] Square Message Edges:', squareMessageEdgesEnabled);
         };
-        
-        classicStyleCheckbox.onchange = (e) => {
-            debugLog('[Core] CLASSIC STYLE CHECKBOX CHANGED');
-            classicStyleEnabled = e.target.checked;
-            debugLog('[Core] Classic Style:', classicStyleEnabled);
-            
-            // Mutual exclusivity: Disable Custom Style if Classic Style is enabled
-            if (classicStyleEnabled && customStyleEnabled) {
-                customStyleEnabled = false;
-                customStyleCheckbox.checked = false;
-                customStyleOptions.classList.add('hidden');
-            }
-        };
-        
-        customStyleCheckbox.onchange = (e) => {
-            debugLog('[Core] CUSTOM STYLE CHECKBOX CHANGED');
-            customStyleEnabled = e.target.checked;
-            debugLog('[Core] Custom Style:', customStyleEnabled);
-            
-            // Mutual exclusivity: Disable Classic Style if Custom Style is enabled
-            if (customStyleEnabled && classicStyleEnabled) {
-                classicStyleEnabled = false;
-                classicStyleCheckbox.checked = false;
-            }
-            
-            // Toggle custom style options visibility
-            if (customStyleEnabled) {
-                customStyleOptions.classList.remove('hidden');
-            } else {
-                customStyleOptions.classList.add('hidden');
-            }
-        };
-        
-        // Update custom style values when inputs change
-        // Get preview elements
-        const previewAiBg = shadow.querySelector('#preview-ai-bg');
-        const previewUserBg = shadow.querySelector('#preview-user-bg');
-        const previewBodyColor = shadow.querySelector('#preview-body-color');
-        const previewQuoteColor = shadow.querySelector('#preview-quote-color');
-        const previewNarrationColor = shadow.querySelector('#preview-narration-color');
-        const previewHighlightBg = shadow.querySelector('#preview-highlight-bg');
-        const previewHighlightText = shadow.querySelector('#preview-highlight-text');
-        const fontPreviewText = shadow.querySelector('#font-preview-text');
-        const previewTextQuote = shadow.querySelector('#preview-text-quote');
-        const previewTextNarration = shadow.querySelector('#preview-text-narration');
-        const previewTextHighlight = shadow.querySelector('#preview-text-highlight');
-        
-        const fontPreviewBox = shadow.querySelector('#font-preview-box');
-        const fontPreviewPage = shadow.querySelector('#font-preview-page');
 
-        // Function to update font preview. Body/Dialogue/Narration colors
-        // come from whichever profile AND role are currently being edited;
-        // Highlight colors are flat (no bot/user split); typography fields
-        // are shared.
-        const updateFontPreview = () => {
-            const c = customStyleValues[editingStyleProfile];
-            const r = c[editingStyleRole];
-            if (fontPreviewPage) {
-                // The outer page backdrop SpicyChat itself would show behind
-                // the bubble — the bubble color below composites over this,
-                // same as it does on the real site.
-                fontPreviewPage.style.background = editingStyleProfile === 'light' ? '#ffffff' : '#1a1a1a';
-            }
-            if (fontPreviewBox) {
-                // Preview against the ACTUAL configured bubble background for
-                // whichever role is being edited (aiMessageBg vs
-                // userMessageBg) — not just a flat light/dark guess — so text
-                // colors tuned for the user's always-dark bubble don't look
-                // broken here just because the page theme is Light.
-                const bubbleBg = editingStyleRole === 'user' ? c.userMessageBg : c.aiMessageBg;
-                fontPreviewBox.style.background = bubbleBg || (editingStyleProfile === 'light' ? '#ffffff' : '#1a1a1a');
-                fontPreviewBox.style.borderColor = editingStyleProfile === 'light' ? '#d1d5db' : '#555';
-            }
-            if (fontPreviewText) {
-                fontPreviewText.style.fontSize = customStyleValues.fontSize || '16px';
-                fontPreviewText.style.fontFamily = customStyleValues.fontFamily || 'inherit';
-                fontPreviewText.style.fontWeight = customStyleValues.bodyFontWeight || 'normal';
-                fontPreviewText.style.fontStyle = customStyleValues.bodyFontStyle || 'normal';
-                fontPreviewText.style.textDecoration = customStyleValues.bodyTextDecoration || 'none';
-                fontPreviewText.style.color = r.bodyColor || '#fff';
-            }
-            if (previewTextQuote) {
-                previewTextQuote.style.color = r.spanQuoteColor || '#fff';
-                previewTextQuote.style.fontWeight = customStyleValues.spanQuoteFontWeight || 'normal';
-                previewTextQuote.style.fontStyle = customStyleValues.spanQuoteFontStyle || 'normal';
-                previewTextQuote.style.textDecoration = customStyleValues.spanQuoteTextDecoration || 'none';
-            }
-            if (previewTextNarration) {
-                previewTextNarration.style.color = r.narrationColor || '#06B7DB';
-                previewTextNarration.style.fontFamily = customStyleValues.fontFamily || 'inherit';
-                previewTextNarration.style.fontWeight = customStyleValues.narrationFontWeight || 'normal';
-                previewTextNarration.style.fontStyle = customStyleValues.narrationFontStyle || 'italic';
-                previewTextNarration.style.textDecoration = customStyleValues.narrationTextDecoration || 'none';
-            }
-            if (previewTextHighlight) {
-                previewTextHighlight.style.backgroundColor = c.highlightBgColor || '#ffdd6d';
-                previewTextHighlight.style.color = c.highlightTextColor || '#000';
-                previewTextHighlight.style.fontWeight = customStyleValues.highlightFontWeight || 'normal';
-                previewTextHighlight.style.fontStyle = customStyleValues.highlightFontStyle || 'normal';
-                previewTextHighlight.style.textDecoration = customStyleValues.highlightTextDecoration || 'none';
-            }
+        // ---- Style tab: individual color overrides (Light + Dark each) ----
+        // Empty = SpicyChat's own color. Values are read back on Save & Refresh.
+        const styleBotBgLightInput  = shadow.querySelector('#style-bot-bg-light');
+        const styleBotBgDarkInput   = shadow.querySelector('#style-bot-bg-dark');
+        const styleUserBgLightInput = shadow.querySelector('#style-user-bg-light');
+        const styleUserBgDarkInput  = shadow.querySelector('#style-user-bg-dark');
+        const styleHoverLightInput  = shadow.querySelector('#style-hover-light');
+        const styleHoverDarkInput   = shadow.querySelector('#style-hover-dark');
+        const bindStyleColorInput = (input, value) => {
+            if (!input) return;
+            input.value = value || '';
+            const swatch = shadow.querySelector(`#${input.id}-preview`);
+            const paint = () => { if (swatch) swatch.style.background = input.value.trim() || 'transparent'; };
+            paint();
+            input.oninput = paint;
         };
+        bindStyleColorInput(styleBotBgLightInput,  styleOverrides.botMessageBg.light);
+        bindStyleColorInput(styleBotBgDarkInput,   styleOverrides.botMessageBg.dark);
+        bindStyleColorInput(styleUserBgLightInput, styleOverrides.userMessageBg.light);
+        bindStyleColorInput(styleUserBgDarkInput,  styleOverrides.userMessageBg.dark);
+        bindStyleColorInput(styleHoverLightInput,  styleOverrides.buttonHover.light);
+        bindStyleColorInput(styleHoverDarkInput,   styleOverrides.buttonHover.dark);
 
-        // Populates every color input/swatch (and both switches' active
-        // state) from customStyleValues[editingStyleProfile][editingStyleRole]
-        // (Body/Dialogue/Narration) or customStyleValues[editingStyleProfile]
-        // directly (everything else). Called on initial load, whenever
-        // either switch is toggled, and after import/reset.
-        const applyStyleProfileToFields = () => {
-            const c = customStyleValues[editingStyleProfile];
-            const r = c[editingStyleRole];
-            if (themeSwitchLightBtn) themeSwitchLightBtn.classList.toggle('active', editingStyleProfile === 'light');
-            if (themeSwitchDarkBtn) themeSwitchDarkBtn.classList.toggle('active', editingStyleProfile === 'dark');
-            if (roleSwitchBotBtn) roleSwitchBotBtn.classList.toggle('active', editingStyleRole === 'bot');
-            if (roleSwitchUserBtn) roleSwitchUserBtn.classList.toggle('active', editingStyleRole === 'user');
-            if (botMessageBgRow) botMessageBgRow.classList.toggle('hidden', editingStyleRole !== 'bot');
-            if (userMessageBgRow) userMessageBgRow.classList.toggle('hidden', editingStyleRole !== 'user');
-
-            customAiBgInput.value = c.aiMessageBg;
-            customUserBgInput.value = c.userMessageBg;
-            customBodyColorInput.value = r.bodyColor;
-            customSpanQuoteColorInput.value = r.spanQuoteColor;
-            customNarrationColorInput.value = r.narrationColor;
-            customHighlightBgColorInput.value = c.highlightBgColor;
-            customHighlightTextColorInput.value = c.highlightTextColor;
-            customHoverButtonColorInput.value = c.hoverButtonColor || '#292929';
-            customCreatorLinkColorInput.value = c.creatorLinkColor || '';
-
-            if (previewAiBg) previewAiBg.style.background = c.aiMessageBg || 'transparent';
-            if (previewUserBg) previewUserBg.style.background = c.userMessageBg || 'transparent';
-            if (previewBodyColor) previewBodyColor.style.background = r.bodyColor || 'transparent';
-            if (previewQuoteColor) previewQuoteColor.style.background = r.spanQuoteColor || 'transparent';
-            if (previewNarrationColor) previewNarrationColor.style.background = r.narrationColor || 'transparent';
-            if (previewHighlightBg) previewHighlightBg.style.background = c.highlightBgColor || 'transparent';
-            if (previewHighlightText) previewHighlightText.style.background = c.highlightTextColor || 'transparent';
-            if (previewHoverButton) previewHoverButton.style.background = c.hoverButtonColor || '#292929';
-            if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = c.creatorLinkColor || 'transparent';
-
-            updateFontPreview();
+        // "Custom Message Colors" checkbox: shows the fields and, when switched
+        // on, fills any that are still empty with the default colors. Switching
+        // it off keeps the values but stops applying them (after Save & Refresh).
+        const styleColorsEnabledCheckbox = shadow.querySelector('#style-colors-enabled');
+        const styleColorsFields = shadow.querySelector('#style-colors-fields');
+        const fillEmptyStyleColors = () => {
+            [[styleBotBgLightInput,  STYLE_COLOR_DEFAULTS.botMessageBg.light],
+             [styleBotBgDarkInput,   STYLE_COLOR_DEFAULTS.botMessageBg.dark],
+             [styleUserBgLightInput, STYLE_COLOR_DEFAULTS.userMessageBg.light],
+             [styleUserBgDarkInput,  STYLE_COLOR_DEFAULTS.userMessageBg.dark],
+             [styleHoverLightInput,  STYLE_COLOR_DEFAULTS.buttonHover.light],
+             [styleHoverDarkInput,   STYLE_COLOR_DEFAULTS.buttonHover.dark]].forEach(([input, def]) => {
+                if (input && !input.value.trim()) { input.value = def; if (input.oninput) input.oninput(); }
+            });
         };
-
-        if (previewMemoryDotColor) previewMemoryDotColor.style.background = memoryDotColor || '#ff3b3b';
-        applyStyleProfileToFields();
-
-        // Light/Dark switch — flips which profile the fields/previews below
-        // are bound to. Doesn't touch the other profile's stored values.
-        if (themeSwitchLightBtn) {
-            themeSwitchLightBtn.onclick = (e) => {
-                e.stopPropagation();
-                editingStyleProfile = 'light';
-                applyStyleProfileToFields();
-            };
-        }
-        if (themeSwitchDarkBtn) {
-            themeSwitchDarkBtn.onclick = (e) => {
-                e.stopPropagation();
-                editingStyleProfile = 'dark';
-                applyStyleProfileToFields();
-            };
-        }
-
-        // Bot/User switch — flips which role's Body/Dialogue/Narration
-        // colors the fields/previews below are bound to. Independent of the
-        // Light/Dark switch above; doesn't touch the other role's values.
-        if (roleSwitchBotBtn) {
-            roleSwitchBotBtn.onclick = (e) => {
-                e.stopPropagation();
-                editingStyleRole = 'bot';
-                applyStyleProfileToFields();
-            };
-        }
-        if (roleSwitchUserBtn) {
-            roleSwitchUserBtn.onclick = (e) => {
-                e.stopPropagation();
-                editingStyleRole = 'user';
-                applyStyleProfileToFields();
-            };
-        }
-
-        // Update custom style values when inputs change (with preview updates)
-        customAiBgInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].aiMessageBg = e.target.value;
-            if (previewAiBg) previewAiBg.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customUserBgInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].userMessageBg = e.target.value;
-            if (previewUserBg) previewUserBg.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customBodyColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile][editingStyleRole].bodyColor = e.target.value;
-            if (previewBodyColor) previewBodyColor.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customBodyFontWeightSelect.onchange = (e) => { customStyleValues.bodyFontWeight = e.target.value; updateFontPreview(); };
-        customBodyFontStyleSelect.onchange = (e) => { customStyleValues.bodyFontStyle = e.target.value; updateFontPreview(); };
-        customBodyTextDecorationSelect.onchange = (e) => { customStyleValues.bodyTextDecoration = e.target.value; updateFontPreview(); };
-        customSpanQuoteColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile][editingStyleRole].spanQuoteColor = e.target.value;
-            if (previewQuoteColor) previewQuoteColor.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customQuoteFontWeightSelect.onchange = (e) => { customStyleValues.spanQuoteFontWeight = e.target.value; updateFontPreview(); };
-        customQuoteFontStyleSelect.onchange = (e) => { customStyleValues.spanQuoteFontStyle = e.target.value; updateFontPreview(); };
-        customQuoteTextDecorationSelect.onchange = (e) => { customStyleValues.spanQuoteTextDecoration = e.target.value; updateFontPreview(); };
-        customNarrationColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile][editingStyleRole].narrationColor = e.target.value;
-            if (previewNarrationColor) previewNarrationColor.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customNarrationFontWeightSelect.onchange = (e) => { customStyleValues.narrationFontWeight = e.target.value; updateFontPreview(); };
-        customNarrationFontStyleSelect.onchange = (e) => { customStyleValues.narrationFontStyle = e.target.value; updateFontPreview(); };
-        customNarrationTextDecorationSelect.onchange = (e) => { customStyleValues.narrationTextDecoration = e.target.value; updateFontPreview(); };
-        customHighlightBgColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].highlightBgColor = e.target.value;
-            if (previewHighlightBg) previewHighlightBg.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customHighlightTextColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].highlightTextColor = e.target.value;
-            if (previewHighlightText) previewHighlightText.style.background = e.target.value || 'transparent';
-            updateFontPreview();
-        };
-        customHighlightFontWeightSelect.onchange = (e) => { customStyleValues.highlightFontWeight = e.target.value; updateFontPreview(); };
-        customHighlightFontStyleSelect.onchange = (e) => { customStyleValues.highlightFontStyle = e.target.value; updateFontPreview(); };
-        customHighlightTextDecorationSelect.onchange = (e) => { customStyleValues.highlightTextDecoration = e.target.value; updateFontPreview(); };
-        customFontSizeInput.oninput = (e) => { customStyleValues.fontSize = e.target.value; updateFontPreview(); };
-        customFontFamilyInput.oninput = (e) => { customStyleValues.fontFamily = e.target.value; updateFontPreview(); };
-        customHoverButtonColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].hoverButtonColor = e.target.value;
-            if (previewHoverButton) previewHoverButton.style.background = e.target.value || 'transparent';
-        };
-        customCreatorLinkColorInput.oninput = (e) => {
-            customStyleValues[editingStyleProfile].creatorLinkColor = e.target.value;
-            if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = e.target.value || 'transparent';
+        styleColorsEnabledCheckbox.checked = styleOverrides.enabled;
+        styleColorsFields.classList.toggle('hidden', !styleOverrides.enabled);
+        styleColorsEnabledCheckbox.onchange = (e) => {
+            styleColorsFields.classList.toggle('hidden', !e.target.checked);
+            if (e.target.checked) fillEmptyStyleColors();
         };
 
         // Memory dot color input handler
+        if (previewMemoryDotColor) previewMemoryDotColor.style.background = memoryDotColor || '#ff3b3b';
         memoryDotColorInput.oninput = (e) => {
             memoryDotColor = e.target.value;
             if (previewMemoryDotColor) previewMemoryDotColor.style.background = e.target.value || '#ff3b3b';
         };
-        
-        // Background image upload handler
-        customBackgroundImageInput.onchange = async (e) => {
+
+        // ---- Background image ----
+        const backgroundImageStatus = shadow.querySelector('#background-image-status');
+        const updateBackgroundImageStatus = () => {
+            if (backgroundImageStatus) {
+                backgroundImageStatus.textContent = styleOverrides.backgroundImage ? 'An image is set.' : 'No image set.';
+            }
+        };
+        updateBackgroundImageStatus();
+
+        backgroundImageInput.onchange = async (e) => {
             const file = e.target.files[0];
             if (!file) return;
-            
-            // Validate file is an image
             if (!file.type.startsWith('image/')) {
                 alert('Please select an image file');
-                customBackgroundImageInput.value = '';
+                backgroundImageInput.value = '';
                 return;
             }
-            
             // Convert to data URL for storage
             const reader = new FileReader();
             reader.onload = (event) => {
-                customStyleValues.backgroundImage = event.target.result;
-                debugLog('[Core] Background image loaded:', customStyleValues.backgroundImage.substring(0, 50) + '...');
+                styleOverrides.backgroundImage = event.target.result;
+                updateBackgroundImageStatus();
+                debugLog('[Core] Background image loaded:', styleOverrides.backgroundImage.substring(0, 50) + '...');
             };
             reader.onerror = () => {
                 alert('Error reading image file');
-                customBackgroundImageInput.value = '';
+                backgroundImageInput.value = '';
             };
             reader.readAsDataURL(file);
         };
-        
-        // Clear background image button
+
         clearBackgroundImageBtn.onclick = (e) => {
             e.stopPropagation();
-            customStyleValues.backgroundImage = '';
-            customBackgroundImageInput.value = '';
+            styleOverrides.backgroundImage = '';
+            backgroundImageInput.value = '';
+            updateBackgroundImageStatus();
             debugLog('[Core] Background image cleared');
         };
-        
-        const validateMaxWidth = (raw) => {
-            const validPattern = /^\d+(?:\.\d+)?(?:px|%|vw|rem|em|ch|vmin|vmax|cm|mm|in|pt|pc)$/i;
-            const numericOnly = /^\d+(?:\.\d+)?$/;
-            if (numericOnly.test(raw)) return { valid: true, normalized: `${raw}px` };
-            if (validPattern.test(raw)) return { valid: true, normalized: raw };
-            return { valid: false, normalized: raw };
-        };
 
-        const showMaxWidthUnitsHelp = () => {
-            messageContainerMaxWidthHelp.replaceChildren(parseHTMLToFragment(MESSAGE_MAX_WIDTH_HELP_HTML));
-            messageContainerMaxWidthHelp.style.display = 'block';
-            messageContainerMaxWidthHelp.style.color = '#374151';
-            messageContainerMaxWidthHelp.style.background = 'rgba(59, 130, 246, 0.06)';
-            messageContainerMaxWidthHelp.style.borderColor = 'rgba(59, 130, 246, 0.2)';
-        };
+        // ---- Legacy Custom Style: export to SpicyChat / clear ----
+        // Shown only while old Custom Style data still exists in storage.
+        // Once cleared, the section stays hidden for good.
+        const legacyCustomStyleSection = shadow.querySelector('#legacy-custom-style-section');
+        const exportCustomStyleUrlBtn  = shadow.querySelector('#export-custom-style-url-btn');
+        const clearCustomStyleDataBtn  = shadow.querySelector('#clear-custom-style-data-btn');
+        const customStyleUrlResult     = shadow.querySelector('#custom-style-url-result');
 
-        const showMaxWidthError = () => {
-            messageContainerMaxWidthHelp.textContent = 'Invalid value. Use a number with a supported unit (e.g. 800px, 90%, 50vw) or a plain number (treated as px).';
-            messageContainerMaxWidthHelp.style.display = 'block';
-            messageContainerMaxWidthHelp.style.color = '#ef4444';
-            messageContainerMaxWidthHelp.style.background = 'rgba(239, 68, 68, 0.06)';
-            messageContainerMaxWidthHelp.style.borderColor = 'rgba(239, 68, 68, 0.3)';
-        };
+        const legacyCustomStyle = await storage.getMultiple({ [CUSTOM_STYLE_KEY]: null, [CUSTOM_STYLE_VALUES_KEY]: null });
+        if (legacyCustomStyleSection && hasLegacyCustomStyleData(legacyCustomStyle[CUSTOM_STYLE_KEY], legacyCustomStyle[CUSTOM_STYLE_VALUES_KEY])) {
+            legacyCustomStyleSection.classList.remove('hidden');
+        }
 
-        const hideMaxWidthHelp = () => {
-            messageContainerMaxWidthHelp.style.display = 'none';
-        };
-
-        messageContainerMaxWidthInput.oninput = (e) => {
-            const raw = String(e.target.value || '').trim();
-
-            if (!raw) {
-                messageContainerMaxWidth = '';
-                e.target.style.borderColor = '';
-                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = '—';
-                if (messageContainerMaxWidthPreviewInner) messageContainerMaxWidthPreviewInner.style.width = '100%';
-                // Keep units help visible while focused
-                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
-                return;
-            }
-
-            const { valid, normalized } = validateMaxWidth(raw);
-            if (valid) {
-                messageContainerMaxWidth = normalized;
-                e.target.style.borderColor = '';
-                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = normalized;
-                if (messageContainerMaxWidthPreviewInner) {
-                    try { messageContainerMaxWidthPreviewInner.style.width = normalized; } catch (err) {}
+        if (exportCustomStyleUrlBtn) {
+            exportCustomStyleUrlBtn.onclick = async (e) => {
+                e.stopPropagation();
+                customStyleUrlResult.replaceChildren();
+                const result = buildSpicyChatStyleShareUrl(legacyCustomStyle[CUSTOM_STYLE_VALUES_KEY]);
+                if (!result) {
+                    customStyleUrlResult.textContent = 'Your Custom Style matches SpicyChat\'s defaults — there is nothing to export.';
+                    return;
                 }
-                // While typing in a focused input, show the units guide (not the error)
-                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
-            } else {
-                messageContainerMaxWidth = raw;
-                e.target.style.borderColor = '#ef4444';
-                // Don't surface the error mid-typing; keep showing units help while focused
-                if (document.activeElement === e.target) showMaxWidthUnitsHelp();
-            }
-        };
+                debugLog('[Core] Custom Style share URL generated:', result);
 
-        // Show units help when the input is focused.
-        messageContainerMaxWidthInput.addEventListener('focus', () => {
-            showMaxWidthUnitsHelp();
-        });
+                const field = document.createElement('input');
+                field.type = 'text';
+                field.readOnly = true;
+                field.className = 'style-input';
+                field.style.cssText = 'width: 100%; margin-top: 6px;';
+                field.value = result.url;
+                field.onclick = () => field.select();
 
-        // Normalize and validate on blur — appending "px" mid-typing causes
-        // values like "5px0" when the user types "50".
-        messageContainerMaxWidthInput.addEventListener('blur', () => {
-            const raw = String(messageContainerMaxWidthInput.value || '').trim();
-            if (!raw) {
-                messageContainerMaxWidthInput.style.borderColor = '';
-                hideMaxWidthHelp();
-                return;
-            }
-            const { valid, normalized } = validateMaxWidth(raw);
-            if (valid) {
-                if (messageContainerMaxWidthInput.value !== normalized) {
-                    messageContainerMaxWidthInput.value = normalized;
-                }
-                messageContainerMaxWidth = normalized;
-                messageContainerMaxWidthInput.style.borderColor = '';
-                hideMaxWidthHelp();
-                if (messageContainerMaxWidthPreviewValue) messageContainerMaxWidthPreviewValue.textContent = normalized;
-                if (messageContainerMaxWidthPreviewInner) {
-                    try { messageContainerMaxWidthPreviewInner.style.width = normalized; } catch (err) {}
-                }
-            } else {
-                showMaxWidthError();
-                messageContainerMaxWidthInput.style.borderColor = '#ef4444';
-            }
-        });
+                const open = document.createElement('a');
+                open.href = result.url;
+                open.target = '_blank';
+                open.rel = 'noopener';
+                open.textContent = 'Open in SpicyChat ↗';
+                open.style.cssText = 'display: inline-block; margin-top: 6px; color: #3b82f6; font-weight: 600;';
+
+                const note = document.createElement('div');
+                note.className = 'setting-desc';
+                note.style.cssText = 'margin-top: 6px; font-size: 11px;';
+                let copied = false;
+                try { await navigator.clipboard.writeText(result.url); copied = true; } catch (_) {}
+                note.textContent = (copied ? 'Link copied. ' : '') +
+                    'Open it, then tap Save in SpicyChat\'s style preview to add it to your saved styles.' +
+                    (result.notCarried.length ? ` Not supported by SpicyChat styles, so not included: ${result.notCarried.join(', ')}.` : '');
+
+                customStyleUrlResult.append(field, open, note);
+            };
+        }
+
+        if (clearCustomStyleDataBtn) {
+            clearCustomStyleDataBtn.onclick = async (e) => {
+                e.stopPropagation();
+                if (!confirm('Delete your old Custom Style data?\n\nThis can\'t be undone. Export it to SpicyChat first if you want to keep it.\n\n(Your Message BG, Button Hover, Background Image and Memory Indicator settings are not affected.)')) return;
+                await storage.remove([CUSTOM_STYLE_KEY, CUSTOM_STYLE_VALUES_KEY]);
+                legacyCustomStyleSection.classList.add('hidden');
+                showNotification('Custom Style data cleared');
+            };
+        }
 
         hideForYouCheckbox.onchange = (e) => {
             debugLog('[Core] HIDE FOR YOU CHECKBOX CHANGED');
@@ -13144,12 +9848,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[Core] Hide Creator:', hideCreatorEnabled);
         };
 
-        wysiwygCheckbox.onchange = (e) => {
-            debugLog('[Core] WYSIWYG CHECKBOX CHANGED');
-            wysiwygEnabled = e.target.checked;
-            debugLog('[Core] WYSIWYG Enabled:', wysiwygEnabled);
-        };
-        
         // Close modal function
         const closeModal = () => {
             syncProgressCallback = null;
@@ -13354,16 +10052,50 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // ---- shared Drive message helper ----
             // Retries once on "Receiving end does not exist" — Chrome MV3 SW may not be ready on first modal open.
             // Holds a keepalive port for each call so an interactive auth tab flow can't be suspended mid-flight.
-            const sendDriveMessage = (type, payload, _retries = 1) => {
+            //
+            // An EMPTY reply (undefined, no lastError) means the background page never answered:
+            // every Drive handler responds with an object. Orion on iOS unloads the background
+            // page when the app is backgrounded and does not always bring it back for the next
+            // message. The keepalive port + 500ms heartbeat held by this call keep nudging it,
+            // so wait and resend a few times before giving up with a message that says what
+            // is actually wrong (instead of a generic "Sync failed").
+            const BACKGROUND_WAKE_DELAYS_MS = [800, 1500, 2500];
+            const BACKGROUND_UNRESPONSIVE_MSG = isOrionOnIOS()
+                ? 'Orion has shut down the extension\'s background page, so Drive can\'t be reached. ' +
+                  'This is a bug in the Orion app. Force-quit Orion (swipe it away in the app switcher), open it again, then retry.'
+                : 'The extension\'s background page isn\'t responding, so Drive can\'t be reached. ' +
+                  'Turn the S.AI Toolkit extension off and on again in your browser\'s extension settings, then retry.';
+            const sendDriveMessage = (type, payload, _retries = 1, _wakeAttempt = 0) => {
                 acquireDriveKeepalive();
                 return new Promise((resolve, reject) => {
                     runtimeAPI.runtime.sendMessage({ type, ...payload }, (res) => {
                         const err = runtimeAPI.runtime.lastError;
                         if (err) {
-                            if (_retries > 0 && err.message && err.message.includes('Could not establish connection')) {
-                                setTimeout(() => sendDriveMessage(type, payload, _retries - 1).then(resolve).catch(reject), 300);
+                            const noReceiver = !!err.message && /Could not establish connection|Receiving end does not exist/i.test(err.message);
+                            if (_retries > 0 && noReceiver) {
+                                setTimeout(() => sendDriveMessage(type, payload, _retries - 1, _wakeAttempt).then(resolve).catch(reject), 300);
+                            } else if (noReceiver && _wakeAttempt < BACKGROUND_WAKE_DELAYS_MS.length) {
+                                // Chrome-style builds report a dead background this way (instead of an empty reply)
+                                debugLog('[Sync] No receiver for', type, '— background not responding, retry', _wakeAttempt + 1, 'of', BACKGROUND_WAKE_DELAYS_MS.length);
+                                setTimeout(() => sendDriveMessage(type, payload, 0, _wakeAttempt + 1).then(resolve).catch(reject),
+                                    BACKGROUND_WAKE_DELAYS_MS[_wakeAttempt]);
+                            } else if (noReceiver) {
+                                const e = new Error(BACKGROUND_UNRESPONSIVE_MSG);
+                                e.backgroundUnresponsive = true;
+                                reject(e);
                             } else {
                                 reject(new Error(err.message));
+                            }
+                        } else if (res === undefined) {
+                            if (_wakeAttempt < BACKGROUND_WAKE_DELAYS_MS.length) {
+                                debugLog('[Sync] Empty reply to', type, '— background not responding, retry', _wakeAttempt + 1, 'of', BACKGROUND_WAKE_DELAYS_MS.length);
+                                setTimeout(() => sendDriveMessage(type, payload, _retries, _wakeAttempt + 1).then(resolve).catch(reject),
+                                    BACKGROUND_WAKE_DELAYS_MS[_wakeAttempt]);
+                            } else {
+                                debugLog('[Sync] Background still not responding to', type, '— giving up');
+                                const e = new Error(BACKGROUND_UNRESPONSIVE_MSG);
+                                e.backgroundUnresponsive = true;
+                                reject(e);
                             }
                         } else {
                             resolve(res);
@@ -13389,9 +10121,48 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     driveDisconnectBtn.style.display = 'none';
                 }
                 const isConnected = !!(driveLastSync || driveFileId);
+                driveReconnectBtn.style.display = 'none';
                 driveBackupSection.style.display = isConnected ? '' : 'none';
-                if (isConnected) loadDriveBackupList();
+                if (!isConnected) return;
+
+                // Verify the Google sign-in in the background (not awaited: this
+                // is a network round-trip and must not delay wiring the buttons).
+                // Only load backups once auth is known-good — listing with a dead
+                // token would otherwise pop an unexpected sign-in sheet.
+                const localStatusText = driveSyncStatus.textContent;
+                sendDriveMessage('SAI_DRIVE_AUTH_STATUS').then((status) => {
+                    debugLog('[Sync] Auth status:', status);
+                    if (status && status.state === 'expired') {
+                        showDriveAuthExpired();
+                    } else {
+                        if (status && status.state === 'ok' && status.email &&
+                            driveSyncStatus.textContent === localStatusText) {
+                            driveSyncStatus.textContent = `${localStatusText} (${status.email})`;
+                        }
+                        loadDriveBackupList();
+                    }
+                }).catch((err) => {
+                    if (err && err.backgroundUnresponsive) {
+                        // Nothing Drive-related can work right now — say so once here
+                        // instead of also failing the backup list.
+                        driveSyncStatus.textContent = err.message;
+                        driveSyncStatus.style.color = '#dc2626';
+                        driveBackupSection.style.display = 'none';
+                    } else {
+                        loadDriveBackupList();
+                    }
+                });
             };
+
+            // Dead sign-in: say so plainly and offer the one-tap fix.
+            const showDriveAuthExpired = () => {
+                driveSyncStatus.textContent = 'Google sign-in expired — tap Reconnect Google.';
+                driveSyncStatus.style.color = '#dc2626';
+                driveReconnectBtn.style.display = '';
+                driveBackupSection.style.display = 'none';
+            };
+            const isAuthErrorMessage = (msg) =>
+                /sign-in has expired|sign in again|access was denied|AUTH_EXPIRED|sign-in required/i.test(msg || '');
 
             // ---- backup list renderer ----
             const loadDriveBackupList = async () => {
@@ -13436,14 +10207,49 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             restoreBtn.disabled = true;
                             restoreBtn.textContent = 'Restoring…';
                             try {
-                                const restoreRes = await sendDriveMessage('SAI_DRIVE_RESTORE_BACKUP', { fileId: backup.id });
-                                if (!restoreRes || !restoreRes.success) {
-                                    alert((restoreRes && restoreRes.error) || 'Restore failed.');
-                                    restoreBtn.disabled = false;
-                                    restoreBtn.textContent = 'Restore';
-                                    return;
+                                // Download HERE, not in the background page: a ~20 MB
+                                // fetch there freezes WebKit/iOS's event loop, and the
+                                // old path also pushed the whole file back through
+                                // sendResponse. Background only supplies a token.
+                                const downloadOnce = async (tokenRejected) => {
+                                    const target = await sendDriveMessage('SAI_DRIVE_BACKUP_TARGET', { tokenOnly: true, tokenRejected });
+                                    if (!target || !target.success) throw new Error((target && target.error) || 'Could not reach Google Drive.');
+                                    const t0 = Date.now();
+                                    const tick = setInterval(() => {
+                                        restoreBtn.textContent = `Downloading… ${Math.round((Date.now() - t0) / 1000)}s`;
+                                    }, 1000);
+                                    const ctrl = new AbortController();
+                                    const timeout = setTimeout(() => ctrl.abort(), 5 * 60 * 1000);
+                                    try {
+                                        const res = await fetch(
+                                            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(backup.id)}?alt=media`,
+                                            { headers: { Authorization: `Bearer ${target.token}` }, signal: ctrl.signal }
+                                        );
+                                        if (res.status === 401) return { authRejected: true };
+                                        if (!res.ok) throw new Error(`Drive backup download failed (HTTP ${res.status}).`);
+                                        const buffer = await res.arrayBuffer();
+                                        restoreBtn.textContent = `Parsing ${(buffer.byteLength / 1048576).toFixed(1)} MB…`;
+                                        const data = JSON.parse(new TextDecoder().decode(buffer));
+                                        debugLog('[Sync] Backup downloaded:', buffer.byteLength, 'bytes in', Date.now() - t0, 'ms');
+                                        return { data };
+                                    } catch (err) {
+                                        if (err.name === 'AbortError') throw new Error('Backup download timed out after 5 minutes — check your connection and try again.');
+                                        throw err;
+                                    } finally {
+                                        clearInterval(tick);
+                                        clearTimeout(timeout);
+                                    }
+                                };
+
+                                restoreBtn.textContent = 'Downloading…';
+                                let outcome = await downloadOnce(false);
+                                if (outcome.authRejected) outcome = await downloadOnce(true);
+                                if (outcome.authRejected) {
+                                    showDriveAuthExpired();
+                                    throw new Error('Google rejected the sign-in — tap Reconnect Google.');
                                 }
-                                await applyImportedData(restoreRes.data);
+                                restoreBtn.textContent = 'Applying…';
+                                await applyImportedData(outcome.data);
                             } catch (err) {
                                 alert(err.message || 'Restore failed.');
                                 restoreBtn.disabled = false;
@@ -13540,13 +10346,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 const updates = {};
                 if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
                 if (imported.sidebarMinWidth !== undefined) updates.sidebarMinWidth = imported.sidebarMinWidth;
-                if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
-                if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
-                if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
-                if (imported.customStyleValues !== undefined) updates.customStyleValues = JSON.stringify(normalizeCustomStyleValues(imported.customStyleValues));
-                if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
-                    updates.enableClassicLayout = imported.enableThemeCustomization;
-                    updates.enableClassicStyle = imported.enableThemeCustomization;
+                // Retired Custom Style data (enableCustomStyle/customStyleValues) in a backup
+                // is deliberately NOT restored. For a pre-1.3.1 backup, only the settings
+                // that survived (bubble BGs, button hover, background image) are derived
+                // from it, the same way the load-time migration does.
+                if (imported.styleOverrides !== undefined) {
+                    updates[STYLE_OVERRIDES_KEY] = JSON.stringify(normalizeStyleOverrides(imported.styleOverrides));
+                } else if (imported.customStyleValues !== undefined) {
+                    updates[STYLE_OVERRIDES_KEY] = JSON.stringify(deriveStyleOverridesFromLegacy(imported.enableCustomStyle === true, imported.customStyleValues));
                 }
                 if (imported.enableCompactGeneration !== undefined) updates.enableCompactGeneration = imported.enableCompactGeneration;
                 if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
@@ -13561,9 +10368,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (imported.showChatNameInTitle !== undefined) updates.showChatNameInTitle = imported.showChatNameInTitle;
                 if (imported.nsfwToggleEnabled !== undefined) updates.nsfwToggleEnabled = imported.nsfwToggleEnabled;
                 if (imported.messageRecoveryEnabled !== undefined) updates.messageRecoveryEnabled = imported.messageRecoveryEnabled;
-                if (imported.enableWysiwygEditor !== undefined) updates.enableWysiwygEditor = imported.enableWysiwygEditor;
                 if (imported.enableGenerationProfiles !== undefined) updates.enableGenerationProfiles = imported.enableGenerationProfiles;
-                if (imported.enableSmallProfileImages !== undefined) updates.enableSmallProfileImages = imported.enableSmallProfileImages;
                 if (imported.enableRoundedProfileImages !== undefined) updates.enableRoundedProfileImages = imported.enableRoundedProfileImages;
                 if (imported.swapCheckboxPosition !== undefined) updates.swapCheckboxPosition = imported.swapCheckboxPosition;
                 if (imported.squareMessageEdges !== undefined) updates.squareMessageEdges = imported.squareMessageEdges;
@@ -13571,7 +10376,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (imported.autoRegenOnMismatch !== undefined) updates.autoRegenOnMismatch = imported.autoRegenOnMismatch;
                 if (imported.autoRegenOnShort !== undefined) updates.autoRegenOnShort = imported.autoRegenOnShort;
                 if (imported.autoRegenMaxAttempts !== undefined) updates.autoRegenMaxAttempts = imported.autoRegenMaxAttempts;
-                if (imported.messageContainerMaxWidth !== undefined) updates[MESSAGE_CONTAINER_MAX_WIDTH_KEY] = imported.messageContainerMaxWidth;
                 if (imported.memoryDotEnabled !== undefined) updates[MEMORY_DOT_ENABLED_KEY] = imported.memoryDotEnabled;
                 if (imported.memoryDotColor !== undefined) updates[MEMORY_DOT_COLOR_KEY] = imported.memoryDotColor;
                 if (imported.hideCreatorName !== undefined) updates[HIDE_CREATOR_KEY] = imported.hideCreatorName;
@@ -13765,6 +10569,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 // sync-scoped keepalive is needed here.
                 let _alreadyRunning = false;
                 try {
+                    await flushHeldStats();   // sync reads the background store; deliver parked stats first
                     const result = await sendDriveMessage('SAI_DRIVE_SYNC', {
                         syncStats, syncSettings, syncStyle
                     });
@@ -13793,6 +10598,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         showSyncError(errMsg);
                         driveSyncStatus.textContent = errMsg;
                         driveSyncStatus.style.color = '#dc2626';
+                        if (isAuthErrorMessage(errMsg) || errMsg === 'auth_silent_fail') showDriveAuthExpired();
                         debugLog('[Sync] Sync failed with error:', errMsg);
                     }
                 } catch (err) {
@@ -13813,7 +10619,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 driveCreateBackupBtn.disabled = true;
                 driveCreateBackupBtn.textContent = 'Creating…';
                 driveBackupStatus.textContent = '';
+                const setBackupStatus = (text) => {
+                    driveBackupStatus.textContent = text;
+                    driveBackupStatus.style.color = '#9ca3af';
+                };
                 try {
+                    setBackupStatus('Reading settings…');
                     const rawStorage = await sendDriveMessage('getSettings');
                     const exportData = { ...rawStorage };
                     if (typeof exportData.generationProfiles === 'string') {
@@ -13823,6 +10634,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     // Pull the authoritative nested snapshot from the DB (getSettings only
                     // carries the frozen legacy blob, which would be stale/empty). If the DB
                     // read fails, ABORT the backup — never ship a silently empty-stats file.
+                    setBackupStatus('Reading stats database…');
+                    await flushHeldStats();   // include stats parked while the background was down
                     const statsRes = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
                     if (!statsRes || !statsRes.success) {
                         throw new Error('Could not read stats from the database — backup aborted to avoid an incomplete file.');
@@ -13839,15 +10652,77 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     delete exportData.driveSyncStyle;
                     delete exportData.driveAutoSync;
                     delete exportData.driveAutoSyncInterval;
-                    const result = await sendDriveMessage('SAI_DRIVE_CREATE_BACKUP', { exportData });
-                    if (result && result.success) {
-                        driveBackupStatus.textContent = 'Backup created.';
-                        driveBackupStatus.style.color = '#10b981';
-                        await loadDriveBackupList();
-                    } else {
-                        driveBackupStatus.textContent = (result && result.error) || 'Backup failed.';
-                        driveBackupStatus.style.color = '#dc2626';
+                    // Retired Custom Style data never goes into new backups
+                    delete exportData.enableCustomStyle;
+                    delete exportData.customStyleValues;
+                    delete exportData.styleOverridesMigration;   // per-device migration marker
+                    delete exportData.pendingStatsRecords;   // internal holding list, already flushed above
+
+                    // Upload from HERE, not the background page. A ~20 MB body sent
+                    // from the WebKit/iOS background page freezes its event loop
+                    // (the same reason sync's writeDriveFile delegates to us) - that
+                    // was the silent "Creating…" hang. The background only hands
+                    // us a token + folder; the 20 MB never crosses runtime messaging.
+                    setBackupStatus('Preparing upload…');
+                    const body = JSON.stringify(exportData);
+                    const sizeMB = (body.length / 1048576).toFixed(1);
+
+                    const uploadOnce = async (tokenRejected) => {
+                        const target = await sendDriveMessage('SAI_DRIVE_BACKUP_TARGET', { tokenRejected });
+                        if (!target || !target.success) throw new Error((target && target.error) || 'Could not reach Google Drive.');
+                        const boundary = 'sai_toolkit_backup_boundary';
+                        const metadata = JSON.stringify({ name: target.fileName, mimeType: 'application/json', parents: [target.folderId] });
+                        const multipart = [
+                            `--${boundary}`, 'Content-Type: application/json; charset=UTF-8', '', metadata,
+                            `--${boundary}`, 'Content-Type: application/json', '', body,
+                            `--${boundary}--`
+                        ].join('\r\n');
+
+                        // Visible progress: fetch() has no upload progress events,
+                        // so show elapsed time so it never looks frozen.
+                        const t0 = Date.now();
+                        const tick = setInterval(() => {
+                            setBackupStatus(`Uploading ${sizeMB} MB… ${Math.round((Date.now() - t0) / 1000)}s`);
+                        }, 1000);
+                        setBackupStatus(`Uploading ${sizeMB} MB…`);
+                        const ctrl = new AbortController();
+                        const timeout = setTimeout(() => ctrl.abort(), 5 * 60 * 1000);
+                        try {
+                            const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name', {
+                                method: 'POST',
+                                headers: { Authorization: `Bearer ${target.token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+                                body: multipart,
+                                signal: ctrl.signal,
+                            });
+                            if (res.status === 401) return { authRejected: true };
+                            if (!res.ok) throw new Error(`Drive backup upload failed (HTTP ${res.status}).`);
+                            const created = await res.json().catch(() => ({}));
+                            debugLog('[Sync] Backup created:', created.name, '→', created.id, 'in', Date.now() - t0, 'ms');
+                            return { created };
+                        } catch (err) {
+                            if (err.name === 'AbortError') throw new Error('Backup upload timed out after 5 minutes — check your connection and try again.');
+                            throw err;
+                        } finally {
+                            clearInterval(tick);
+                            clearTimeout(timeout);
+                        }
+                    };
+
+                    let outcome = await uploadOnce(false);
+                    if (outcome.authRejected) {
+                        // Token died between issue and use - have the background
+                        // drop it and mint/prompt for a fresh one, then retry once.
+                        setBackupStatus('Refreshing Google sign-in…');
+                        outcome = await uploadOnce(true);
                     }
+                    if (outcome.authRejected) {
+                        showDriveAuthExpired();
+                        throw new Error('Google rejected the sign-in — tap Reconnect Google.');
+                    }
+
+                    driveBackupStatus.textContent = 'Backup created.';
+                    driveBackupStatus.style.color = '#10b981';
+                    await loadDriveBackupList();
                 } catch (err) {
                     driveBackupStatus.textContent = err.message || 'Backup failed.';
                     driveBackupStatus.style.color = '#dc2626';
@@ -13866,8 +10741,36 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             };
 
+            driveReconnectBtn.onclick = async (e) => {
+                e.stopPropagation();
+                driveReconnectBtn.disabled = true;
+                driveReconnectBtn.textContent = 'Opening Google…';
+                driveSyncStatus.textContent = 'Waiting for Google sign-in…';
+                driveSyncStatus.style.color = '#9ca3af';
+                try {
+                    const res = await sendDriveMessage('SAI_DRIVE_RECONNECT');
+                    if (res && res.success) {
+                        await updateDriveStatus();
+                        driveSyncStatus.textContent = `Reconnected${res.email ? ` as ${res.email}` : ''}. Tap Sync Now to catch up.`;
+                        driveSyncStatus.style.color = '#10b981';
+                    } else {
+                        driveSyncStatus.textContent = (res && res.error) || 'Reconnect failed — please try again.';
+                        driveSyncStatus.style.color = '#dc2626';
+                        driveReconnectBtn.style.display = '';
+                    }
+                } catch (err) {
+                    driveSyncStatus.textContent = err.message || 'Reconnect failed — please try again.';
+                    driveSyncStatus.style.color = '#dc2626';
+                    driveReconnectBtn.style.display = '';
+                }
+                driveReconnectBtn.disabled = false;
+                driveReconnectBtn.textContent = 'Reconnect Google';
+            };
+
             driveDisconnectBtn.onclick = async (e) => {
                 e.stopPropagation();
+                // Revoke at Google first (needs the tokens we're about to delete).
+                try { await sendDriveMessage('SAI_DRIVE_REVOKE'); } catch (_) {}
                 await storage.remove(['driveAccessToken', 'driveRefreshToken', 'driveTokenExpiry', 'driveFileId', 'driveLastSync', 'driveBackupFolderId']);
                 driveBackupFolderUrl = null;
                 // Disable auto-sync and clear the alarm
@@ -13893,9 +10796,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Read current checkbox states
             sidebarEnabled = sidebarCheckbox.checked;
             compactGenerationEnabled = compactGenerationCheckbox.checked;
-            classicLayoutEnabled = classicLayoutCheckbox.checked;
-            classicStyleEnabled = classicStyleCheckbox.checked;
-            customStyleEnabled = customStyleCheckbox.checked;
             hideForYouEnabled = hideForYouCheckbox.checked;
             pageJumpEnabled = pageJumpCheckbox.checked;
             showStatsEnabled = showStatsCheckbox.checked;
@@ -13913,27 +10813,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             nsfwToggleEnabled = nsfwToggleCheckbox.checked;
             messageRecoveryEnabled = messageRecoveryCheckbox.checked;
             hideCreatorEnabled = hideCreatorCheckbox.checked;
-            smallProfileImagesEnabled = smallProfileImagesCheckbox.checked;
             roundedProfileImagesEnabled = roundedProfileImagesCheckbox.checked;
             swapCheckboxPositionEnabled = swapCheckboxPositionCheckbox.checked;
             squareMessageEdgesEnabled = squareMessageEdgesCheckbox.checked;
-            wysiwygEnabled = wysiwygCheckbox.checked;
             enableGenerationProfilesEnabled = enableGenerationProfilesCheckbox.checked;
-            // Normalize message container max width on save as well
-            let finalMessageMax = String(messageContainerMaxWidthInput.value || '').trim();
-            if (/^\d+(?:\.\d+)?$/.test(finalMessageMax)) finalMessageMax = `${finalMessageMax}px`;
-            messageContainerMaxWidth = finalMessageMax;
+            // Style-tab colors: empty input = use SpicyChat's own color.
+            // (backgroundImage is updated in place by its file picker / Clear button.)
+            styleOverrides.botMessageBg = { light: styleBotBgLightInput.value.trim(), dark: styleBotBgDarkInput.value.trim() };
+            styleOverrides.userMessageBg = { light: styleUserBgLightInput.value.trim(), dark: styleUserBgDarkInput.value.trim() };
+            styleOverrides.buttonHover = { light: styleHoverLightInput.value.trim(), dark: styleHoverDarkInput.value.trim() };
+            styleOverrides.enabled = styleColorsEnabledCheckbox.checked;
             memoryDotEnabled = memoryDotEnabledCheckbox.checked;
             memoryDotColor = memoryDotColorInput.value.trim() || '#ff3b3b';
             
-            debugLog('[Core] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'ClassicLayout:', classicLayoutEnabled, 'ClassicStyle:', classicStyleEnabled, 'CustomStyle:', customStyleEnabled, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MessageMaxWidth:', messageContainerMaxWidth, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
+            debugLog('[Core] Saving - Sidebar:', sidebarEnabled, 'SidebarMinWidth:', finalMinWidth, 'CompactGeneration:', compactGenerationEnabled, 'StyleOverrides:', styleOverrides, 'HideForYou:', hideForYouEnabled, 'PageJump:', pageJumpEnabled, 'ShowStats:', showStatsEnabled, 'ShowModelDetails:', showModelDetailsEnabled, 'ShowTimestamp:', showTimestampEnabled, 'TimestampFormat:', timestampDateFirst ? 'date@time' : 'time@date', 'ShowChatNameInTitle:', showChatNameInTitleEnabled, 'MemoryDot:', memoryDotEnabled, 'MemoryDotColor:', memoryDotColor);
             await storage.set(SIDEBAR_LAYOUT_KEY, sidebarEnabled);
             await storage.set(SIDEBAR_MIN_WIDTH_KEY, finalMinWidth);
             await storage.set(COMPACT_GENERATION_KEY, compactGenerationEnabled);
-            await storage.set(CLASSIC_LAYOUT_KEY, classicLayoutEnabled);
-            await storage.set(CLASSIC_STYLE_KEY, classicStyleEnabled);
-            await storage.set(CUSTOM_STYLE_KEY, customStyleEnabled);
-            await storage.set(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(customStyleValues));
+            await storage.set(STYLE_OVERRIDES_KEY, JSON.stringify(styleOverrides));
             await storage.set(HIDE_FOR_YOU_KEY, hideForYouEnabled);
             await storage.set(PAGE_JUMP_KEY, pageJumpEnabled);
             await storage.set('showGenerationStats', showStatsEnabled);
@@ -13951,13 +10848,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set('nsfwToggleEnabled', nsfwToggleEnabled);
             await storage.set('messageRecoveryEnabled', messageRecoveryEnabled);
             await storage.set(HIDE_CREATOR_KEY, hideCreatorEnabled);
-            await storage.set(SMALL_PROFILE_IMAGES_KEY, smallProfileImagesEnabled);
             await storage.set(ROUNDED_PROFILE_IMAGES_KEY, roundedProfileImagesEnabled);
             await storage.set(SWAP_CHECKBOX_POSITION_KEY, swapCheckboxPositionEnabled);
             await storage.set(SQUARE_MESSAGE_EDGES_KEY, squareMessageEdgesEnabled);
-            await storage.set(WYSIWYG_EDITOR_KEY, wysiwygEnabled);
             await storage.set(ENABLE_GENERATION_PROFILES_KEY, enableGenerationProfilesEnabled);
-            await storage.set(MESSAGE_CONTAINER_MAX_WIDTH_KEY, messageContainerMaxWidth);
             await storage.set(MEMORY_DOT_ENABLED_KEY, memoryDotEnabled);
             await storage.set(MEMORY_DOT_COLOR_KEY, memoryDotColor);
             // Debug log filters — Save-time fallback. The per-checkbox change/click handlers are
@@ -14059,155 +10953,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             };
         }
         
-        // Export Custom Style button
-        if (exportCustomStyleBtn) {
-            exportCustomStyleBtn.onclick = async (e) => {
-                e.stopPropagation();
-                try {
-                    const customStyleValuesJson = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-                    const customStyleValues = normalizeCustomStyleValues(customStyleValuesJson);
-                    const dataStr = JSON.stringify(customStyleValues, null, 2);
-                    const dataBlob = new Blob([dataStr], { type: 'application/json' });
-                    const url = URL.createObjectURL(dataBlob);
-                    const link = document.createElement('a');
-                    link.href = url;
-                    link.download = 'spicychat-custom-style.json';
-                    link.click();
-                    URL.revokeObjectURL(url);
-                    showNotification('Custom Style exported');
-                } catch (error) {
-                    console.error('[Core] Error exporting custom style:', error);
-                    alert('Error exporting custom style: ' + error.message);
-                }
-            };
-        }
-        
-        // Import Custom Style button
-        if (importCustomStyleBtn) {
-            importCustomStyleBtn.onclick = async (e) => {
-                e.stopPropagation();
-                const input = document.createElement('input');
-                input.type = 'file';
-                input.accept = '.json';
-                input.addEventListener('change', async function(e) {
-                    const file = e.target.files[0];
-                    if (file) {
-                        const reader = new FileReader();
-                        reader.onload = async function(event) {
-                            try {
-                                const imported = JSON.parse(event.target.result);
-                                // Legacy schema migration: old single fontWeight/fontStyle/textDecoration
-                                // applied to all four categories. Spread legacy values across the new
-                                // per-category keys only when the new key is absent from the import.
-                                if (imported.fontWeight !== undefined) {
-                                    if (imported.bodyFontWeight === undefined) imported.bodyFontWeight = imported.fontWeight;
-                                    if (imported.spanQuoteFontWeight === undefined) imported.spanQuoteFontWeight = imported.fontWeight;
-                                    if (imported.narrationFontWeight === undefined) imported.narrationFontWeight = imported.fontWeight;
-                                    if (imported.highlightFontWeight === undefined) imported.highlightFontWeight = imported.fontWeight;
-                                }
-                                if (imported.fontStyle !== undefined) {
-                                    if (imported.bodyFontStyle === undefined) imported.bodyFontStyle = imported.fontStyle;
-                                    if (imported.spanQuoteFontStyle === undefined) imported.spanQuoteFontStyle = imported.fontStyle;
-                                    if (imported.narrationFontStyle === undefined) imported.narrationFontStyle = imported.fontStyle;
-                                    if (imported.highlightFontStyle === undefined) imported.highlightFontStyle = imported.fontStyle;
-                                }
-                                if (imported.textDecoration !== undefined) {
-                                    if (imported.bodyTextDecoration === undefined) imported.bodyTextDecoration = imported.textDecoration;
-                                    if (imported.spanQuoteTextDecoration === undefined) imported.spanQuoteTextDecoration = imported.textDecoration;
-                                    if (imported.narrationTextDecoration === undefined) imported.narrationTextDecoration = imported.textDecoration;
-                                    if (imported.highlightTextDecoration === undefined) imported.highlightTextDecoration = imported.textDecoration;
-                                }
-                                // Drop the legacy keys so they don't pollute the merged object
-                                delete imported.fontWeight;
-                                delete imported.fontStyle;
-                                delete imported.textDecoration;
-                                // Also drop other obsolete keys observed in old saves
-                                delete imported.textColor;
-                                delete imported.italicColor;
-                                delete imported.quoteColor;
-
-                                // normalizeCustomStyleValues() handles both the legacy flat
-                                // shape (pre-dual-theme exports) and the current
-                                // { light, dark, ...shared } shape, filling any gaps from
-                                // defaults — so an old export still imports cleanly.
-                                const mergedValues = normalizeCustomStyleValues(imported);
-                                // Update the in-memory values
-                                Object.assign(customStyleValues, mergedValues);
-
-                                // Font family/size (shared, not theme-split)
-                                customFontSizeInput.value = customStyleValues.fontSize;
-                                customFontFamilyInput.value = customStyleValues.fontFamily || '';
-
-                                // Body/quote/narration/highlight typography (shared)
-                                customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
-                                customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
-                                customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
-                                customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
-                                customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
-                                customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
-                                customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
-                                customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
-                                customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
-                                customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
-                                customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
-                                customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
-
-                                // Reset background image file picker (actual data lives in customStyleValues.backgroundImage)
-                                if (customBackgroundImageInput) customBackgroundImageInput.value = '';
-
-                                // Colors, swatches, and font preview for the currently-viewed profile
-                                applyStyleProfileToFields();
-
-                                showNotification('Custom Style imported - click Save to apply');
-                            } catch (err) {
-                                alert('Error importing custom style: ' + err.message);
-                            }
-                        };
-                        reader.readAsText(file);
-                    }
-                });
-                input.click();
-            };
-        }
-
-        // Reset Custom Style to Defaults button — resets only the profile
-        // currently being viewed (plus the shared typography fields); the
-        // other profile's colors are left untouched.
-        if (resetCustomStyleBtn) {
-            resetCustomStyleBtn.onclick = async (e) => {
-                e.stopPropagation();
-
-                customStyleValues[editingStyleProfile] = {
-                    ...DEFAULT_CUSTOM_STYLE[editingStyleProfile],
-                    bot: { ...DEFAULT_CUSTOM_STYLE[editingStyleProfile].bot },
-                    user: { ...DEFAULT_CUSTOM_STYLE[editingStyleProfile].user }
-                };
-                Object.keys(DEFAULT_CUSTOM_STYLE).forEach((key) => {
-                    if (key !== 'light' && key !== 'dark') customStyleValues[key] = DEFAULT_CUSTOM_STYLE[key];
-                });
-
-                customFontSizeInput.value = DEFAULT_CUSTOM_STYLE.fontSize;
-                customFontFamilyInput.value = DEFAULT_CUSTOM_STYLE.fontFamily;
-                customBodyFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontWeight;
-                customBodyFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontStyle;
-                customBodyTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.bodyTextDecoration;
-                customQuoteFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontWeight;
-                customQuoteFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontStyle;
-                customQuoteTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteTextDecoration;
-                customNarrationFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontWeight;
-                customNarrationFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontStyle;
-                customNarrationTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.narrationTextDecoration;
-                customHighlightFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontWeight;
-                customHighlightFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontStyle;
-                customHighlightTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.highlightTextDecoration;
-                customBackgroundImageInput.value = '';
-
-                applyStyleProfileToFields();
-
-                showNotification(`Custom Style (${editingStyleProfile}) reset to defaults - click Save to apply`);
-            };
-        }
-
         // Export All Data button
         debugLog('[Core] Attaching exportAllBtn onclick handler...');
         debugLog('[Core] exportAllBtn element:', exportAllBtn);
@@ -14229,10 +10974,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     const exportData = await storage.getMultiple({
                         [SIDEBAR_LAYOUT_KEY]: false,
                         [SIDEBAR_MIN_WIDTH_KEY]: DEFAULT_SIDEBAR_MIN_WIDTH,
-                        [CLASSIC_LAYOUT_KEY]: false,
-                        [CLASSIC_STYLE_KEY]: false,
-                        [CUSTOM_STYLE_KEY]: false,
-                        [CUSTOM_STYLE_VALUES_KEY]: JSON.stringify(DEFAULT_CUSTOM_STYLE),
+                        [STYLE_OVERRIDES_KEY]: JSON.stringify(EMPTY_STYLE_OVERRIDES),
                         [COMPACT_GENERATION_KEY]: false,
                         [HIDE_FOR_YOU_KEY]: false,
                         [PAGE_JUMP_KEY]: false,
@@ -14250,13 +10992,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         'showChatNameInTitle': false,
                         'nsfwToggleEnabled': false,
                         'messageRecoveryEnabled': false,
-                        [WYSIWYG_EDITOR_KEY]: false,
                         [ENABLE_GENERATION_PROFILES_KEY]: false,
-                        [SMALL_PROFILE_IMAGES_KEY]: false,
                         [ROUNDED_PROFILE_IMAGES_KEY]: false,
                         [SWAP_CHECKBOX_POSITION_KEY]: false,
                         [SQUARE_MESSAGE_EDGES_KEY]: false,
-                        [MESSAGE_CONTAINER_MAX_WIDTH_KEY]: '',
                         [MEMORY_DOT_ENABLED_KEY]: true,
                         [MEMORY_DOT_COLOR_KEY]: '#ff3b3b',
                         [HIDE_CREATOR_KEY]: false,
@@ -14273,6 +11012,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     // Stats live in the background IndexedDB store now — pull the nested snapshot
                     // from the DB (storage.local only holds the frozen legacy blob post-migration).
                     // If the DB read fails, ABORT the export — never write a silently empty-stats file.
+                    await flushHeldStats();   // include stats parked while the background was down
                     const statsRes = await sendStatsMessage('SAI_STATS_EXPORT_ALL');
                     if (!statsRes || !statsRes.success) {
                         throw new Error('Could not read stats from the database — export aborted to avoid an incomplete file.');
@@ -14283,10 +11023,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     const allData = {
                         enableSidebarLayout: exportData[SIDEBAR_LAYOUT_KEY],
                         sidebarMinWidth: exportData[SIDEBAR_MIN_WIDTH_KEY],
-                        enableClassicLayout: exportData[CLASSIC_LAYOUT_KEY],
-                        enableClassicStyle: exportData[CLASSIC_STYLE_KEY],
-                        enableCustomStyle: exportData[CUSTOM_STYLE_KEY],
-                        customStyleValues: exportData[CUSTOM_STYLE_VALUES_KEY],
+                        // (Retired Custom Style data is intentionally not exported.)
+                        styleOverrides: normalizeStyleOverrides(exportData[STYLE_OVERRIDES_KEY]),
                         enableCompactGeneration: exportData[COMPACT_GENERATION_KEY],
                         enableHideForYou: exportData[HIDE_FOR_YOU_KEY],
                         enablePageJump: exportData[PAGE_JUMP_KEY],
@@ -14300,9 +11038,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         showChatNameInTitle: exportData['showChatNameInTitle'],
                         nsfwToggleEnabled: exportData['nsfwToggleEnabled'],
                         messageRecoveryEnabled: exportData['messageRecoveryEnabled'],
-                        enableWysiwygEditor: exportData[WYSIWYG_EDITOR_KEY],
                         enableGenerationProfiles: exportData[ENABLE_GENERATION_PROFILES_KEY],
-                        enableSmallProfileImages: exportData[SMALL_PROFILE_IMAGES_KEY],
                         enableRoundedProfileImages: exportData[ROUNDED_PROFILE_IMAGES_KEY],
                         swapCheckboxPosition: exportData[SWAP_CHECKBOX_POSITION_KEY],
                         squareMessageEdges: exportData[SQUARE_MESSAGE_EDGES_KEY],
@@ -14310,7 +11046,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         autoRegenOnMismatch: exportData['autoRegenOnMismatch'],
                         autoRegenOnShort: exportData['autoRegenOnShort'],
                         autoRegenMaxAttempts: exportData['autoRegenMaxAttempts'],
-                        messageContainerMaxWidth: exportData[MESSAGE_CONTAINER_MAX_WIDTH_KEY],
                         memoryDotEnabled: exportData[MEMORY_DOT_ENABLED_KEY],
                         memoryDotColor: exportData[MEMORY_DOT_COLOR_KEY],
                         hideCreatorName: exportData[HIDE_CREATOR_KEY],
@@ -14452,14 +11187,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         const updates = {};
                         if (imported.enableSidebarLayout !== undefined) updates.enableSidebarLayout = imported.enableSidebarLayout;
                         if (imported.sidebarMinWidth !== undefined) updates.sidebarMinWidth = imported.sidebarMinWidth;
-                        if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
-                        if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
-                        if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
-                        if (imported.customStyleValues !== undefined) updates.customStyleValues = JSON.stringify(normalizeCustomStyleValues(imported.customStyleValues));
-                        // Support legacy key for backwards compatibility
-                        if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
-                            updates.enableClassicLayout = imported.enableThemeCustomization;
-                            updates.enableClassicStyle = imported.enableThemeCustomization;
+                        // Retired Custom Style data (enableCustomStyle/customStyleValues) in a backup
+                        // is deliberately NOT restored. For a pre-1.3.1 backup, only the settings
+                        // that survived (bubble BGs, button hover, background image) are derived
+                        // from it, the same way the load-time migration does.
+                        if (imported.styleOverrides !== undefined) {
+                            updates[STYLE_OVERRIDES_KEY] = JSON.stringify(normalizeStyleOverrides(imported.styleOverrides));
+                        } else if (imported.customStyleValues !== undefined) {
+                            updates[STYLE_OVERRIDES_KEY] = JSON.stringify(deriveStyleOverridesFromLegacy(imported.enableCustomStyle === true, imported.customStyleValues));
                         }
                         if (imported.enableCompactGeneration !== undefined) updates.enableCompactGeneration = imported.enableCompactGeneration;
                         if (imported.enableHideForYou !== undefined) updates.enableHideForYou = imported.enableHideForYou;
@@ -14474,9 +11209,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.showChatNameInTitle !== undefined) updates.showChatNameInTitle = imported.showChatNameInTitle;
                         if (imported.nsfwToggleEnabled !== undefined) updates.nsfwToggleEnabled = imported.nsfwToggleEnabled;
                         if (imported.messageRecoveryEnabled !== undefined) updates.messageRecoveryEnabled = imported.messageRecoveryEnabled;
-                        if (imported.enableWysiwygEditor !== undefined) updates.enableWysiwygEditor = imported.enableWysiwygEditor;
                         if (imported.enableGenerationProfiles !== undefined) updates.enableGenerationProfiles = imported.enableGenerationProfiles;
-                        if (imported.enableSmallProfileImages !== undefined) updates.enableSmallProfileImages = imported.enableSmallProfileImages;
                         if (imported.enableRoundedProfileImages !== undefined) updates.enableRoundedProfileImages = imported.enableRoundedProfileImages;
                         if (imported.swapCheckboxPosition !== undefined) updates.swapCheckboxPosition = imported.swapCheckboxPosition;
                         if (imported.squareMessageEdges !== undefined) updates.squareMessageEdges = imported.squareMessageEdges;
@@ -14484,7 +11217,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.autoRegenOnMismatch !== undefined) updates.autoRegenOnMismatch = imported.autoRegenOnMismatch;
                         if (imported.autoRegenOnShort !== undefined) updates.autoRegenOnShort = imported.autoRegenOnShort;
                         if (imported.autoRegenMaxAttempts !== undefined) updates.autoRegenMaxAttempts = imported.autoRegenMaxAttempts;
-                        if (imported.messageContainerMaxWidth !== undefined) updates[MESSAGE_CONTAINER_MAX_WIDTH_KEY] = imported.messageContainerMaxWidth;
                         if (imported.memoryDotEnabled !== undefined) updates[MEMORY_DOT_ENABLED_KEY] = imported.memoryDotEnabled;
                         if (imported.memoryDotColor !== undefined) updates[MEMORY_DOT_COLOR_KEY] = imported.memoryDotColor;
                         if (imported.hideCreatorName !== undefined) updates[HIDE_CREATOR_KEY] = imported.hideCreatorName;
@@ -14557,11 +11289,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         debugLog('[Core] ===== MODAL SETUP COMPLETE =====');
     }
 
-    // (Removed the diagnostic global `error` / `unhandledrejection` logger that was added
-    // during the WYSIWYG iOS crash investigation. It logged a verbose "GLOBAL ERROR
-    // DETECTED" block for every error, including opaque cross-origin "Script error."
-    // events from the host page — pure noise now that the crash is resolved.)
-
     // =============================================================================
     // =============================================================================
     // =============================================================================
@@ -14592,29 +11319,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     debugLog('[Core] All storage keys:', storageKeys);
     debugLog('[Core] Storage contents:', allStorage);
     
-    // Check if this is first run: no hasSeenOnboarding key OR it's explicitly false
-    // OR if Classic Style key is missing (indicates update from old version)
+    // Check if this is first run: no hasSeenOnboarding key OR it's explicitly false.
+    // (Used to also re-show onboarding when the Classic Style key was missing as an
+    // "updated from an old version" heuristic. Classic Style is gone and its key is
+    // cleaned up on load, so that check would now re-onboard every existing user.)
     const hasSeenOnboarding = allStorage.hasSeenOnboarding;
-    const hasClassicStyleKey = CLASSIC_STYLE_KEY in allStorage;
-    const hasToolkitSettings = (
-        SIDEBAR_LAYOUT_KEY in allStorage ||
-        CLASSIC_LAYOUT_KEY in allStorage ||
-        CLASSIC_STYLE_KEY in allStorage ||
-        'enableThemeCustomization' in allStorage || // Legacy key
-        COMPACT_GENERATION_KEY in allStorage ||
-        HIDE_FOR_YOU_KEY in allStorage ||
-        PAGE_JUMP_KEY in allStorage
-    );
-    
+
     debugLog('[Core] Onboarding check - hasSeenOnboarding:', hasSeenOnboarding);
-    debugLog('[Core] Onboarding check - hasClassicStyleKey:', hasClassicStyleKey);
-    debugLog('[Core] Onboarding check - hasToolkitSettings:', hasToolkitSettings);
-    
-    // Show onboarding if: never seen before (undefined) OR explicitly false
-    // OR if user has settings but Classic Style key is missing (update scenario)
-    const shouldShowOnboarding = hasSeenOnboarding === undefined || 
-                                  hasSeenOnboarding === false ||
-                                  (hasToolkitSettings && !hasClassicStyleKey);
+
+    const shouldShowOnboarding = hasSeenOnboarding === undefined ||
+                                  hasSeenOnboarding === false;
     debugLog('[Core] Should show onboarding?', shouldShowOnboarding);
     
     // Initialize styles on page load
@@ -14622,6 +11336,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
     // Background cleanup: remove legacy null-only stats entries (fire-and-forget)
     pruneNullStats();
+    // Deliver any stats parked while the background page was unavailable
+    flushHeldStats();
 
     // Initialize Message Recovery: read the user's opt-in state from storage
     // and forward it to the page-context interceptor. Idempotent — safe to
@@ -14636,9 +11352,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         await storage.remove('hasSeenOnboarding');
         // Also clear all settings to simulate a truly fresh install
         await storage.remove(SIDEBAR_LAYOUT_KEY);
-        await storage.remove(CLASSIC_LAYOUT_KEY);
-        await storage.remove(CLASSIC_STYLE_KEY);
-        await storage.remove('enableThemeCustomization'); // Legacy key
         await storage.remove(COMPACT_GENERATION_KEY);
         await storage.remove(HIDE_FOR_YOU_KEY);
         await storage.remove(PAGE_JUMP_KEY);
@@ -14698,57 +11411,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         pendingInjectionTimeouts = [];
     }
     
-    // Remove all WYSIWYG editors from DOM to prevent React conflicts during resize
-    function removeAllWysiwygEditorsForResize() {
-        debugLog('[WYSIWYG] Removing all WYSIWYG editors from DOM for resize');
-        const allEditors = document.querySelectorAll('.sai-wysiwyg-editor');
-        let removeCount = 0;
-        allEditors.forEach(editor => {
-            // Find the associated textarea to clean up references
-            const textarea = editor.nextElementSibling;
-            if (textarea && textarea.tagName === 'TEXTAREA') {
-                // Mark that it needs re-setup after resize
-                textarea.dataset.wysiwygSetup = '';
-                // Clean up observers
-                if (textarea._wysiwygResizeObserver) {
-                    textarea._wysiwygResizeObserver.disconnect();
-                    delete textarea._wysiwygResizeObserver;
-                }
-                if (textarea._wysiwygMutationObserver) {
-                    textarea._wysiwygMutationObserver.disconnect();
-                    delete textarea._wysiwygMutationObserver;
-                }
-                if (textarea._wysiwygEditorMutationObserver) {
-                    textarea._wysiwygEditorMutationObserver.disconnect();
-                    delete textarea._wysiwygEditorMutationObserver;
-                }
-                if (textarea._wysiwygValueCheckInterval) {
-                    clearInterval(textarea._wysiwygValueCheckInterval);
-                    delete textarea._wysiwygValueCheckInterval;
-                }
-                // Restore textarea visibility
-                textarea.classList.remove('sai-wysiwyg-hidden');
-                textarea.style.removeProperty('position');
-                textarea.style.removeProperty('opacity');
-                textarea.style.removeProperty('pointer-events');
-                textarea.style.removeProperty('width');
-                textarea.style.removeProperty('height');
-                textarea.style.removeProperty('min-width');
-                textarea.style.removeProperty('min-height');
-                textarea.style.removeProperty('max-width');
-                textarea.style.removeProperty('max-height');
-                textarea.style.removeProperty('padding');
-                textarea.style.removeProperty('margin');
-                textarea.style.removeProperty('border');
-                textarea.style.removeProperty('overflow');
-                textarea.style.removeProperty('z-index');
-            }
-            editor.remove();
-            removeCount++;
-        });
-        debugLog('[WYSIWYG] Removed', removeCount, 'WYSIWYG editors from DOM');
-    }
-    
     // Pre-emptive resize detection using mousedown on window edges
     // This removes elements BEFORE resize starts, avoiding React conflicts
     let resizeStartPending = false;
@@ -14756,12 +11418,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // (a send button, a scrollbar, anything near the edge — not just an actual
     // resize drag) sets isResizing=true below. If no real window 'resize' event
     // follows, nothing else ever clears it — the 'mouseup' handler deliberately
-    // leaves that to the resize-end timer, which never gets scheduled. Once stuck,
-    // findAndSetupWysiwygTextareas() permanently skips rebuilding the WYSIWYG
-    // overlay for any new textarea (e.g. a new chat's composer), silently
-    // dropping syntax highlighting until the page is reloaded. This timer
-    // self-heals: if no genuine resize shows up shortly after the mousedown, we
-    // recover exactly as the real resize-end path would.
+    // leaves that to the resize-end timer, which never gets scheduled. Once
+    // stuck, scheduleInjection() skips every button re-injection until reload.
+    // This timer self-heals: if no genuine resize shows up shortly after the
+    // mousedown, we recover exactly as the real resize-end path would.
     let mousedownResizeFallbackTimer = null;
 
     document.addEventListener('mousedown', function(e) {
@@ -14776,9 +11436,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             isResizing = true;
             sidebarWidthTransitionPending = true;
             cancelAllPendingInjections();
-
-            // CRITICAL: Remove all WYSIWYG editors from DOM to prevent React 185 error
-            removeAllWysiwygEditorsForResize();
 
             // Remove button IMMEDIATELY before any resize events fire
             const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
@@ -14803,8 +11460,6 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (window.innerWidth >= 600) {
                     injectToolkitSidebarButton();
                 }
-                debugLog('[WYSIWYG] Re-initializing editors after false-alarm resize recovery');
-                findAndSetupWysiwygTextareas();
             }, RESIZE_DEBOUNCE_MS);
         }
     }, true); // Use capture phase to run before other handlers
@@ -14819,10 +11474,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Track last-known window width so we can ignore height-only resize events.
     // On Firefox Android PWA (standalone display-mode), opening the soft keyboard
     // resizes the layout viewport (height shrinks, width unchanged) and fires a
-    // window 'resize' event. Without this guard, the handler tears down the WYSIWYG
-    // editor the user just tapped, which steals focus and dismisses the keyboard.
-    // React-185 avoidance only depends on width breakpoints, so height-only changes
-    // are safe to skip here.
+    // window 'resize' event. React-185 avoidance only depends on width
+    // breakpoints, so height-only changes are safe to skip here.
     let lastResizeWidth = window.innerWidth;
     window.addEventListener('resize', function() {
         const width = window.innerWidth;
@@ -14846,10 +11499,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             isResizing = true;
             sidebarWidthTransitionPending = true;
             cancelAllPendingInjections();
-            
-            // CRITICAL: Remove all WYSIWYG editors from DOM to prevent React 185 error
-            removeAllWysiwygEditorsForResize();
-            
+
             // Remove button immediately
             const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
             if (sidebarBtn) {
@@ -14887,30 +11537,9 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     }
                 }, 100);
             }
-            
-            // Re-setup WYSIWYG editors after resize ends
-            if (!isResizing) {
-                debugLog('[WYSIWYG] Re-initializing editors after resize');
-                findAndSetupWysiwygTextareas();
-            }
         }, RESIZE_DEBOUNCE_MS);
     });
-    
-    // CRITICAL: Periodic check to remove WYSIWYG editors if window is in danger zone
-    // This prevents React Error 185 when user types/sends messages at ~768px breakpoint
-    setInterval(() => {
-        const windowWidth = window.innerWidth;
-        const inDangerZone = windowWidth >= 700 && windowWidth <= 850;
-        
-        if (inDangerZone && !isResizing) {
-            const editors = document.querySelectorAll('.sai-wysiwyg-editor');
-            if (editors.length > 0) {
-                debugLog('[WYSIWYG] Danger zone detected (' + windowWidth + 'px), removing ' + editors.length + ' editor(s)');
-                removeAllWysiwygEditorsForResize();
-            }
-        }
-    }, 250); // Check every 250ms
-    
+
     // =============================================================================
     // SIDEBAR LAYOUT BODY-CLASS OBSERVER
     // =============================================================================
@@ -17908,8 +14537,39 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     width: 100%;
                     max-width: 100vw;
                     max-height: 100vh;
+                    /* iOS Safari: 100vh includes the area under the toolbar, which
+                       pushed the footer's Close button off-screen. dvh tracks the
+                       actually-visible viewport; vh above stays as the fallback. */
+                    max-height: 100dvh;
                     border-radius: 0;
                 }
+                .modal-footer {
+                    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+                }
+            }
+
+            /* Always-reachable dismiss control. On phones the modal covers the
+               whole backdrop, so tap-outside-to-close isn't available there. */
+            .modal-x {
+                position: absolute;
+                top: calc(0.5rem + env(safe-area-inset-top, 0px));
+                right: 0.5rem;
+                width: 40px;
+                height: 40px;
+                border: none;
+                border-radius: 50%;
+                background: transparent;
+                color: #6b7280;
+                font-size: 1.5rem;
+                line-height: 1;
+                cursor: pointer;
+                touch-action: manipulation;
+                z-index: 1;
+            }
+            .modal-x:hover { background: rgba(0, 0, 0, 0.06); }
+            @media (prefers-color-scheme: dark) {
+                .modal-x { color: #9ca3af; }
+                .modal-x:hover { background: rgba(255, 255, 255, 0.08); }
             }
 
             @media (prefers-color-scheme: dark) {
@@ -18125,11 +14785,18 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         modal.className = 'modal';
         modal.addEventListener('click', (e) => e.stopPropagation());
 
+        const xBtn = document.createElement('button');
+        xBtn.className = 'modal-x';
+        xBtn.type = 'button';
+        xBtn.setAttribute('aria-label', 'Close');
+        xBtn.textContent = '×';
+        modal.appendChild(xBtn);
+
         shadow.appendChild(style);
         shadow.appendChild(backdrop);
         shadow.appendChild(modal);
 
-        return { root, backdrop, modal };
+        return { root, backdrop, modal, xBtn };
     }
 
     function closeChangelogModal(root, backdrop, modal) {
@@ -18155,7 +14822,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const changelog = await loadChangelogData();
         const entry = changelog.find(e => e.version === version) || buildFallbackChangelogEntry(version);
 
-        const { root, backdrop, modal } = createChangelogModalShell();
+        const { root, backdrop, modal, xBtn } = createChangelogModalShell();
 
         // Create modal header
         const modalHeader = document.createElement('div');
@@ -18233,6 +14900,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
 
         closeBtn.addEventListener('click', closeModal);
+        xBtn.addEventListener('click', closeModal);
         backdrop.addEventListener('click', closeModal);
 
         // Give the user a way to see previous releases' notes too, not just
@@ -18257,7 +14925,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const changelog = await loadChangelogData();
         const entries = changelog.slice(0, limit);
 
-        const { root, backdrop, modal } = createChangelogModalShell();
+        const { root, backdrop, modal, xBtn } = createChangelogModalShell();
 
         const modalHeader = document.createElement('div');
         modalHeader.className = 'modal-header';
@@ -18336,6 +15004,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }
 
         closeBtn.addEventListener('click', closeModal);
+        xBtn.addEventListener('click', closeModal);
         backdrop.addEventListener('click', closeModal);
     }
 

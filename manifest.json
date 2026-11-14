@@ -1,17 +1,14 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "S.AI Toolkit",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Enhanced features for SpicyChat including generation profiles, sidebar layout, theme customization, and more",
-  "homepage_url": "https://sai.onyxmizuna.eu/SAI-Toolkit/",
   "permissions": [
     "storage",
     "unlimitedStorage",
     "identity",
     "alarms",
-    "tabs"
-  ],
-  "host_permissions": [
+    "tabs",
     "*://spicychat.ai/*",
     "https://www.googleapis.com/*",
     "https://oauth2.googleapis.com/*"
@@ -34,31 +31,28 @@
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-  "action": {
+  "browser_action": {
     "default_popup": "popup.html",
     "default_icon": "icons/icon-48.png",
     "default_title": "S.AI Toolkit Settings"
   },
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
   "web_accessible_resources": [
-    {
-      "resources": [
-        "page-context.js",
-        "xhr-intercept.js",
-        "changelog.json",
-        "images/mari.jpg"
-      ],
-      "matches": [
-        "*://spicychat.ai/*"
-      ]
-    }
+    "page-context.js",
+    "xhr-intercept.js",
+    "changelog.json",
+    "images/mari.jpg"
   ],
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'"
-  },
-  "externally_connectable": {
-    "matches": []
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "sai-toolkit@spicychat.ai",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["none"],
+        "optional": ["technicalAndInteraction"]
+      }
+    }
   }
 }

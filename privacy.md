@@ -21,7 +21,7 @@ S.AI Toolkit's access to, and use and transfer of, information received from Goo
 When — and only when — you connect Google Drive, the extension accesses:
 
 - **A Google OAuth authorization** limited to the scope `https://www.googleapis.com/auth/drive.file`. This is a non-sensitive scope that grants access **only to files this extension itself creates or opens** in your Drive — never to any of your other Drive files. The flow yields a short-lived **access token** and a long-lived **refresh token**.
-- **The extension's own Drive files**: a sync file named `sai-toolkit-sync.json`, and any backup files (`sai-toolkit-backup-*.json`) inside a folder named **"S.AI Toolkit"** — all created by the extension. Their contents are *your own* extension data: generation statistics (model name, token count, temperature, top_p, top_k, message UUID, character UUID — **no** message text, **no** AI replies, **no** personal identifiers) and, if you enable those sync options, your extension settings and custom-style values.
+- **The extension's own Drive files**: a sync file named `sai-toolkit-sync.json`, and any backup files (`sai-toolkit-backup-*.json`) inside a folder named **"S.AI Toolkit"** — all created by the extension. Their contents are *your own* extension data: generation statistics (model name, token count, temperature, top_p, top_k, message UUID, character UUID — **no** message text, **no** AI replies, **no** personal identifiers) and, if you enable those sync options, your extension settings and Style-tab settings (message colors and background image).
 - The extension does **not** access your Google email address, profile, name, contacts, or any Drive file it did not create.
 
 ### Data Usage
@@ -77,9 +77,11 @@ The extension does **not** transmit, log, or send any data externally, except as
 
 The extension stores limited information locally using the browser's `storage.local` API and a local **IndexedDB** database:
 
-- **User Preferences:** Layout, theme, interface customization, and feature toggles (e.g., sidebar, classic theme, NSFW mode, Message Recovery, Hide Creator Name, etc.)
+- **User Preferences:** Layout, theme, interface customization, and feature toggles (e.g., sidebar, NSFW mode, Message Recovery, Hide Creator Name, etc.)
 - **Generation Statistics:** Metadata about message generation (e.g., model type, token count, temperature, top_p, top_k, timestamps) for debugging and display purposes. These records are kept in a local **IndexedDB** database (`sai_toolkit_stats`) on your device.
-- **Custom Style Values:** User-defined color, font, and background preferences for the chat interface, including any uploaded background image (stored as a local data URL).
+- **Style Overrides:** Optional message background and button hover colors, plus any uploaded chat background image (stored as a local data URL).
+- **Legacy Custom Style Values:** If you used the retired Custom Style feature, its saved colors/fonts remain stored locally until you click **Clear Custom Style data** in the Style tab, so you can export them first.
+- **Pending Statistics:** If the background page is temporarily unavailable, new generation statistics are held in `storage.local` (`pendingStatsRecords`) and moved into the IndexedDB database once it responds again.
 - **Exported Data:** When you use the export feature, chat data is prepared for download but is never sent externally.
 - **NSFW Mode State:** If you toggle NSFW image mode, your preference is stored locally.
 - **Failed Message Queue (only if Message Recovery is enabled):** Locally saved copies of messages whose send to SpicyChat failed — see section 1.3.
@@ -122,7 +124,9 @@ Capture happens **only at send time**. If the request succeeds, the in-memory sn
 
 ### 1.4 Custom Background Image (Opt-In)
 
-The **Custom Style** feature includes an optional background image upload. If the user uploads an image, it is converted to a data URL entirely within the browser and stored in `chrome.storage.local` under the `customStyleValues` key. The image data never leaves the device and is not transmitted anywhere. Users can remove it at any time by clicking **Clear** next to the background image field or by using **Reset to Defaults** or **Clear All Data** in the settings modal.
+The Style tab includes an optional background image upload. If the user uploads an image, it is converted to a data URL entirely within the browser and stored in `chrome.storage.local` under the `styleOverrides` key. The image data never leaves the device unless the user opts in to Drive Sync with the **Style** scope checked. Users can remove it at any time by clicking the bin button next to the background image field or by using **Clear All Data** in the settings modal.
+
+**Export Custom Style URL to SpicyChat** builds a spicychat.ai share link from your legacy Custom Style colors entirely in the browser. Nothing is sent anywhere unless you choose to open that link, which loads it on spicychat.ai like any other style link.
 
 ### 1.5 Drive Sync (Opt-In Feature)
 
@@ -215,8 +219,8 @@ This permission is requested solely to ensure the extension continues to operate
 You have full control over your data at all times:
 
 - **Clear Data:** You can remove all stored data by uninstalling the extension or by using the built-in "Clear All Data" option.
-- **Export/Import Data:** You may export or import all settings (including generation statistics and custom style values) for backup or to transfer to another device.
-- **Reset Styles:** The "Reset to Defaults" button in the Custom Style panel clears any uploaded background image and all custom color/font choices without requiring a full data wipe.
+- **Export/Import Data:** You may export or import all settings (including generation statistics and style settings) for backup or to transfer to another device.
+- **Reset Styles:** Empty any Style-tab color field (or click the bin button next to the background image) to return to SpicyChat's own look, and use **Clear Custom Style data** to delete legacy Custom Style values, without requiring a full data wipe.
 - **Local Management:** You may modify or reset preferences through your browser settings.
 - **Disconnect from Google Drive:** Clicking **Disconnect** in the Settings modal's Data tab clears the locally cached OAuth token, token expiry, Drive file reference, and last-sync timestamp. No further syncs will occur until the user re-authenticates. Drive access can also be revoked at any time from [Google Account Permissions](https://myaccount.google.com/permissions).
 

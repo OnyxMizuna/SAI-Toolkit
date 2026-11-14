@@ -41,20 +41,29 @@ const AUTO_SYNC_ALARM_NAME  = 'driveAutoSync';
 // Keys included in each sync section
 const SETTINGS_SYNC_KEYS = [
     'enableSidebarLayout', 'sidebarMinWidth',
-    'enableClassicLayout', 'enableClassicStyle',
     'enableCompactGeneration', 'enableHideForYou', 'enablePageJump',
     'showGenerationStats', 'showModelDetails', 'showTimestamp',
     'timestampDateFirst', 'timestamp24Hour', 'showMessageIds',
     'showChatNameInTitle', 'nsfwToggleEnabled', 'messageRecoveryEnabled',
-    'enableWysiwygEditor', 'enableGenerationProfiles',
-    'enableSmallProfileImages', 'enableRoundedProfileImages',
+    'enableGenerationProfiles', 'enableRoundedProfileImages',
     'enableSwapCheckboxPosition', 'enableSquareMessageEdges',
     'highlightModelChanges', 'autoRegenOnMismatch', 'autoRegenOnShort',
-    'autoRegenMaxAttempts', 'messageContainerMaxWidth',
+    'autoRegenMaxAttempts',
     'memoryDotEnabled', 'memoryDotColor', 'hideCreatorName',
     'generationProfiles', 'lastSelectedProfile'
 ];
-const STYLE_SYNC_KEYS = ['enableCustomStyle', 'customStyleValues'];
+// Style tab's individual overrides (bubble BGs, button hover, background image).
+// The retired Custom Style keys (enableCustomStyle/customStyleValues) are NOT
+// synced: they're kept per-device only until the user exports + clears them,
+// and pulling them back down from Drive would resurrect cleared data. Any copy
+// already in the Drive file is dropped the next time Style is synced.
+const STYLE_SYNC_KEYS = ['styleOverrides'];
+
+function pickKeys(obj, keys) {
+    const out = {};
+    for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
+    return out;
+}
 
 // ---- Stat-record merge helper ----
 // Merges one {model,max_tokens,temperature,top_p,top_k,role} leaf: the "→" arrow
@@ -636,7 +645,10 @@ function buildAuthUrl(redirectURL, codeChallenge) {
         code_challenge:        codeChallenge,
         code_challenge_method: 'S256',
         access_type:           'offline',
-        prompt:                'consent',
+        // select_account: always show Google's account chooser, so a stale
+        // Google session cookie in Safari's auth sheet can't silently pin the
+        // flow to a dead/wrong session (previously only clearing cookies fixed it).
+        prompt:                'select_account consent',
     });
     return `https://accounts.google.com/o/oauth2/auth?${params}`;
 }
@@ -885,6 +897,73 @@ async function clearCachedToken() {
     await storageAPI.storage.local.remove(['driveAccessToken', 'driveTokenExpiry', 'driveBackupFolderId']);
 }
 
+// Best-effort revoke at Google so Disconnect really severs the grant (otherwise
+// Google keeps the old consent around and the next sign-in can reuse it).
+async function revokeDriveTokens() {
+    const { driveRefreshToken, driveAccessToken } =
+        await storageAPI.storage.local.get(['driveRefreshToken', 'driveAccessToken']);
+    const tok = driveRefreshToken || driveAccessToken; // revoking the refresh token kills both
+    if (!tok) return;
+    try {
+        await fetch('https://oauth2.googleapis.com/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ token: tok }),
+        });
+        console.log('[Sync] revokeDriveTokens: revoke request sent');
+    } catch (err) {
+        console.warn('[Sync] revokeDriveTokens: revoke failed (ignored) —', err.message);
+    }
+}
+
+// Non-interactive health check used by the Data tab to detect a dead sign-in
+// BEFORE the user hits Sync. Returns:
+//   { state: 'none' }                 — never connected / disconnected
+//   { state: 'ok', email }            — token works against Drive
+//   { state: 'expired', reason }      — had tokens, but none work silently
+//   { state: 'unknown', reason }      — network/broker trouble; don't alarm the user
+async function checkDriveAuthStatus() {
+    const stored = await storageAPI.storage.local.get(['driveAccessToken', 'driveRefreshToken', 'driveFileId', 'driveLastSync']);
+    const hadConnection = !!(stored.driveAccessToken || stored.driveRefreshToken || stored.driveFileId || stored.driveLastSync);
+    if (!hadConnection) return { state: 'none' };
+
+    const probe = async (token) => {
+        const res = await fetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)',
+            { headers: { Authorization: `Bearer ${token}` } });
+        if (res.status === 401) return { auth: false };
+        if (!res.ok) return { auth: null, status: res.status };
+        const data = await res.json().catch(() => ({}));
+        return { auth: true, email: data.user && data.user.emailAddress };
+    };
+
+    // getAccessToken(false) returns null both for a dead refresh token (which it
+    // deletes) and for a transient broker/network error (which leaves it in place).
+    const noTokenState = async (reason) => {
+        const { driveRefreshToken } = await storageAPI.storage.local.get('driveRefreshToken');
+        return driveRefreshToken ? { state: 'unknown', reason: 'refresh temporarily failed' }
+                                 : { state: 'expired', reason };
+    };
+
+    try {
+        let token = await getAccessToken(false);
+        if (!token) return await noTokenState('no usable token');
+        let r = await probe(token);
+        if (r.auth === false) {
+            // Cached access token was rejected (revoked early, or Google's
+            // clock disagrees). Drop it and try one silent refresh.
+            await clearCachedToken();
+            token = await getAccessToken(false);
+            if (!token) return await noTokenState('refresh failed');
+            r = await probe(token);
+        }
+        if (r.auth === true)  return { state: 'ok', email: r.email || null };
+        if (r.auth === false) return { state: 'expired', reason: 'token rejected by Drive' };
+        return { state: 'unknown', reason: `Drive HTTP ${r.status}` };
+    } catch (err) {
+        return { state: 'unknown', reason: err.message };
+    }
+}
+
 async function findDriveFile(token, folderId) {
     console.log('[Sync] findDriveFile: checking cached file ID');
     const cached = await storageAPI.storage.local.get('driveFileId');
@@ -1009,6 +1088,11 @@ async function readDriveFile(token, fileId, tabId) {
             _downloadResolve = null;
             _downloadReject  = null;
             await storageAPI.storage.local.remove(STORAGE_KEY);
+            // The content script saw a 401. Drop the cached access token, or the
+            // AUTH_EXPIRED retry in runDriveSync gets the same dead token back
+            // from getAccessToken() (it's still "unexpired" locally) and fails
+            // again — for up to an hour.
+            if (err.message === AUTH_EXPIRED) await clearCachedToken();
             throw err;
         }
         clearTimeout(timeoutId);
@@ -1048,28 +1132,6 @@ async function readDriveFile(token, fileId, tabId) {
     return { data: parsed, bytes, durationMs };
 }
 
-// XHR-based upload for WebKit/Orion background contexts where fetch with a body can hang.
-// Falls back to fetch on Chrome MV3 service workers where XHR is unavailable.
-function driveXhrRequest(method, url, headers, body) {
-    return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open(method, url);
-        for (const [key, val] of Object.entries(headers)) xhr.setRequestHeader(key, val);
-        xhr.timeout = 90000;
-        xhr.onload = () => {
-            const text = xhr.responseText;
-            resolve({
-                status: xhr.status,
-                ok: xhr.status >= 200 && xhr.status < 300,
-                json: () => { try { return Promise.resolve(JSON.parse(text)); } catch (e) { return Promise.reject(e); } },
-            });
-        };
-        xhr.onerror   = () => reject(new Error('XHR network error during Drive upload'));
-        xhr.ontimeout = () => reject(new Error('XHR timeout during Drive upload (>90 s)'));
-        xhr.send(body);
-    });
-}
-
 async function writeDriveFile(token, fileId, data, folderId, tabId) {
     const isMV2BackgroundPage = typeof XMLHttpRequest !== 'undefined';
 
@@ -1102,6 +1164,7 @@ async function writeDriveFile(token, fileId, data, folderId, tabId) {
             clearTimeout(timeoutId);
             _uploadResolve = null; _uploadReject = null;
             await storageAPI.storage.local.remove(STORAGE_KEY);
+            if (err.message === AUTH_EXPIRED) await clearCachedToken(); // see readDriveFile
             throw err;
         }
         clearTimeout(timeoutId);
@@ -1219,38 +1282,9 @@ async function listDriveBackups(token) {
     return { backups: listed.files || [], folderId };
 }
 
-async function createDriveBackup(token, exportData) {
-    const folderId = await getOrCreateToolkitFolder(token);
+function makeBackupFileName() {
     const ts = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '');
-    const fileName = `${BACKUP_FILE_PREFIX}${ts}.json`;
-    const boundary = 'sai_toolkit_backup_boundary';
-    const metadata = JSON.stringify({ name: fileName, mimeType: 'application/json', parents: [folderId] });
-    const body = JSON.stringify(exportData);
-    const multipart = [
-        `--${boundary}`,
-        'Content-Type: application/json; charset=UTF-8',
-        '',
-        metadata,
-        `--${boundary}`,
-        'Content-Type: application/json',
-        '',
-        body,
-        `--${boundary}--`
-    ].join('\r\n');
-    const useXHR = typeof XMLHttpRequest !== 'undefined';
-    console.log('[Sync] createDriveBackup: uploading', (multipart.length / 1024).toFixed(1), 'KB — transport:', useXHR ? 'XHR' : 'fetch');
-    const doRequest = useXHR ? driveXhrRequest : (method, url, headers, reqBody) => fetch(url, { method, headers, body: reqBody });
-    const res = await doRequest(
-        'POST',
-        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
-        { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
-        multipart
-    );
-    if (res.status === 401) { await clearCachedToken(); throw new Error(AUTH_EXPIRED); }
-    if (!res.ok) throw new Error(`Drive backup create failed: ${res.status}`);
-    const created = await res.json();
-    console.log('[Sync] createDriveBackup: created', created.name, '→', created.id);
-    return { fileId: created.id, fileName };
+    return `${BACKUP_FILE_PREFIX}${ts}.json`;
 }
 
 async function deleteDriveBackup(token, fileId) {
@@ -1260,16 +1294,6 @@ async function deleteDriveBackup(token, fileId) {
     );
     if (res.status === 401) { await clearCachedToken(); throw new Error(AUTH_EXPIRED); }
     if (res.status !== 204 && !res.ok) throw new Error(`Drive backup delete failed: ${res.status}`);
-}
-
-async function readDriveBackupFile(token, fileId) {
-    const res = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-        { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.status === 401) { await clearCachedToken(); throw new Error(AUTH_EXPIRED); }
-    if (!res.ok) throw new Error(`Drive backup read failed: ${res.status}`);
-    return await res.json();
 }
 
 // ---- Sync progress reporting ----
@@ -1402,8 +1426,11 @@ async function _doSync(interactive, syncOptions, tabId) {
             '| remote keys:', Object.keys(remoteSettings).length,
             '| merged keys:', Object.keys(merged).length);
         newFile.settings = merged;
-        if (Object.keys(merged).length > 0) {
-            await storageAPI.storage.local.set(merged);
+        // Only write back keys this version still uses — a remote file from an older
+        // version can carry settings for removed features (Classic Layout, WYSIWYG, ...).
+        const toApply = pickKeys(merged, SETTINGS_SYNC_KEYS);
+        if (Object.keys(toApply).length > 0) {
+            await storageAPI.storage.local.set(toApply);
         }
     } else if (isV2 && remote && remote.settings) {
         newFile.settings = remote.settings; // preserve
@@ -1422,9 +1449,12 @@ async function _doSync(interactive, syncOptions, tabId) {
         console.log('[Sync] _doSync: style merge — local keys:', Object.keys(localStyle).length,
             '| remote keys:', Object.keys(remoteStyle).length,
             '| merged keys:', Object.keys(merged).length);
-        newFile.style = merged;
-        if (Object.keys(merged).length > 0) {
-            await storageAPI.storage.local.set(merged);
+        // Write only current style keys: this also drops retired Custom Style data
+        // that an older version left in the Drive file.
+        const toApply = pickKeys(merged, STYLE_SYNC_KEYS);
+        newFile.style = toApply;
+        if (Object.keys(toApply).length > 0) {
+            await storageAPI.storage.local.set(toApply);
         }
     } else if (isV2 && remote && remote.style) {
         newFile.style = remote.style; // preserve
@@ -1550,7 +1580,6 @@ storageAPI.runtime.onInstalled.addListener(async (details) => {
     if (details.reason === 'install') {
         await storageAPI.storage.local.set({
             'enableSidebarLayout':      false,
-            'enableThemeCustomization': true,
             'enableHideForYou':         true,
             'enablePageJump':           true,
             'showGenerationStats':      false,
@@ -1705,19 +1734,58 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-    if (message.type === 'SAI_DRIVE_CREATE_BACKUP') {
+    if (message.type === 'SAI_DRIVE_AUTH_STATUS') {
+        checkDriveAuthStatus().then(sendResponse);
+        return true;
+    }
+
+    // Wipe local tokens, revoke at Google, then run a fresh interactive sign-in
+    // (account chooser forced). This is the in-app replacement for "clear cookies".
+    if (message.type === 'SAI_DRIVE_RECONNECT') {
         (async () => {
             try {
+                await revokeDriveTokens();
+                await storageAPI.storage.local.remove(['driveAccessToken', 'driveRefreshToken', 'driveTokenExpiry', 'driveBackupFolderId']);
+                const token = await getAccessToken(true);
+                if (!token) throw new Error('Google sign-in did not complete.');
+                const status = await checkDriveAuthStatus();
+                sendResponse({ success: status.state === 'ok', email: status.email || null,
+                               error: status.state === 'ok' ? undefined : 'Signed in, but Drive still rejected the token.' });
+            } catch (err) {
+                sendResponse({ success: false, error: friendlyError(err) });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === 'SAI_DRIVE_REVOKE') {
+        revokeDriveTokens().then(() => sendResponse({ success: true }));
+        return true;
+    }
+
+    // Create Backup on WebKit/iOS: the background page must not push a ~20 MB
+    // body itself (XHR/fetch with a large body freezes its event loop - same
+    // reason writeDriveFile delegates). Hand the content script a token + folder
+    // and let it upload directly.
+    if (message.type === 'SAI_DRIVE_BACKUP_TARGET') {
+        (async () => {
+            try {
+                if (message.tokenRejected) await clearCachedToken();
                 let token = await getAccessToken(true);
+                if (!token) throw new Error('Google sign-in did not complete.');
+                // Restore only needs a token (it downloads a known fileId).
+                if (message.tokenOnly) { sendResponse({ success: true, token }); return; }
+                let folderId;
                 try {
-                    sendResponse({ success: true, ...(await createDriveBackup(token, message.exportData)) });
+                    folderId = await getOrCreateToolkitFolder(token);
                 } catch (err) {
                     if (err.message !== AUTH_EXPIRED) throw err;
                     token = await getAccessToken(true);
-                    sendResponse({ success: true, ...(await createDriveBackup(token, message.exportData)) });
+                    folderId = await getOrCreateToolkitFolder(token);
                 }
+                sendResponse({ success: true, token, folderId, fileName: makeBackupFileName() });
             } catch (err) {
-                sendResponse({ success: false, error: err.message });
+                sendResponse({ success: false, error: friendlyError(err) });
             }
         })();
         return true;
@@ -1736,25 +1804,6 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     token = await getAccessToken(true);
                     await deleteDriveBackup(token, message.fileId);
                     sendResponse({ success: true });
-                }
-            } catch (err) {
-                sendResponse({ success: false, error: err.message });
-            }
-        })();
-        return true;
-    }
-
-    if (message.type === 'SAI_DRIVE_RESTORE_BACKUP') {
-        (async () => {
-            try {
-                let token = await getAccessToken(false);
-                if (!token) token = await getAccessToken(true);
-                try {
-                    sendResponse({ success: true, data: await readDriveBackupFile(token, message.fileId) });
-                } catch (err) {
-                    if (err.message !== AUTH_EXPIRED) throw err;
-                    token = await getAccessToken(true);
-                    sendResponse({ success: true, data: await readDriveBackupFile(token, message.fileId) });
                 }
             } catch (err) {
                 sendResponse({ success: false, error: err.message });

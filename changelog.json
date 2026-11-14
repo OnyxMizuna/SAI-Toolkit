@@ -1,5 +1,20 @@
 [
   {
+    "version": "1.3.1",
+    "date": "November 14, 2026",
+    "features": [
+      "Retired features SpicyChat now does natively (and better): Live Text Formatting (WYSIWYG), Classic Chat Layout, Classic Style, Small Profile Images, Message Container Max Width and Custom Style text colors/fonts",
+      "Style tab: a new \"Custom Message Colors\" checkbox controls Bot/User Message BG and Button Hover, each with its own Light and Dark value; Background Image and the Memory Limit Indicator are separate settings. If you had Custom Style on, your colors carry over and stay on",
+      "If you had a Custom Style, the Style tab now offers \"Export Custom Style URL to SpicyChat\" — open the link and tap Save to add it to SpicyChat's own saved chat styles — and \"Clear Custom Style data\" once you're done",
+      "iOS: the changelog window now has a close (×) button and fits on screen",
+      "iOS: tapping the version number 4 times to toggle Debug Mode works reliably again",
+      "Google Drive: an expired sign-in is now detected when you open the Data tab, with a one-tap \"Reconnect Google\" button (no more clearing cookies)",
+      "Google Drive: Create Backup and Restore no longer hang on iOS, and show their progress while running",
+      "Generation Statistics are no longer lost when the browser shuts down the extension's background page (a bug in Orion on iOS): they are held safely and saved as soon as it is back, and Orion users get a one-time alert explaining how to fix it (force-quit and reopen Orion)",
+      "Google Drive: when the extension's background page isn't responding, Drive actions now retry and then say so plainly instead of \"Sync failed\""
+    ]
+  },
+  {
     "version": "1.3.0",
     "date": "November 5, 2026",
     "features": [

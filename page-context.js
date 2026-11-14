@@ -639,10 +639,6 @@ window.addEventListener('message', async function(event) {
             if (textarea.closest('.border-1.border-solid.rounded-\\[13px\\]')) {
                 continue;
             }
-            // Skip hidden WYSIWYG textareas
-            if (textarea.classList.contains('sai-wysiwyg-hidden')) {
-                continue;
-            }
             // Check if it's visible
             const style = window.getComputedStyle(textarea);
             if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0) {
