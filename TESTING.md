@@ -150,6 +150,21 @@ Don't let it drift from what the extension actually does.
   - [ ] Regenerate a bot message a few times, then flip between versions with
         `<` `>` while a new response is still loading: each version shows one
         stats block, none duplicated, none missing
+  - [ ] **Automatic recovery (all browsers)** — on page load and every time the
+        tab returns to the foreground, the console logs "Background health:
+        alive (…)". On Orion after switching apps, either it logs
+        "alive (reconnect)" and stats keep saving with no alert, or the Orion
+        alert appears within a few seconds of returning — before any message
+        is generated
+  - [ ] **Background page frozen mid-chat (iOS/Orion)** — the case that used
+        to lose a whole chat: with the extension working, generate a message,
+        switch to another app for a minute, come back and keep chatting. Every
+        new message shows its stats; within ~8 s of the first one that can't
+        be saved, the Orion alert appears. Force-quit and reopen Orion,
+        reload the chat: **all** of those messages still have their stats
+  - [ ] While healthy, `pendingStatsRecords` is empty or absent after each
+        message (records are written there first and removed once the
+        database confirms)
   - [ ] **Background page down (iOS/Orion)** — switch to another app and back
         so Orion unloads the background page, then generate a few messages.
         Each new message still shows its stats block, and the console logs
@@ -178,6 +193,9 @@ Don't let it drift from what the extension actually does.
   - [ ] Change the model via SpicyChat's own preset picker — confirm this
         does **not** falsely trigger an auto-regen (suppression logic)
 - [ ] **Chat Name in Title** — browser tab title updates
+  - [ ] On a chat with a label, tab reads `{Character} ({label})`, not
+        SpicyChat's native `Chat with {Character} on SpicyChat`
+  - [ ] On a brand-new chat (no messages yet), tab reads just `{Character}`
 - [ ] **NSFW Image Toggle** — button appears, stays in sync with SpicyChat's
       own Image Settings modal
 - [ ] **Message Recovery** (off by default) — enable it, force a failed send,
@@ -371,6 +389,33 @@ right after bumping `manifest.json`'s version.
 - [ ] "Generation Profiles (Legacy)" row, "Debug Log Filters" section and
       Mari's tribute appear/disappear along with it
 
+### 11.1 Background page experiment (Debug Mode only)
+
+Under Debug Log Filters there is a **Background page (experimental)** block.
+It exists to learn what works on Orion for iOS; nothing in it is on by default.
+
+- [ ] **Check background** on a healthy browser: `backgroundAnswersPing: true`,
+      `heldStatsWaiting: 0`, and `bridge: "off…"` while the box is unticked
+- [ ] Tick **Use extension-page fallback (bridge)**, then **Check background**:
+      `bridge.ok: true`, with `database.opened: true` and
+      `backgroundBefore.alive: true`. If it says "bridge page did not load",
+      the browser or page blocked the hidden frame — note which browser
+- [ ] **iOS (Orion), background dead** (switch apps and back): press **Check
+      background** and record the output — whether the ping answers, whether
+      the bridge loads, and whether the database opens
+- [ ] **Try revive** while dead: record `before`, `after` and `details.via`
+      (`reconnect` = the fresh-port approach worked; `bridge` = the extension
+      page revived it; `null` = neither did)
+- [ ] With the box ticked and the background dead, generate a message: the
+      console logs "Bridge fallback for message … stored", and after a
+      force-quit and reload the message still has its stats
+- [ ] **Restart extension** (needs the box ticked) asks for confirmation, then
+      restarts the extension; refresh the page afterwards and check the
+      background answers again
+- [ ] Untick the box or turn Debug Mode off: the bridge refuses requests
+      ("not authorised") and no hidden frame is used
+- [ ] `bridgeToken` and `experimentalBridge` are **not** in Drive backups
+
 ## 12. iOS pass (iPhone/iPad Safari)
 
 The **iOS**-marked steps above, gathered for a phone-only run:
@@ -383,6 +428,8 @@ The **iOS**-marked steps above, gathered for a phone-only run:
 - [ ] Sync Now completes with a large stats set (4.2)
 - [ ] Orion: after switching apps, Drive actions recover or explain that the
       extension needs toggling off/on (4.1)
+- [ ] Orion: switching apps mid-chat no longer loses that chat's stats (3)
+- [ ] Orion: run the background page experiment and record the results (11.1)
 - [ ] Orion: stats for messages generated while the background page was
       unloaded are kept and delivered later, and the one-time alert explains
       the Orion bug and the force-quit fix (3)

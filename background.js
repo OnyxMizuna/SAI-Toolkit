@@ -1611,6 +1611,9 @@ storageAPI.runtime.onInstalled.addListener(async (details) => {
 // completion, keeping the background alive for the full sync duration.
 
 storageAPI.runtime.onConnect.addListener((port) => {
+    // 'sai-wake': a fresh port the content script opens when a ping went unanswered,
+    // to nudge a background page the browser stopped delivering messages to.
+    if (port.name === 'sai-wake') { console.log('[Core] wake port opened by content script'); return; }
     if (port.name !== 'sai-sync-keepalive') return;
     console.log('[Sync] keepalive port opened — background will stay alive until port closes');
     port.onDisconnect.addListener(() => {
@@ -1630,7 +1633,7 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'ping') {
         sendResponse({ pong: true });
-        return true;
+        return false;   // answered synchronously — returning true would hold the channel open
     }
 
     // Heartbeat from the (foreground, always-alive) content script during a Drive sync. On Orion/iOS
@@ -1641,7 +1644,7 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // scheduled so the merge actually runs to completion. The handler only needs to exist + respond.
     if (message.type === 'SAI_KEEPALIVE_PING') {
         sendResponse({ alive: true });
-        return true;
+        return false;   // synchronous reply (see 'ping' above)
     }
 
     if (message.type === 'SAI_DRIVE_SYNC') {

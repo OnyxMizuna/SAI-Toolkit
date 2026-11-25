@@ -1,5 +1,14 @@
 [
   {
+    "version": "1.3.2",
+    "date": "November 17, 2026",
+    "features": [
+      "Chat Name in Title works again: SpicyChat changed its tab title to \"Chat with {name} on SpicyChat\", which stopped the tab from being shortened to the character name and chat label",
+      "Generation Statistics are now saved to a holding area before being sent to the database, so a chat's stats are no longer lost when Orion on iOS freezes the extension in the background (previously that went unnoticed and the stats disappeared on reload)",
+      "The toolkit now checks that its background page is still running whenever you return to the tab, tries to reconnect to it if not, and on Orion for iOS warns you straight away instead of when the next message arrives"
+    ]
+  },
+  {
     "version": "1.3.1",
     "date": "November 14, 2026",
     "features": [

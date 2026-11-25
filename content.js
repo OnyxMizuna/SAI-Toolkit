@@ -261,8 +261,23 @@ if (runtimeAPI && runtimeAPI.runtime && runtimeAPI.runtime.onMessage) {
 // Defined at module scope so both the page-context debug bridge (below) and the
 // IIFE stats engine can call it.
 // ---------------------------------------------------------------------------
-function sendStatsMessage(type, payload, _retries = 1) {
-    return new Promise((resolve, reject) => {
+// Settles with an error after `ms`, so a call whose other side froze can't hang
+// the caller forever. (The original promise is left to settle on its own.)
+function withTimeout(promise, ms, label) {
+    if (!ms) return promise;
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + ' timed out after ' + ms + ' ms')), ms); })
+    ]).finally(() => clearTimeout(timer));
+}
+
+// timeoutMs: optional time limit. Orion can SUSPEND the background page mid-call:
+// the reply then never arrives and the background's own timers are frozen too, so
+// only this (foreground) side can give up. Large one-off ops (export, import merge)
+// pass no limit because they can legitimately take a while.
+function sendStatsMessage(type, payload, _retries = 1, timeoutMs = 0) {
+    const call = new Promise((resolve, reject) => {
         try {
             runtimeAPI.runtime.sendMessage({ type, ...(payload || {}) }, (res) => {
                 const err = runtimeAPI.runtime.lastError;
@@ -280,27 +295,44 @@ function sendStatsMessage(type, payload, _retries = 1) {
             reject(e);
         }
     });
+    return withTimeout(call, timeoutMs, type);
 }
 
 // ---------------------------------------------------------------------------
-// Stats holding list — survives a dead background page.
-// Some browsers (Orion on iOS) unload the background page when the app is
-// backgrounded and don't reliably bring it back, so SAI_STATS_PUT gets an empty
-// reply and the record would be silently lost. storage.local is served by the
-// browser itself (no background page needed), so records that couldn't be
-// delivered are parked there as { [messageId]: record } and replayed once the
-// background answers again. Replaying is safe to repeat: the store merges by
+// Stats holding list (write-ahead) — survives a dead or frozen background page.
+// Orion on iOS unloads or SUSPENDS the background page when the app is
+// backgrounded. A suspended page never answers at all, so "fall back when the
+// save fails" isn't enough: the save just hangs and the record is lost with the
+// tab. So every record is written HERE FIRST (storage.local, served by the
+// browser, no background page needed) as { [messageId]: record }, then sent to
+// the background, and removed only once the background confirms. Anything left
+// is retried on load, periodically, when the tab returns to the foreground, and
+// after any confirmed save. Replaying is safe to repeat: the store merges by
 // messageId (idbMergePut).
 // ---------------------------------------------------------------------------
 const STATS_HOLD_KEY = 'pendingStatsRecords';
 const STATS_HOLD_MAX = 2000;          // oldest are dropped beyond this (~300 KB worst case)
 const STATS_RECORD_FIELDS = ['model', 'max_tokens', 'temperature', 'top_p', 'top_k', 'role'];
+const STATS_PUT_TIMEOUT_MS = 8000;    // background must confirm a save within this
+const STATS_READ_TIMEOUT_MS = 8000;   // ...and answer a display read within this
+const STATS_HOLD_IO_TIMEOUT_MS = 5000;
+const STATS_HOLD_RETRY_MS = 60000;
 let _heldStatsMayExist = true;        // unknown until first read
 let _heldStatsFlushing = null;
 
+// Every read-modify-write of the holding list goes through this chain, so a save
+// and a flush running at the same time can't overwrite each other's update.
+// (Two TABS saving in the same instant can still race; that window is tiny.)
+let _heldStatsLock = Promise.resolve();
+function withHeldStatsLock(fn) {
+    const run = _heldStatsLock.catch(() => {}).then(fn);
+    _heldStatsLock = run.catch(() => {});
+    return run;
+}
+
 async function readHeldStats() {
     try {
-        const got = await runtimeAPI.storage.local.get(STATS_HOLD_KEY);
+        const got = await withTimeout(runtimeAPI.storage.local.get(STATS_HOLD_KEY), STATS_HOLD_IO_TIMEOUT_MS, 'holding list read');
         const v = got && got[STATS_HOLD_KEY];
         return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
     } catch (_) {
@@ -310,11 +342,13 @@ async function readHeldStats() {
 
 async function writeHeldStats(held) {
     try {
-        if (Object.keys(held).length) await runtimeAPI.storage.local.set({ [STATS_HOLD_KEY]: held });
-        else await runtimeAPI.storage.local.remove(STATS_HOLD_KEY);
+        if (Object.keys(held).length) await withTimeout(runtimeAPI.storage.local.set({ [STATS_HOLD_KEY]: held }), STATS_HOLD_IO_TIMEOUT_MS, 'holding list write');
+        else await withTimeout(runtimeAPI.storage.local.remove(STATS_HOLD_KEY), STATS_HOLD_IO_TIMEOUT_MS, 'holding list clear');
         _heldStatsMayExist = Object.keys(held).length > 0;
+        return true;
     } catch (e) {
         debugLog('[Stats] holding list write failed:', e && e.message);
+        return false;
     }
 }
 
@@ -328,21 +362,38 @@ function mergeHeldRecord(older, newer) {
     return out;
 }
 
-async function holdStatsRecord(record) {
-    if (!record || !record.messageId) return;
-    const held = await readHeldStats();
-    held[record.messageId] = mergeHeldRecord(held[record.messageId], record);
-    const ids = Object.keys(held);
-    for (let i = 0; i < ids.length - STATS_HOLD_MAX; i++) delete held[ids[i]];
-    await writeHeldStats(held);
-    debugLog('[Stats] Background unavailable — held stats for message', String(record.messageId).substring(0, 8),
-        '(' + Object.keys(held).length + ' waiting)');
+// Adds/merges a record into the holding list. Returns the merged copy that was
+// stored, or null if storage.local couldn't be written.
+function holdStatsRecord(record) {
+    if (!record || !record.messageId) return Promise.resolve(null);
+    return withHeldStatsLock(async () => {
+        const held = await readHeldStats();
+        const merged = mergeHeldRecord(held[record.messageId], record);
+        held[record.messageId] = merged;
+        const ids = Object.keys(held);
+        for (let i = 0; i < ids.length - STATS_HOLD_MAX; i++) delete held[ids[i]];
+        return (await writeHeldStats(held)) ? merged : null;
+    });
+}
+
+// Removes the given records — but only those still exactly as they were sent,
+// so an update that arrived while sending stays held for the next attempt.
+function releaseHeldStats(sentById) {
+    return withHeldStatsLock(async () => {
+        const held = await readHeldStats();
+        let removed = 0;
+        Object.keys(sentById).forEach((id) => {
+            if (held[id] && JSON.stringify(held[id]) === JSON.stringify(sentById[id])) { delete held[id]; removed++; }
+        });
+        if (removed) await writeHeldStats(held);
+        return Object.keys(held).length;
+    });
 }
 
 // True only when the background positively confirmed the write.
 async function tryPutStatsRecord(record) {
     try {
-        const res = await sendStatsMessage('SAI_STATS_PUT', { record });
+        const res = await sendStatsMessage('SAI_STATS_PUT', { record }, 1, STATS_PUT_TIMEOUT_MS);
         return !!(res && res.success);
     } catch (_) {
         return false;
@@ -386,14 +437,179 @@ function warnOrionBackgroundDead() {
     setTimeout(() => { try { alert(ORION_BACKGROUND_DEAD_MSG); } catch (_) {} }, 0);
 }
 
-// Deliver a record, or park it. Returns 'stored' | 'held'.
+// ---------------------------------------------------------------------------
+// Background health: probe, reconnect, and (experimental) extension bridge.
+// On WebKit/iOS the background page can stop answering after the app is
+// backgrounded and is not always woken by the next message. Preferred recovery
+// (approach 1): probe it, and if it's silent open a FRESH port and probe again —
+// re-creating the connection is a workaround reported for the same WebKit bug.
+// Fallback (approach 3, Debug Mode + opt-in only): a hidden extension page
+// (bridge.html) that may be able to revive the background or write stats itself.
+// ---------------------------------------------------------------------------
+const BG_PROBE_TIMEOUT_MS = 2500;
+const BG_RECONNECT_DELAYS_MS = [300, 1000, 2000];
+const BG_DEAD_BACKOFF_MS = 30000;      // after a failed revive, don't retry on every save
+let _bgReviving = null;
+let _bgDeadUntil = 0;
+const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function probeBackground() {
+    return sendStatsMessage('SAI_KEEPALIVE_PING', null, 0, BG_PROBE_TIMEOUT_MS)
+        .then(res => !!(res && res.alive))
+        .catch(() => false);
+}
+
+// Resolves true if the background answers (possibly after reconnecting).
+// force: ignore the "recently failed" backoff (used by the debug buttons).
+function reviveBackground(force = false) {
+    if (_bgReviving) return _bgReviving;
+    if (!force && Date.now() < _bgDeadUntil) return Promise.resolve(false);
+    _bgReviving = (async () => {
+        const steps = [];
+        if (await probeBackground()) return { alive: true, via: 'already alive', steps };
+        for (const delay of BG_RECONNECT_DELAYS_MS) {
+            let port = null;
+            try { port = runtimeAPI.runtime.connect({ name: 'sai-wake' }); } catch (e) { steps.push('connect failed: ' + e.message); }
+            await _sleep(delay);
+            const ok = await probeBackground();
+            try { if (port) port.disconnect(); } catch (_) {}
+            steps.push('reconnect + ' + delay + ' ms: ' + (ok ? 'alive' : 'no answer'));
+            if (ok) return { alive: true, via: 'reconnect', steps };
+        }
+        if (await bridgeEnabled()) {
+            const r = await bridgeCall('revive');
+            steps.push('bridge revive: ' + (r.ok ? JSON.stringify(r.result) : r.error));
+            if (r.ok && r.result && r.result.after && r.result.after.alive) return { alive: true, via: 'bridge', steps };
+        }
+        return { alive: false, via: null, steps };
+    })().then((outcome) => {
+        _bgDeadUntil = outcome.alive ? 0 : Date.now() + BG_DEAD_BACKOFF_MS;
+        debugLog('[Core] Background health:', outcome.alive ? 'alive (' + outcome.via + ')' : 'NOT responding', outcome.steps);
+        _lastBackgroundHealth = outcome;
+        return outcome.alive;
+    }).catch(() => false).finally(() => { _bgReviving = null; });
+    return _bgReviving;
+}
+let _lastBackgroundHealth = null;
+
+// Run when the page loads and whenever the tab comes back to the foreground —
+// the moments the background is most likely to have been killed.
+async function checkBackgroundHealth() {
+    const alive = await reviveBackground();
+    if (alive) { if (_heldStatsMayExist) flushHeldStats(); }
+    else warnOrionBackgroundDead();
+    return alive;
+}
+
+// ---- Experimental extension bridge (bridge.html), Debug Mode + opt-in only ----
+const BRIDGE_ENABLED_KEY = 'experimentalBridge';
+const BRIDGE_TOKEN_KEY = 'bridgeToken';
+let _bridgeFrame = null;
+let _bridgeReady = null;
+const _bridgePending = new Map();
+
+async function bridgeEnabled() {
+    try {
+        const s = await withTimeout(runtimeAPI.storage.local.get(['debugMode', BRIDGE_ENABLED_KEY]), 4000, 'storage');
+        return s.debugMode === true && s[BRIDGE_ENABLED_KEY] === true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function getBridgeToken() {
+    const s = await withTimeout(runtimeAPI.storage.local.get(BRIDGE_TOKEN_KEY), 4000, 'storage');
+    if (typeof s[BRIDGE_TOKEN_KEY] === 'string' && s[BRIDGE_TOKEN_KEY].length >= 16) return s[BRIDGE_TOKEN_KEY];
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const token = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    await withTimeout(runtimeAPI.storage.local.set({ [BRIDGE_TOKEN_KEY]: token }), 4000, 'storage');
+    return token;
+}
+
+function bridgeOrigin() {
+    return runtimeAPI.runtime.getURL('').replace(/\/$/, '');
+}
+
+window.addEventListener('message', (ev) => {
+    if (!_bridgeFrame || ev.source !== _bridgeFrame.contentWindow || !ev.data) return;
+    if (ev.data.__saiBridge === 'reply' && _bridgePending.has(ev.data.id)) {
+        const done = _bridgePending.get(ev.data.id);
+        _bridgePending.delete(ev.data.id);
+        done(ev.data);
+    }
+});
+
+function ensureBridgeFrame() {
+    if (_bridgeReady) return _bridgeReady;
+    _bridgeReady = new Promise((resolve, reject) => {
+        const frame = document.createElement('iframe');
+        frame.setAttribute('aria-hidden', 'true');
+        frame.tabIndex = -1;
+        frame.style.cssText = 'position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none;left:-9999px;top:-9999px;';
+        const onMsg = (ev) => {
+            if (ev.source === frame.contentWindow && ev.data && ev.data.__saiBridge === 'ready') { cleanup(); resolve(frame); }
+        };
+        const timer = setTimeout(() => {
+            cleanup();
+            try { frame.remove(); } catch (_) {}
+            _bridgeFrame = null; _bridgeReady = null;
+            reject(new Error('bridge page did not load (blocked by the page or the browser)'));
+        }, 5000);
+        const cleanup = () => { clearTimeout(timer); window.removeEventListener('message', onMsg); };
+        window.addEventListener('message', onMsg);
+        _bridgeFrame = frame;
+        frame.src = runtimeAPI.runtime.getURL('bridge.html');
+        (document.body || document.documentElement).appendChild(frame);
+    });
+    return _bridgeReady;
+}
+
+// Always resolves: { ok: true, result } or { ok: false, error }.
+async function bridgeCall(cmd, extra, timeoutMs = 15000) {
+    try {
+        const frame = await ensureBridgeFrame();
+        const token = await getBridgeToken();
+        const id = 'b' + Date.now() + Math.random().toString(16).slice(2);
+        const reply = new Promise(resolve => _bridgePending.set(id, resolve));
+        frame.contentWindow.postMessage({ __saiBridge: 'request', id, cmd, token, ...(extra || {}) }, bridgeOrigin());
+        const res = await withTimeout(reply, timeoutMs, 'bridge ' + cmd).finally(() => _bridgePending.delete(id));
+        return res.ok ? { ok: true, result: res.result } : { ok: false, error: res.error || 'bridge error' };
+    } catch (e) {
+        return { ok: false, error: e && e.message ? e.message : String(e) };
+    }
+}
+
+// Write-ahead save. Returns 'stored' (background confirmed), 'held' (kept in the
+// holding list for a later retry) or 'lost' (neither worked — only possible if
+// storage.local itself is failing).
 async function putStatsRecordDurably(record) {
-    if (await tryPutStatsRecord(record)) {
-        if (_heldStatsMayExist) flushHeldStats();   // background is alive: catch up (not awaited)
+    const held = await holdStatsRecord(record);          // 1) durable first
+    const toSend = held || record;                        //    (send the merged copy)
+    // 2) then the database. If a revive just failed, don't make every save wait out
+    //    the full time limit again — the record is already safe in the holding list.
+    const knownDead = held && Date.now() < _bgDeadUntil;
+    let saved = knownDead ? false : await tryPutStatsRecord(toSend);
+    if (!saved && !knownDead && await reviveBackground()) {             //    silent? probe + reconnect, retry once
+        saved = await tryPutStatsRecord(toSend);
+    }
+    if (!saved && await bridgeEnabled()) {                //    experimental: write via the extension bridge page
+        const viaBridge = await bridgeCall('put', { record: toSend });
+        saved = viaBridge.ok;
+        debugLog('[Stats] Bridge fallback for message', String(toSend.messageId).substring(0, 8), viaBridge.ok ? 'stored' : 'failed: ' + viaBridge.error);
+    }
+    if (saved) {
+        if (held) await releaseHeldStats({ [toSend.messageId]: toSend });
+        if (_heldStatsMayExist) flushHeldStats();         //    catch up on anything still held
         return 'stored';
     }
-    await holdStatsRecord(record);
     warnOrionBackgroundDead();
+    if (!held) {
+        console.warn('[Stats] Could not save stats for message', String(record.messageId).substring(0, 8),
+            '— neither the background page nor extension storage responded');
+        return 'lost';
+    }
+    debugLog('[Stats] Background unavailable — kept stats for message', String(record.messageId).substring(0, 8), 'in the holding list');
     return 'held';
 }
 
@@ -406,34 +622,44 @@ function flushHeldStats() {
         const held = await readHeldStats();
         const ids = Object.keys(held);
         if (!ids.length) { _heldStatsMayExist = false; return 0; }
-        const delivered = [];
+        const delivered = {};
         for (const id of ids) {
             if (!(await tryPutStatsRecord(held[id]))) break;
-            delivered.push(id);
+            delivered[id] = held[id];
         }
-        if (delivered.length) {
-            const latest = await readHeldStats();
-            delivered.forEach((id) => {
-                // Only drop it if it wasn't updated while we were sending
-                if (JSON.stringify(latest[id]) === JSON.stringify(held[id])) delete latest[id];
-            });
-            await writeHeldStats(latest);
-            debugLog('[Stats] Delivered', delivered.length, 'held stats record(s);', Object.keys(latest).length, 'still waiting');
+        const n = Object.keys(delivered).length;
+        if (n) {
+            const waiting = await releaseHeldStats(delivered);
+            debugLog('[Stats] Delivered', n, 'held stats record(s);', waiting, 'still waiting');
         }
-        return delivered.length;
+        return n;
     })().catch(() => 0).finally(() => { _heldStatsFlushing = null; });
     return _heldStatsFlushing;
 }
 
-async function removeHeldStats(messageId) {
-    if (!_heldStatsMayExist) return;
-    const held = await readHeldStats();
-    if (held[messageId]) { delete held[messageId]; await writeHeldStats(held); }
+function removeHeldStats(messageId) {
+    if (!_heldStatsMayExist) return Promise.resolve();
+    return withHeldStatsLock(async () => {
+        const held = await readHeldStats();
+        if (held[messageId]) { delete held[messageId]; await writeHeldStats(held); }
+    });
 }
 
-async function clearHeldStats() {
-    await writeHeldStats({});
+function clearHeldStats() {
+    return withHeldStatsLock(() => writeHeldStats({}));
 }
+
+// Keep retrying while anything is held: every minute, and as soon as the tab
+// comes back to the foreground (the moment Orion is most likely to have just
+// restored the background page).
+setInterval(() => { if (_heldStatsMayExist) flushHeldStats(); }, STATS_HOLD_RETRY_MS);
+// Tab back in front (or restored from the back/forward cache): check the
+// background is still there, reconnect if not, then deliver anything held.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkBackgroundHealth();
+});
+window.addEventListener('pageshow', (e) => { if (e.persisted) checkBackgroundHealth(); });
+setTimeout(() => { checkBackgroundHealth(); }, 1500);
 
 // Parked records for one character, in the same shape the store returns.
 async function getHeldStatsForCharacter(characterId) {
@@ -2878,7 +3104,7 @@ button[data-testid="ContextCapIndicator-Button"] {
         let map = {};
         if (characterId) {
             try {
-                const res = await sendStatsMessage('SAI_STATS_GET_CHARACTER', { characterId });
+                const res = await sendStatsMessage('SAI_STATS_GET_CHARACTER', { characterId }, 1, STATS_READ_TIMEOUT_MS);
                 if (res && res.success && res.stats) {
                     map = res.stats;
                     if (_heldStatsMayExist) flushHeldStats();   // background is alive: catch up
@@ -3095,7 +3321,7 @@ button[data-testid="ContextCapIndicator-Button"] {
             // background page isn't answering (see putStatsRecordDurably).
             const outcome = await putStatsRecordDurably(record);
             invalidateStatsCache();
-            debugLog('[Stats]', outcome === 'stored' ? 'Stored' : 'Held (background unavailable)',
+            debugLog('[Stats]', outcome === 'stored' ? 'Stored' : outcome === 'held' ? 'Held (background unavailable)' : 'LOST',
                 'stats for character:', characterId, 'message:', messageId, record);
         }));
     }
@@ -4054,12 +4280,17 @@ button[data-testid="ContextCapIndicator-Button"] {
         // Extract character name from existing title. SpicyChat's own native title
         // format has changed over time — try both so this survives either one:
         //   legacy:  "Chat with {name} - AI Sex Chatbot | Spicychat"
-        //   current: "Chat with {name} on Spicychat"
+        //   current: "Chat with {name} on SpicyChat"
+        // The brand's capitalisation has flipped between "Spicychat" and
+        // "SpicyChat", so every match here is case-insensitive — a
+        // case-sensitive miss falls through to the short-title branch and
+        // treats the whole native title as the character name.
         // Also handle already-shortened format: just "{name}" or "{name} (label)"
         let characterName = null;
-        const legacyFullTitleMatch = document.title.match(/^Chat with (.+) - AI Sex Chatbot \| Spicychat$/);
-        const currentFullTitleMatch = document.title.match(/^Chat with (.+) on Spicychat$/);
+        const legacyFullTitleMatch = document.title.match(/^Chat with (.+) - AI Sex Chatbot \| Spicychat$/i);
+        const currentFullTitleMatch = document.title.match(/^Chat with (.+) on Spicychat$/i);
         const shortTitleMatch = document.title.match(/^([^(]+?)(?:\s*\([^)]+\))?$/);
+        const titleLooksNative = /spicychat/i.test(document.title) || /^Chat with /i.test(document.title);
 
         if (legacyFullTitleMatch) {
             characterName = legacyFullTitleMatch[1];
@@ -4067,7 +4298,7 @@ button[data-testid="ContextCapIndicator-Button"] {
         } else if (currentFullTitleMatch) {
             characterName = currentFullTitleMatch[1];
             debugLog('[ChatTitle UPDATE]   - Extracted character name from current full title:', characterName);
-        } else if (shortTitleMatch && !document.title.includes('Spicychat')) {
+        } else if (shortTitleMatch && !titleLooksNative) {
             // Already shortened, extract base name (before any label in parentheses)
             characterName = shortTitleMatch[1].trim();
             debugLog('[ChatTitle UPDATE]   - Extracted character name from shortened title:', characterName);
@@ -9001,6 +9232,18 @@ button[data-testid="ContextCapIndicator-Button"] {
                             <button class="btn-data" id="debug-filter-all-btn">Enable All</button>
                             <button class="btn-data" id="debug-filter-none-btn">Disable All</button>
                         </div>
+                        <div id="bg-experiment-section" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(74,222,128,0.3);">
+                            <div style="font-size: 0.75rem; font-weight: 600; color: #4ade80; margin-bottom: 0.4rem;">Background page (experimental)</div>
+                            <label class="debug-filter-label" style="display: block; margin-bottom: 0.5rem;">
+                                <input type="checkbox" id="bridge-enabled-checkbox"> Use extension-page fallback (bridge) when the background doesn't answer
+                            </label>
+                            <div class="data-buttons">
+                                <button class="btn-data" id="bg-check-btn">Check background</button>
+                                <button class="btn-data" id="bg-revive-btn">Try revive</button>
+                                <button class="btn-data" id="bg-reload-btn" style="color: #dc2626; border-color: #dc2626;">Restart extension</button>
+                            </div>
+                            <pre id="bg-experiment-output" style="margin-top: 0.5rem; padding: 0.5rem; max-height: 220px; overflow: auto; background: rgba(0,0,0,0.3); border-radius: 4px; color: #d1d5db; font-size: 10px; white-space: pre-wrap; word-break: break-word; user-select: text; -webkit-user-select: text;">Results appear here.</pre>
+                        </div>
                         <div id="model-override-section" style="display: none; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(255,140,0,0.3);">
                             <div style="font-size: 0.75rem; font-weight: 600; color: #ff8c00; margin-bottom: 0.4rem;">Model Override <span style="color: #9ca3af; font-weight: 400; font-size: 0.7rem;">(quad-click "Model" to toggle)</span></div>
                             <input type="text" id="model-override-input" placeholder="e.g. glm5-beta" autocomplete="off" style="width: 100%; box-sizing: border-box; padding: 0.4rem 0.5rem; background: rgba(255,140,0,0.08); border: 1px solid rgba(255,140,0,0.5); border-radius: 4px; color: #ff8c00; font-size: 0.75rem; outline: none; font-family: monospace;">
@@ -9214,6 +9457,62 @@ button[data-testid="ContextCapIndicator-Button"] {
             });
         }
         
+        // ---- Background page experiment (Debug Mode only) ----
+        const bridgeEnabledCheckbox = shadow.querySelector('#bridge-enabled-checkbox');
+        const bgCheckBtn = shadow.querySelector('#bg-check-btn');
+        const bgReviveBtn = shadow.querySelector('#bg-revive-btn');
+        const bgReloadBtn = shadow.querySelector('#bg-reload-btn');
+        const bgExperimentOutput = shadow.querySelector('#bg-experiment-output');
+        const showBgResult = (title, obj) => {
+            bgExperimentOutput.textContent = new Date().toLocaleTimeString() + ' — ' + title + '\n' + JSON.stringify(obj, null, 1);
+            debugLog('[Core] Background experiment:', title, obj);
+        };
+        const runBgAction = async (btn, title, fn) => {
+            btn.disabled = true;
+            bgExperimentOutput.textContent = title + '…';
+            try { showBgResult(title, await fn()); }
+            catch (err) { showBgResult(title + ' failed', { error: err && err.message }); }
+            btn.disabled = false;
+        };
+        try {
+            const s = await runtimeAPI.storage.local.get(BRIDGE_ENABLED_KEY);
+            bridgeEnabledCheckbox.checked = s[BRIDGE_ENABLED_KEY] === true;
+        } catch (_) {}
+        // Saved immediately (like the debug filters): it changes behaviour without a reload.
+        bridgeEnabledCheckbox.onchange = async (e) => {
+            await runtimeAPI.storage.local.set({ [BRIDGE_ENABLED_KEY]: e.target.checked });
+            showBgResult('Bridge fallback ' + (e.target.checked ? 'ON' : 'OFF'), { experimentalBridge: e.target.checked });
+        };
+        bgCheckBtn.onclick = (e) => {
+            e.stopPropagation();
+            runBgAction(bgCheckBtn, 'Check background', async () => {
+                const out = { browser: isOrionOnIOS() ? 'Orion on iOS' : 'other', extensionUrl: runtimeAPI.runtime.getURL('') };
+                out.backgroundAnswersPing = await probeBackground();
+                out.heldStatsWaiting = Object.keys(await readHeldStats()).length;
+                out.lastAutomaticCheck = _lastBackgroundHealth;
+                out.bridge = (await bridgeEnabled()) ? await bridgeCall('diagnose') : 'off (tick the box above to test it)';
+                return out;
+            });
+        };
+        bgReviveBtn.onclick = (e) => {
+            e.stopPropagation();
+            runBgAction(bgReviveBtn, 'Try revive', async () => {
+                const before = await probeBackground();
+                const alive = await reviveBackground(true);
+                const out = { before, after: alive, details: _lastBackgroundHealth };
+                if (alive) out.heldStatsDelivered = await flushHeldStats();
+                return out;
+            });
+        };
+        bgReloadBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (!confirm('Restart the extension through the bridge page?\n\nThis page will lose its connection to the extension and need a refresh.')) return;
+            runBgAction(bgReloadBtn, 'Restart extension', async () => {
+                if (!(await bridgeEnabled())) return { error: 'Tick "Use extension-page fallback" first — restart goes through the bridge page.' };
+                return await bridgeCall('reload');
+            });
+        };
+
         // Debug filter "Enable All" button
         const debugFilterAllBtn = shadow.querySelector('#debug-filter-all-btn');
         if (debugFilterAllBtn) {
@@ -10089,6 +10388,7 @@ button[data-testid="ContextCapIndicator-Button"] {
                         } else if (res === undefined) {
                             if (_wakeAttempt < BACKGROUND_WAKE_DELAYS_MS.length) {
                                 debugLog('[Sync] Empty reply to', type, '— background not responding, retry', _wakeAttempt + 1, 'of', BACKGROUND_WAKE_DELAYS_MS.length);
+                                reviveBackground(true);   // probe + fresh port while we wait
                                 setTimeout(() => sendDriveMessage(type, payload, _retries, _wakeAttempt + 1).then(resolve).catch(reject),
                                     BACKGROUND_WAKE_DELAYS_MS[_wakeAttempt]);
                             } else {
@@ -10656,6 +10956,8 @@ button[data-testid="ContextCapIndicator-Button"] {
                     delete exportData.enableCustomStyle;
                     delete exportData.customStyleValues;
                     delete exportData.styleOverridesMigration;   // per-device migration marker
+                    delete exportData.bridgeToken;               // per-device secret for the debug bridge
+                    delete exportData.experimentalBridge;
                     delete exportData.pendingStatsRecords;   // internal holding list, already flushed above
 
                     // Upload from HERE, not the background page. A ~20 MB body sent

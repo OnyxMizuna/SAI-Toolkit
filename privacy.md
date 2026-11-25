@@ -81,7 +81,7 @@ The extension stores limited information locally using the browser's `storage.lo
 - **Generation Statistics:** Metadata about message generation (e.g., model type, token count, temperature, top_p, top_k, timestamps) for debugging and display purposes. These records are kept in a local **IndexedDB** database (`sai_toolkit_stats`) on your device.
 - **Style Overrides:** Optional message background and button hover colors, plus any uploaded chat background image (stored as a local data URL).
 - **Legacy Custom Style Values:** If you used the retired Custom Style feature, its saved colors/fonts remain stored locally until you click **Clear Custom Style data** in the Style tab, so you can export them first.
-- **Pending Statistics:** If the background page is temporarily unavailable, new generation statistics are held in `storage.local` (`pendingStatsRecords`) and moved into the IndexedDB database once it responds again.
+- **Pending Statistics:** New generation statistics are first written to `storage.local` (`pendingStatsRecords`) and removed once the IndexedDB database confirms them, so they survive the background page being unavailable.
 - **Exported Data:** When you use the export feature, chat data is prepared for download but is never sent externally.
 - **NSFW Mode State:** If you toggle NSFW image mode, your preference is stored locally.
 - **Failed Message Queue (only if Message Recovery is enabled):** Locally saved copies of messages whose send to SpicyChat failed — see section 1.3.
