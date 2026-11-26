@@ -433,3 +433,13 @@ The **iOS**-marked steps above, gathered for a phone-only run:
 - [ ] Orion: stats for messages generated while the background page was
       unloaded are kept and delivered later, and the one-time alert explains
       the Orion bug and the force-quit fix (3)
+
+## 13. Proposed compatibility and reliability regression pass
+
+- [ ] Story with entire history loaded: first message is #1, last matches API total; long window retains absolute numbering; alternatives share one number and one combined index; repeat reload and Auto Story Mode.
+- [ ] Two unrelated 2/2 and 3/3 groups: alternate each, rapidly alternate during generation, use mouse and keyboard, reload, navigate chats. Stats must correspond to the visible message identity. If identity cannot be established, no guessed version stats should appear.
+- [ ] Public Rulebook issue #3: new chat without first prompt, public Rulebook, send prompt, verify attachment. Test Firefox/Edge with Toolkit disabled, enabled/default, Sidebar Layout only, then other settings individually. Compare native request payloads locally; do not log credentials. No speculative API fix included.
+- [ ] Export 116k+ messages (JSON and HTML separately), verify IDs/count/ordering against an independent export and expected conversation; test duplicate pages, empty terminal page, timestamp formats, 429 with Retry-After, network interruption, cancellation, concurrent attempts, and no silent partial downloads. Compare duration to the 6m25s QoL reference; this is a benchmark, not a promised runtime.
+- [ ] Toolkit capability attribute appears without QoL, reports actual installed version and independent feature flags, updates after settings changes/import/restore and theme changes, contains no sensitive values. Test both extension initialization orders and older/absent Toolkit.
+- [ ] Test both extensions' overlapping UI features independently and together, including recovery/auto-retry and native Rulebook/Lorebook attachment. Confirm no duplicate sends, no broken streaming, no stale CSS, and retained QoL-only features.
+- [ ] Preserve v1.3.2 Orion background holding/reconnect, Drive and bridge tests above. Firefox alternate manifest must have identical resources to main Firefox manifest.

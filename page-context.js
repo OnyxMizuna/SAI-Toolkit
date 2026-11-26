@@ -289,12 +289,26 @@ console.log('[Core] Reset function available: resetSAIToolkitOnboarding()');
 // without CSP blocking inline scripts. Content script sends a request via
 // postMessage, we fetch the data, and send it back.
 
+const saiActiveChatExports = new Set();
+
 window.addEventListener('message', async function(event) {
     // Only handle our specific export request
     if (event.source !== window) return;
-    if (event.data.type !== 'SAI_EXPORT_CHAT_REQUEST') return;
+    if (event.data?.type !== 'SAI_EXPORT_CHAT_REQUEST') return;
 
-    const { characterId, conversationId } = event.data;
+    const { characterId, conversationId, requestId } = event.data;
+    if (typeof requestId !== 'string' || !requestId || typeof characterId !== 'string' || !characterId) return;
+    if (saiActiveChatExports.has(requestId)) return;
+    if (saiActiveChatExports.size) {
+        window.postMessage({ type: 'SAI_EXPORT_CHAT_RESPONSE', requestId, success: false, error: 'A chat export is already running' }, '*');
+        return;
+    }
+    saiActiveChatExports.add(requestId);
+    const controller = new AbortController();
+    const cancelHandler = event => {
+        if (event.source === window && event.data?.type === 'SAI_EXPORT_CHAT_CANCEL' && event.data.requestId === requestId) controller.abort();
+    };
+    window.addEventListener('message', cancelHandler);
 
     try {
         let authToken = null;
@@ -363,140 +377,151 @@ window.addEventListener('message', async function(event) {
 
         console.log('[Export] Fetching from API with character ID:', characterId, 'conversation ID:', conversationId);
 
-        // Fetch messages for specific conversation
-        // If conversation ID is not provided, use the character-level endpoint
-        const messagesBaseUrl = conversationId && conversationId !== 'null'
-            ? `https://prod.nd-api.com/characters/${characterId}/messages/${conversationId}`
-            : `https://prod.nd-api.com/characters/${characterId}/messages`;
-
-        // PAGINATE. The messages endpoint silently caps a single response body at
-        // ~1MB — with no limit it returns only the most recent ~625 messages of a
-        // longer conversation and drops the rest, which is exactly the "exports
-        // cut off around 1MB" bug. So walk the history in pages the way the site's
-        // own "Load Previous Chapters" button does: ?limit=N returns the newest N,
-        // and ?limit=N&last_id=<oldest id we have> returns the N older than that.
-        // We page backward with the oldest id as the cursor until the history is
-        // exhausted, then merge + de-dupe. limit=300 keeps each page (~0.5MB here)
-        // safely under the cap while minimizing round-trips.
+        // Keep the existing authentication headers, but bound each request rather
+        // than the complete export. Retry only transient failures of idempotent GETs.
         const PAGE_LIMIT = 300;
-        const MAX_PAGES = 500; // hard safety valve (150k messages) against a loop
-        const messagesById = new Map(); // id -> message, de-dupes across pages
-        let messagesData = null;        // first (newest) page, reused for metadata
-        let cursorLastId = null;        // oldest id seen so far = next page's cursor
+        const MAX_PAGES = 100000;
+        const messagesById = new Map();
+        const seenCursors = new Set();
+        let messagesData = null;
+        let cursorLastId = null;
         let pageNum = 0;
-
-        while (pageNum < MAX_PAGES) {
-            const pageUrl = messagesBaseUrl + `?limit=${PAGE_LIMIT}` +
-                (cursorLastId ? `&last_id=${encodeURIComponent(cursorLastId)}` : '') + '&';
-            const pageResponse = await fetch(pageUrl, {
-                method: 'GET',
-                headers: headers,
-                credentials: 'include'
-            });
-
-            if (!pageResponse.ok) {
-                // A failure on the very first page is fatal; on a later page we keep
-                // whatever history we've already gathered rather than losing it all.
-                if (pageNum === 0) {
-                    throw new Error('Failed to fetch messages: ' + pageResponse.status);
+        let lockedConversationId = conversationId && conversationId !== 'null' ? conversationId : null;
+        let reachedEnd = false;
+        const expected = () => {
+            if (messagesData?.num_messages == null) return null;
+            const n = Number(messagesData.num_messages);
+            return Number.isSafeInteger(n) && n >= 0 ? n : null;
+        };
+        const progress = phase => window.postMessage({
+            type: 'SAI_EXPORT_CHAT_PROGRESS', requestId, count: messagesData?.messages?.length || messagesById.size,
+            expected: expected(), page: pageNum, phase
+        }, '*');
+        const checkCancelled = () => {
+            if (controller.signal.aborted) throw new Error('Export cancelled');
+        };
+        const wait = ms => new Promise((resolve, reject) => {
+            if (controller.signal.aborted) return reject(new Error('Export cancelled'));
+            const onAbort = () => { clearTimeout(timer); reject(new Error('Export cancelled')); };
+            const timer = setTimeout(() => { controller.signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+            controller.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        async function getJSON(url) {
+            for (let attempt = 0; attempt < 3; attempt++) {
+                checkCancelled();
+                const requestController = new AbortController();
+                const onAbort = () => requestController.abort();
+                controller.signal.addEventListener('abort', onAbort, { once: true });
+                const timer = setTimeout(() => requestController.abort(), 45000);
+                let retryAfter = 0;
+                try {
+                    const response = await fetch(url, { method: 'GET', headers, credentials: 'include', signal: requestController.signal });
+                    if (!response.ok) {
+                        const error = new Error(`HTTP ${response.status}`);
+                        error.permanent = ![408, 425, 429, 500, 502, 503, 504].includes(response.status);
+                        const raw = response.headers.get('Retry-After');
+                        if (raw) {
+                            const seconds = Number(raw);
+                            retryAfter = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(raw) - Date.now();
+                        }
+                        // Avoid retaining unconsumed response streams across retries.
+                        try { await response.body?.cancel(); } catch (_) {}
+                        throw error;
+                    }
+                    const result = await response.json();
+                    checkCancelled();
+                    return result;
+                } catch (error) {
+                    checkCancelled();
+                    if (error.permanent || attempt === 2) throw error;
+                    // Honor server backoff. If it exceeds the idle budget, stop clearly
+                    // instead of repeatedly hitting a rate-limited endpoint.
+                    if (retryAfter > 120000) throw new Error('Server requested a long retry delay; retry the export later');
+                    progress(`Temporary request failure; retry ${attempt + 1}/2`);
+                } finally {
+                    clearTimeout(timer);
+                    controller.signal.removeEventListener('abort', onAbort);
                 }
-                console.warn('[Export] Pagination page', pageNum + 1, 'failed with', pageResponse.status,
-                    '- stopping with', messagesById.size, 'messages gathered');
-                break;
+                await wait(Math.max(1000 * 2 ** attempt, Number.isFinite(retryAfter) ? retryAfter : 0));
             }
-
-            const pageData = await pageResponse.json();
-            if (!messagesData) messagesData = pageData; // keep newest page's metadata
-            const pageMsgs = Array.isArray(pageData.messages) ? pageData.messages : [];
-
-            let addedThisPage = 0;
+        }
+        function timestampOf(message) {
+            const value = message.createdAt ?? message.created_at;
+            if (typeof value === 'number') return Number.isFinite(value) ? value : NaN;
+            if (typeof value === 'string' && value.trim()) {
+                const numeric = Number(value);
+                return Number.isFinite(numeric) ? numeric : Date.parse(value);
+            }
+            return NaN;
+        }
+        progress('Fetching chat');
+        while (pageNum < MAX_PAGES) {
+            checkCancelled();
+            const base = `https://prod.nd-api.com/characters/${encodeURIComponent(characterId)}/messages` +
+                (lockedConversationId ? `/${encodeURIComponent(lockedConversationId)}` : '');
+            const url = base + `?limit=${PAGE_LIMIT}` + (cursorLastId ? `&last_id=${encodeURIComponent(cursorLastId)}` : '') + '&';
+            const pageData = await getJSON(url);
+            if (!pageData || !Array.isArray(pageData.messages)) throw new Error(`Invalid message page ${pageNum + 1}`);
+            const returnedId = pageData.conversation_id || pageData.chat_id || null;
+            if (lockedConversationId && returnedId && returnedId !== lockedConversationId) throw new Error('Conversation changed during export');
+            if (!lockedConversationId && returnedId) lockedConversationId = returnedId;
+            if (!messagesData) messagesData = { ...pageData, messages: [] };
+            const pageMsgs = pageData.messages;
+            pageNum++;
+            if (pageMsgs.length === 0) { reachedEnd = true; break; }
+            let added = 0;
             let oldestTs = Infinity;
             let oldestId = null;
-            for (const m of pageMsgs) {
-                if (m && m.id && !messagesById.has(m.id)) {
-                    messagesById.set(m.id, m);
-                    addedThisPage++;
-                }
-                const ts = m && (m.createdAt || m.created_at);
-                if (typeof ts === 'number' && ts < oldestTs) {
-                    oldestTs = ts;
-                    oldestId = m.id;
-                }
+            for (const message of pageMsgs) {
+                if (!message || typeof message.id !== 'string' || !message.id) throw new Error(`Message without an ID on page ${pageNum}`);
+                const ts = timestampOf(message);
+                if (!Number.isFinite(ts)) throw new Error(`Message without a valid timestamp on page ${pageNum}`);
+                if (!messagesById.has(message.id)) { messagesById.set(message.id, message); added++; }
+                if (ts <= oldestTs) { oldestTs = ts; oldestId = message.id; }
             }
-            pageNum++;
-            console.log('[Export] Page', pageNum, '- received', pageMsgs.length, ', new', addedThisPage,
-                ', running total', messagesById.size, 'of', messagesData.num_messages);
-
-            // Termination — robust to alternatives inflating counts vs num_messages:
-            //   empty page = reached the beginning; no new ids = wrapped/duplicate;
-            //   cursor didn't advance = the endpoint ignored last_id (e.g. the
-            //   character-level fallback), so there's nothing more to page.
-            if (pageMsgs.length === 0) break;
-            if (addedThisPage === 0) break;
-            if (!oldestId || oldestId === cursorLastId) break;
+            progress('Fetching chat');
+            if (!added) {
+                // Some cursor endpoints repeat the last record at the beginning.
+                // Only accept the exact terminal cursor record and a satisfied total.
+                if (pageMsgs.length === 1 && pageMsgs[0].id === cursorLastId && expected() !== null && messagesById.size >= expected()) {
+                    reachedEnd = true; break;
+                }
+                throw new Error(`Pagination stopped making progress after ${messagesById.size} messages; no incomplete file was saved`);
+            }
+            if (!lockedConversationId) throw new Error('Cannot verify the conversation ID for subsequent export pages');
+            if (!oldestId || oldestId === cursorLastId || seenCursors.has(oldestId)) throw new Error('Pagination cursor repeated; no incomplete file was saved');
+            seenCursors.add(oldestId);
             cursorLastId = oldestId;
         }
-
+        if (!reachedEnd) throw new Error('Export reached its pagination safety limit; no incomplete file was saved');
+        if (expected() !== null && messagesById.size < expected()) throw new Error(`Incomplete export: got ${messagesById.size} of ${expected()} reported messages`);
+        checkCancelled();
+        progress('Sorting messages');
         if (!messagesData) messagesData = { messages: [] };
-        // Replace the windowed array with the full, de-duped, chronological history.
-        messagesData.messages = Array.from(messagesById.values())
-            .sort((a, b) => (a.createdAt || a.created_at || 0) - (b.createdAt || b.created_at || 0));
-        console.log('[Export] Messages received:', messagesData.messages.length,
-            'across', pageNum, 'page(s); API num_messages =', messagesData.num_messages);
-
-        // Also fetch character info
-        const characterResponse = await fetch(`https://prod.nd-api.com/v2/characters/${characterId}`, {
-            method: 'GET',
-            headers: headers,
-            credentials: 'include'
-        });
-
+        messagesData.messages = Array.from(messagesById.values()).sort((a, b) => timestampOf(a) - timestampOf(b));
+        messagesById.clear();
+        if (lockedConversationId) messagesData.conversation_id = lockedConversationId;
         let characterData = null;
-        if (characterResponse.ok) {
-            characterData = await characterResponse.json();
-        }
-
-        // A character that's since been made private/unlisted returns `{}` from
-        // the direct lookup above (still 200 OK, just empty — not an error we can
-        // catch). The conversations list embeds a denormalized character snapshot
-        // (name/avatar/title) per conversation that isn't gated by the character's
-        // current visibility, since it's just your own conversation history — so
-        // fall back to it when the direct lookup didn't give us a name.
-        if (!characterData || !characterData.name) {
+        progress('Fetching character details');
+        try {
+            characterData = await getJSON(`https://prod.nd-api.com/v2/characters/${encodeURIComponent(characterId)}`);
+        } catch (error) { checkCancelled(); console.warn('[Export] Character lookup failed:', error.message); }
+        if (!characterData?.name && lockedConversationId) {
             try {
-                const conversationsResponse = await fetch('https://prod.nd-api.com/v2/conversations?limit=500', {
-                    method: 'GET',
-                    headers: headers,
-                    credentials: 'include'
-                });
-                if (conversationsResponse.ok) {
-                    const conversations = await conversationsResponse.json();
-                    const match = Array.isArray(conversations)
-                        ? conversations.find((c) => c.id === conversationId || c.character_id === characterId)
-                        : null;
-                    if (match && match.character) {
-                        characterData = { ...characterData, ...match.character };
-                    }
-                }
-            } catch (e) {
-                console.error('[Export] Conversations fallback for character info failed:', e);
-            }
+                const conversations = await getJSON('https://prod.nd-api.com/v2/conversations?limit=500');
+                const match = Array.isArray(conversations) ? conversations.find(c => c.id === lockedConversationId) : null;
+                if (match?.character) characterData = { ...characterData, ...match.character };
+            } catch (error) { checkCancelled(); console.warn('[Export] Character fallback failed:', error.message); }
         }
-
-        // Send data back via postMessage
-        window.postMessage({
-            type: 'SAI_EXPORT_CHAT_RESPONSE',
-            success: true,
-            messages: messagesData,
-            character: characterData
-        }, '*');
+        checkCancelled();
+        window.postMessage({ type: 'SAI_EXPORT_CHAT_PROGRESS', requestId, count: messagesData.messages.length, expected: expected(), page: pageNum, phase: 'Preparing download' }, '*');
+        window.postMessage({ type: 'SAI_EXPORT_CHAT_RESPONSE', requestId, success: true, messages: messagesData, character: characterData }, '*');
     } catch (error) {
         console.error('[Export] Error fetching chat data:', error);
-        window.postMessage({
-            type: 'SAI_EXPORT_CHAT_RESPONSE',
-            success: false,
-            error: error.message
-        }, '*');
+        window.postMessage({ type: 'SAI_EXPORT_CHAT_RESPONSE', requestId, success: false, error: error.message }, '*');
+    } finally {
+        window.removeEventListener('message', cancelHandler);
+        saiActiveChatExports.delete(requestId);
     }
 });
 

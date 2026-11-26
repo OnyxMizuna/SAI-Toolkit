@@ -7,12 +7,12 @@ Enhanced features for SpicyChat including generation profiles, sidebar layout, t
 
 - **Generation Settings Profiles**: Save and load different generation settings configurations
 - **Sidebar Layout**: Pin Generation Settings and Memories modals to the side of the screen
-- **Classic Theme**: Apply classic SpicyChat colors and styling (credit: MssAcc)
+- **Appearance Overrides**: Optional Light/Dark message backgrounds, button hover colors, custom chat backgrounds and layout details. Native SpicyChat Chat Appearance handles retired Classic Style and formatting options.
 - **Hide "For You" Characters**: Automatically hide "For You" tagged characters on the main page
 - **Page Jump**: Click pagination "..." to jump directly to any page number
 - **Generation Stats**: Display model info and timestamps on bot messages
 - **Toolkit Settings**: Access all features through a unified settings modal
-- **Chat Export**: Export your current conversation as JSON or HTML (with images embedded)
+- **Chat Export**: Export your current conversation as JSON or HTML (with images embedded). Paginated history export shows progress and supports cancellation; failed or stalled pagination is reported rather than silently saving partial history.
 - **NSFW Mode Toggle**: Toggle NSFW image mode directly from the chat UI; state is stored locally and never transmitted
 - **Message Recovery** *(opt-in, off by default)*: When SpicyChat's chat backend fails (502, CORS, network drop, timeout) the message you typed is normally lost — the input clears the moment you press Send and only an "Oops!" banner remains. With this enabled, the extension captures the outgoing text at send time, persists it locally **only if the send fails**, and shows a "Recover message" button next to SpicyChat's "Resubmit" button so you can restore your message into the input field. Captured text never leaves your browser. Toggle in the Features tab of the S.AI Settings modal.
 - **Import/Export Statistics**: Backup or restore your generation statistics and settings with one click
@@ -38,7 +38,7 @@ The extension is optimized for minimal performance impact:
 
 ### Chrome/Edge
 1. Download the extension folder
-2. Open Chrome/Edge and navigate to `chrome://extensions/`
+2. In a separate working copy, copy `manifest.chrome.json` over `manifest.json` (MV3). Then open Chrome/Edge and navigate to `chrome://extensions/` or `edge://extensions/`.
 3. Enable "Developer mode" (toggle in top right)
 4. Click "Load unpacked"
 5. Select the extension folder
@@ -51,8 +51,9 @@ extension/
 ### File Structure
 ```
 extension/
-├── manifest.json           # Extension manifest (Chrome/Edge/Firefox)
-├── manifest.chrome.json    # Chrome-specific manifest (if needed)
+├── manifest.json           # Firefox MV2 manifest
+├── manifest.firefox.json   # Matching alternate Firefox MV2 manifest
+├── manifest.chrome.json    # Chrome/Edge MV3 manifest
 ├── background.js           # Background service worker
 ├── content.js              # Main content script (injected into pages)
 ├── storage-wrapper.js      # Storage API wrapper (cross-browser)
@@ -78,8 +79,8 @@ web-ext run --source-dir=extension/
 # Build for Firefox
 web-ext build --source-dir=extension/
 
-# Test in Chrome
-# Just use chrome://extensions/ Load unpacked
+# Test in Chrome/Edge (in a separate copy)
+# Copy manifest.chrome.json to manifest.json, then Load unpacked
 ```
 
 ## Migration from Userscript
@@ -103,7 +104,7 @@ The extension uses `browser.storage.local` with unlimited storage permission, al
 - Persist NSFW mode and other feature toggles locally
 
 **Privacy:**
-- All data is stored locally in your browser and never transmitted externally
+- Settings and statistics are stored locally by default. Optional Google Drive synchronization and backups transmit selected data to the user's Google Drive account.
 - No personal or message content is collected or sent to any server
 - See `privacy.md` for full details
 
@@ -126,3 +127,7 @@ Same as the original userscript project. See LICENSE for details.
 
 - Original userscript: OnyxMizuna
 - Classic theme CSS: MssAcc (Discord)
+
+## Optional extension interoperability
+
+Toolkit publishes `data-sai-toolkit-capabilities` on the document root (JSON, `schemaVersion: 1`, `version`, `features` booleans). Listen for `sai-toolkit-capabilities-changed` and reread the attribute. The fields express configured feature ownership, not a guarantee of rendering on every route. Profiles are effective when saved profiles exist or the legacy force-enable flag is set. Color-specific flags reflect the active native Light/Dark theme; no stored colors, images, profiles, messages or credentials are exposed. Missing or unknown schema means unknown capability. This interface is informational, not a trust or security boundary, and Toolkit does not depend on QoL.

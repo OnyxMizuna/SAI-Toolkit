@@ -3784,7 +3784,7 @@ button[data-testid="ContextCapIndicator-Button"] {
             for (const msg of allMessages) {
                 if (!msg.id) continue;
                 
-                if (msg.is_alternative && msg.prev_id) {
+                if (msg.isBot && msg.prev_id && alternativeMessageGroups[msg.prev_id]) {
                     // This is part of an alternative group
                     // Only count the FIRST one we encounter from each group
                     if (!countedAlternativeGroups.has(msg.prev_id)) {
@@ -3832,9 +3832,13 @@ button[data-testid="ContextCapIndicator-Button"] {
             if (typeof numMessages === 'number' && numMessages > 0) {
                 const windowEntryCount = Object.keys(messageIdToIndexMap).length;
                 const offset = numMessages - windowEntryCount;
-                if (offset > 0) {
+                if (offset >= 0) {
                     for (const [idx, id] of Object.entries(messageIdToIndexMap)) {
                         messageDisplayNumberMap[id] = parseInt(idx, 10) + offset + 1; // 1-based
+                    }
+                    for (const group of Object.values(alternativeMessageGroups)) {
+                        const number = group.map(entry => messageDisplayNumberMap[entry.id]).find(Number.isFinite);
+                        if (number !== undefined) for (const entry of group) messageDisplayNumberMap[entry.id] = number;
                     }
                     debugLog('[Core] Calibrated display numbering against API num_messages:', numMessages, 'offset:', offset);
                 }
@@ -3985,7 +3989,8 @@ button[data-testid="ContextCapIndicator-Button"] {
             }
             
             // If this is an alternative (regenerated) message, update the alternativeMessageGroups
-            if ((isAlternative || isRegenerationDetected) && prevId && messageId) {
+            if ((isAlternative || isRegenerationDetected) && prevId && messageId &&
+                (!isStoryMode() || isAlternative || altMessageId || (prevIdToMessageIds[prevId] || []).some(id => id !== messageId))) {
                 debugLog('[Stats] Updating alternativeMessageGroups for regenerated message');
                 if (!alternativeMessageGroups[prevId]) {
                     // First time seeing this prev_id in this session.
@@ -4126,7 +4131,10 @@ button[data-testid="ContextCapIndicator-Button"] {
                         // SAI_NEW_MESSAGE (or a Story Mode regeneration re-firing for a
                         // new id at the same position) can't grow it past what a page
                         // reload would rebuild.
-                        if (!Object.values(messageIdToIndexMap).includes(messageId)) {
+                        const versionGroup = prevId && alternativeMessageGroups[prevId];
+                        const sharesPosition = Array.isArray(versionGroup) && versionGroup.some(entry =>
+                            entry.id !== messageId && Object.values(messageIdToIndexMap).includes(entry.id));
+                        if (!sharesPosition && !Object.values(messageIdToIndexMap).includes(messageId)) {
                             const currentMaxIndex = Math.max(-1, ...Object.keys(messageIdToIndexMap).map(k => parseInt(k)));
                             const newIndex = currentMaxIndex + 1;
                             messageIdToIndexMap[newIndex] = messageId;
@@ -4150,7 +4158,11 @@ button[data-testid="ContextCapIndicator-Button"] {
                         // Fall back to max+1 only if the predecessor isn't numbered yet
                         // (e.g. it scrolled out of the loaded window) and the id is new.
                         let displayNumber;
-                        if (prevId && messageDisplayNumberMap[prevId] !== undefined) {
+                        const siblingNumber = Array.isArray(versionGroup) && versionGroup.length > 1
+                            ? versionGroup.map(entry => messageDisplayNumberMap[entry.id]).find(Number.isFinite) : undefined;
+                        if (siblingNumber !== undefined) {
+                            displayNumber = siblingNumber;
+                        } else if (prevId && messageDisplayNumberMap[prevId] !== undefined) {
                             displayNumber = messageDisplayNumberMap[prevId] + 1;
                         } else if (messageDisplayNumberMap[messageId] !== undefined) {
                             displayNumber = messageDisplayNumberMap[messageId];
@@ -7169,35 +7181,69 @@ button[data-testid="ContextCapIndicator-Button"] {
         debugLog('[Export] Conversation ID:', conversationId);
         
         return new Promise((resolve, reject) => {
-            // Use postMessage to communicate with page-context.js instead of inline script
-            // This avoids CSP issues with inline script injection
-            const handler = (event) => {
-                // Only handle our specific response
-                if (event.source !== window) return;
-                if (event.data.type !== 'SAI_EXPORT_CHAT_RESPONSE') return;
-                
+            if (document.getElementById('sai-toolkit-export-progress')) {
+                reject(new Error('A chat export is already running'));
+                return;
+            }
+            const requestId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+            const start = Date.now();
+            const panel = document.createElement('div');
+            panel.id = 'sai-toolkit-export-progress';
+            panel.setAttribute('role', 'status');
+            panel.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:2147483646;max-width:min(360px,90vw);padding:12px;border-radius:8px;background:#202124;color:#fff;font:13px system-ui;box-shadow:0 2px 12px #0006;';
+            const status = document.createElement('div');
+            status.textContent = 'Exporting chat…';
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.textContent = 'Cancel export';
+            cancel.style.cssText = 'margin-top:8px;padding:4px 10px;border:1px solid #aaa;border-radius:4px;color:#fff;background:#333;cursor:pointer;';
+            panel.append(status, cancel);
+            document.body.appendChild(panel);
+            let timer;
+            let settled = false;
+            const cleanup = () => {
+                clearTimeout(timer);
                 window.removeEventListener('message', handler);
-                
-                if (event.data.success) {
-                    resolve({ messages: event.data.messages, character: event.data.character });
-                } else {
-                    reject(new Error(event.data.error || 'Failed to fetch chat data'));
-                }
+                window.removeEventListener('pagehide', onPageHide);
+                panel.remove();
             };
+            const finish = (error, result) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (error) reject(error); else resolve(result);
+            };
+            const abort = (message) => {
+                window.postMessage({ type: 'SAI_EXPORT_CHAT_CANCEL', requestId }, '*');
+                finish(new Error(message));
+            };
+            const onPageHide = () => abort('Export interrupted by navigation');
+            const arm = () => {
+                clearTimeout(timer);
+                // Inactivity timeout, not a total export duration limit.
+                timer = setTimeout(() => abort('Export stopped responding for 180 seconds. Please retry.'), 180000);
+            };
+            const handler = (event) => {
+                if (event.source !== window || event.data?.requestId !== requestId) return;
+                if (event.data.type === 'SAI_EXPORT_CHAT_PROGRESS') {
+                    const { count, expected, page, phase } = event.data;
+                    const elapsed = Math.max(1, (Date.now() - start) / 1000);
+                    const rate = count > 0 ? Math.round(count / elapsed) : 0;
+                    const eta = rate > 0 && Number.isFinite(expected) && expected > count ? `~${Math.ceil((expected - count) / rate)}s remaining` : '';
+                    const progress = Number.isFinite(count) ? `${count.toLocaleString()}${Number.isFinite(expected) && expected > 0 ? ` / ~${expected.toLocaleString()}` : ''} messages` : '';
+                    status.textContent = [phase || 'Fetching chat', progress, page ? `Page ${page}` : '', `${Math.floor(elapsed)}s elapsed`, rate ? `${rate.toLocaleString()} msg/s` : '', eta].filter(Boolean).join(' · ');
+                    arm();
+                    return;
+                }
+                if (event.data.type !== 'SAI_EXPORT_CHAT_RESPONSE') return;
+                if (event.data.success) finish(null, { messages: event.data.messages, character: event.data.character });
+                else finish(new Error(event.data.error || 'Failed to fetch chat data'));
+            };
+            cancel.addEventListener('click', () => abort('Export cancelled'));
+            window.addEventListener('pagehide', onPageHide, { once: true });
             window.addEventListener('message', handler);
-            
-            // Send request to page-context.js
-            window.postMessage({
-                type: 'SAI_EXPORT_CHAT_REQUEST',
-                characterId: characterId,
-                conversationId: conversationId
-            }, '*');
-            
-            // Timeout after 30 seconds
-            setTimeout(() => {
-                window.removeEventListener('message', handler);
-                reject(new Error('Export request timed out after 30 seconds'));
-            }, 30000);
+            arm();
+            window.postMessage({ type: 'SAI_EXPORT_CHAT_REQUEST', requestId, characterId, conversationId }, '*');
         });
     }
     
@@ -12456,91 +12502,24 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             return true; // Not an error, just nothing to do
         }
         
-        // Find the message that's currently showing the latest regeneration
-        // Look for message bubbles and find the one with a version counter showing the highest version
-        const versionCounters = document.querySelectorAll('p.text-label-md');
         let targetBubble = null;
-        let targetCounterEl = null; // Version counter that picked targetBubble (null on the fallback path)
-        let highestVersion = 0;
+        let targetCounterEl = null;
+        const wrappers = Array.from(document.querySelectorAll('div.w-full.flex.mb-lg'));
+        const candidates = [];
+        for (const wrapper of wrappers) {
+            const counter = findVersionCounter(wrapper);
+            if (counter ? resolveVersionMessageId(counter) === messageId : verifiedDomMessageId(wrapper) === messageId) {
+                candidates.push({ wrapper, counter });
+            }
+        }
+        if (candidates.length === 1) {
+            const { wrapper, counter } = candidates[0];
+            targetCounterEl = counter;
+            targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"], div[class*="px-\\[13px\\]"]');
+        }
+        // Never assign a new ID to the last/highest-version bubble by guessing.
+        // The regular scan can backfill an unversioned message from the history map.
 
-        for (const counter of versionCounters) {
-            const match = counter.textContent.trim().match(/^(\d+)\/(\d+)$/);
-            if (match) {
-                const currentVer = parseInt(match[1]);
-                const totalVer = parseInt(match[2]);
-                // We want the one showing the LATEST version (currentVer === totalVer)
-                if (currentVer === totalVer && totalVer > highestVersion) {
-                    highestVersion = totalVer;
-                    targetCounterEl = counter;
-                    targetBubble = counter.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!targetBubble) {
-                        targetBubble = counter.closest('div[class*="px-\\[13px\\]"]');
-                    }
-                }
-            }
-        }
-        
-        // FALLBACK: If no version counter found (brand new message, not a regeneration),
-        // find the LAST bot message bubble in the chat (the newest one)
-        // First, try to find a message that matches our messageId directly
-        if (!targetBubble) {
-            debugLog('[Stats REGEN] No version counter found, trying to find last bot message bubble');
-            
-            // Try to find the message by data-message-id first (most reliable)
-            const messageByIdElement = document.querySelector(`[data-message-id="${messageId}"]`);
-            if (messageByIdElement) {
-                const wrapper = messageByIdElement.closest('div.w-full.flex.mb-lg');
-                if (wrapper) {
-                    targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!targetBubble) {
-                        targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
-                    }
-                    if (targetBubble) {
-                        debugLog('[Stats REGEN] Found message bubble by data-message-id:', messageId?.substring(0, 8));
-                    }
-                }
-            }
-            
-            // If still not found, fall back to last bot message
-            if (!targetBubble) {
-                // Find all message wrappers and get the last bot message
-                const allMessageWrappers = document.querySelectorAll('div.w-full.flex.mb-lg');
-                for (let i = allMessageWrappers.length - 1; i >= 0; i--) {
-                    const wrapper = allMessageWrappers[i];
-                    // Check if this is a bot message (has character link)
-                    // Use contains selector to support localized URLs like /pt/chatbot/
-                    const characterLink = wrapper.querySelector('a[href*="/chatbot/"]');
-                    let isBotWrapper = !!characterLink;
-                    // Story Mode never renders a chatbot profile link on the message
-                    // wrapper, so characterLink is always null there — this loop
-                    // used to fall through every wrapper and never find one,
-                    // meaning EVERY brand-new Story Mode message fell through this
-                    // entire function (always "no target bubble found") and burned
-                    // insertStatsWithRetry's full ~3s of retries before giving up,
-                    // relying entirely on processMessagesForStats's slower,
-                    // DOM-snapshot-dependent pass to ever backfill stats. This
-                    // function is only ever called for bot messages in the first
-                    // place (see the SAI_NEW_MESSAGE handler above — user messages
-                    // take the processMessagesForStats path instead), so in Story
-                    // Mode the last wrapper in the DOM is always the one we want.
-                    if (!isBotWrapper && isStoryMode()) {
-                        isBotWrapper = true;
-                    }
-                    if (isBotWrapper) {
-                        // This is a bot message - find its bubble
-                        targetBubble = wrapper.querySelector('div[class*="bg-gray-4"][class*="rounded"]');
-                        if (!targetBubble) {
-                            targetBubble = wrapper.querySelector('div[class*="px-\\[13px\\]"]');
-                        }
-                        if (targetBubble) {
-                            debugLog('[Stats REGEN] Found last bot message bubble via fallback');
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
         if (!targetBubble) {
             debugLog('[Stats REGEN] Could not find target message bubble (neither version counter nor fallback worked)');
             // Remove from in-progress so later retry attempts can try again
@@ -12550,12 +12529,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         
         debugLog('[Stats REGEN] Found target bubble for message');
 
-        // Mark the message wrapper with the message ID so extractMessageId can find it
         const messageWrapper = targetBubble.closest('div.w-full.flex.mb-lg');
-        if (messageWrapper) {
-            messageWrapper.dataset.messageId = messageId;
-            debugLog('[Stats REGEN] Marked message wrapper with data-message-id');
-        }
 
         // Find the header container (supports both gap-md and gap-0)
         const headerContainer = targetBubble.querySelector('div.flex.justify-between.items-center.gap-md, div.flex.justify-between.items-center.gap-0, div.flex.justify-between.items-center');
@@ -12630,7 +12604,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 statsInsertionInProgress.delete(messageId);
                 return false;
             }
-            if (liveMatch[1] !== liveMatch[2]) {
+            if (resolveVersionMessageId(targetCounterEl) !== messageId) {
                 debugLog('[Stats REGEN] Displayed version changed while awaiting storage, abandoning stale insert');
                 statsInsertionInProgress.delete(messageId);
                 if (pendingNewMessageCount > 0) pendingNewMessageCount--;
@@ -12638,6 +12612,11 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             }
         }
 
+        if (!targetBubble.isConnected || !headerContainer.isConnected ||
+            (!targetCounterEl && verifiedDomMessageId(messageWrapper || targetBubble) !== messageId)) {
+            statsInsertionInProgress.delete(messageId);
+            return false;
+        }
         // Re-read the live DOM so we update the block that is actually attached
         // (not a stale or removed one) instead of duplicating.
         statsDiv = headerContainer.querySelector('.generation-stats');
@@ -12711,25 +12690,90 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     //                             if false, process all messages (for initial page load)
     // Map a "current/total" version counter element to the message ID of the version
     // it is displaying, via alternativeMessageGroups. Returns null if unresolvable.
-    function resolveVersionMessageId(versionCounter) {
-        const versionMatch = versionCounter.textContent.trim().match(/^(\d+)\/(\d+)$/);
-        if (!versionMatch) return null;
-        const currentVersion = parseInt(versionMatch[1]);
-        const totalVersions = parseInt(versionMatch[2]);
-        debugLog('[Stats] Message has version counter:', currentVersion, '/', totalVersions);
+    // A version count is not a message identity. Only resolve a group from a
+    // known message ID, or a history position corroborated by native DOM IDs.
+    function versionGroupForId(id) {
+        if (!id) return null;
+        let found = null;
+        for (const [prevId, group] of Object.entries(alternativeMessageGroups)) {
+            if (!group.some(entry => entry.id === id)) continue;
+            if (found !== null && found !== prevId) return null;
+            found = prevId;
+        }
+        return found;
+    }
 
-        // Find the alternative group that matches this total version count
-        for (const alternatives of Object.values(alternativeMessageGroups)) {
-            if (alternatives.length === totalVersions) {
-                // Found matching group - get the message ID for the current version
-                const targetIndex = currentVersion - 1; // versions are 1-indexed
-                if (targetIndex >= 0 && targetIndex < alternatives.length) {
-                    return alternatives[targetIndex].id;
-                }
-                return null;
+    function findVersionCounter(wrapper) {
+        return Array.from(wrapper.querySelectorAll('p.text-label-md')).find(
+            node => /^\d+\/\d+$/.test(node.textContent.trim())) || null;
+    }
+
+    function verifiedDomMessageId(wrapper) {
+        if (!wrapper) return null;
+        const ids = new Set();
+        const own = wrapper.getAttribute('data-message-id');
+        if (own) ids.add(own);
+        for (const node of wrapper.querySelectorAll('[data-message-id]')) {
+            const id = node.getAttribute('data-message-id');
+            if (id) ids.add(id);
+        }
+        // Only exact message objects attached to this wrapper, not arbitrary
+        // UUIDs extracted from handler source or unrelated ancestors.
+        for (const key of Object.keys(wrapper)) {
+            if (!/^__react(?:Props|InternalInstance|Fiber)/.test(key)) continue;
+            const props = wrapper[key];
+            for (const message of [props?.message, props?.children?.props?.message, props?.memoizedProps?.message]) {
+                if (typeof message?.id === 'string') ids.add(message.id);
             }
         }
-        return null;
+        return ids.size === 1 ? ids.values().next().value : ids.size > 1 ? false : null;
+    }
+
+    function verifiedHistoryId(wrapper) {
+        // React's private props aren't always visible from an isolated world.
+        // Permit the existing history-index fallback only if all available DOM
+        // anchors agree with that alignment and at least one anchor exists.
+        const wrappers = Array.from(document.querySelectorAll('div.w-full.flex.mb-lg'));
+        const index = wrappers.indexOf(wrapper);
+        const count = Object.keys(messageIdToIndexMap).length;
+        if (index < 0 || wrappers.length > count || pendingNewMessageCount > 0) return null;
+        const offset = count - wrappers.length;
+        let anchors = 0;
+        for (let i = 0; i < wrappers.length; i++) {
+            const actual = verifiedDomMessageId(wrappers[i]);
+            if (actual === false) return null;
+            if (!actual) continue;
+            const expected = messageIdToIndexMap[offset + i];
+            if (!expected) return null;
+            if (actual !== expected) {
+                const actualGroup = versionGroupForId(actual);
+                if (!actualGroup || actualGroup !== versionGroupForId(expected)) return null;
+            }
+            anchors++;
+        }
+        return anchors ? messageIdToIndexMap[offset + index] || null : null;
+    }
+
+    function resolveVersionMessageId(versionCounter) {
+        const match = versionCounter?.textContent.trim().match(/^(\d+)\/(\d+)$/);
+        if (!match) return null;
+        const current = Number(match[1]);
+        const total = Number(match[2]);
+        if (current < 1 || current > total || total < 1) return null;
+        const wrapper = versionCounter.closest('div.w-full.flex.mb-lg');
+        if (!wrapper) return null;
+        const routeId = getCurrentConversationId();
+        if (routeId && currentConversationId && routeId !== currentConversationId) return null;
+        const explicitId = verifiedDomMessageId(wrapper);
+        if (explicitId === false) return null;
+        if (total === 1) return explicitId || verifiedHistoryId(wrapper);
+        let groupKey = versionGroupForId(explicitId);
+        if (!groupKey && !explicitId) groupKey = versionGroupForId(verifiedHistoryId(wrapper));
+        if (!groupKey) return null;
+        const group = alternativeMessageGroups[groupKey];
+        // Require the complete group to be known. Do not infer missing versions.
+        if (!Array.isArray(group) || group.length !== total) return null;
+        return group[current - 1]?.id || null;
     }
 
     async function processMessagesForStats(skipVersionCounterMessages = false) {
@@ -12782,7 +12826,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         for (const wrapper of wrappersArray) {
             // Skip wrappers that we've already failed to extract IDs from
             // This prevents endless retries on messages that don't have IDs yet
-            if (statsFailedForWrappers.has(wrapper)) {
+            if (statsFailedForWrappers.has(wrapper) && !findVersionCounter(wrapper)) {
                 debugLog('[Stats] Skipping wrapper that previously failed ID extraction');
                 messageIndex--;
                 continue;
@@ -12809,14 +12853,11 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             // Skip messages with version counters when processing new messages
             // (they're handled by insertStatsForRegeneratedMessage in that case)
             // But on initial page load, we need to process them here
-            const versionCounter = wrapper.querySelector('p.text-label-md');
+            const versionCounter = findVersionCounter(wrapper);
             const hasVersionCounter = versionCounter && /^\d+\/\d+$/.test(versionCounter.textContent.trim());
-            if (skipVersionCounterMessages && hasVersionCounter) {
-                debugLog('[Stats] Skipping message with version counter (handled by insertStatsForRegeneratedMessage)');
-                messageIndex--;
-                continue;
-            }
-            
+            const displayedVersionId = hasVersionCounter ? resolveVersionMessageId(versionCounter) : null;
+            if (hasVersionCounter) isBotMessage = true;
+
             // Update selector to match new DOM structure - action container has gap-0 and may have flex-row-reverse
             const actionContainer = wrapper.querySelector('.flex.justify-between.items-center.gap-0, .flex.justify-between.items-center');
             
@@ -12842,6 +12883,20 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     existingStatsDiv = storyStatsContainer.querySelector(':scope > .generation-stats');
                 }
             }
+            const existingNumber = existingStatsDiv?.dataset.versionId && getMessageNumber(existingStatsDiv.dataset.versionId);
+            const staleStoryNumber = isStoryMode() && timestampEnabled && existingNumber && existingStatsDiv && Number(existingStatsDiv.textContent.match(/[|] #([0-9]+)/)?.[1]) !== existingNumber;
+            if (staleStoryNumber || (hasVersionCounter && (!displayedVersionId || (existingStatsDiv && existingStatsDiv.dataset.versionId !== displayedVersionId)))) {
+                if (existingStatsDiv?.dataset.versionId) {
+                    statsInsertedForMessageIds.delete(existingStatsDiv.dataset.versionId);
+                    existingStatsDiv.remove();
+                    existingStatsDiv = null;
+                }
+                delete actionContainer.dataset.statsFinalized;
+            }
+            if (hasVersionCounter && !displayedVersionId) {
+                messageIndex--;
+                continue;
+            }
             if (existingStatsDiv) {
                 debugLog('[Stats] Found existing stats div');
                 
@@ -12855,7 +12910,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 
                 // Check if we need to update the stats (e.g., from partial to full model format)
                 if (isBotMessage) {
-                    let messageId = extractMessageId(wrapper);
+                    let messageId = displayedVersionId || extractMessageId(wrapper);
                     debugLog('[Stats] Bot message, messageId:', messageId);
                     
                     // Try fallback to index map if extraction failed
@@ -12970,16 +13025,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     debugLog('[Stats DISPLAY] hasVersionCounter:', hasVersionCounter);
                 }
                 
-                // For messages with version counters, find the correct message ID from alternativeMessageGroups
-                // based on which version is currently being displayed
-                if (hasVersionCounter && versionCounter) {
-                    const versionMessageId = resolveVersionMessageId(versionCounter);
-                    if (versionMessageId) {
-                        messageId = versionMessageId;
-                        debugLog('[Stats] Found message ID from alternativeMessageGroups:', messageId?.substring(0, 8));
-                    }
-                }
-                
+                // A versioned message must resolve to its verified group and version.
+                if (hasVersionCounter) messageId = displayedVersionId;
+
                 // Calculate the correct index: page shows newest messages, so offset from end of storage
                 if (!messageId) {
                     // Use cached storageOffset calculated at start of function
@@ -13004,7 +13052,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 
                 // Skip if this message was already handled or is being handled by insertStatsWithRetry
                 // This prevents duplicate stats when both paths try to insert
-                if (messageId && (statsInsertedForMessageIds.has(messageId) || statsInsertionInProgress.has(messageId))) {
+                if (messageId && ((!hasVersionCounter && statsInsertedForMessageIds.has(messageId)) || statsInsertionInProgress.has(messageId))) {
                     debugLog('[Stats DISPLAY] Message already handled or in progress by insertStatsForRegeneratedMessage, skipping');
                     delete actionContainer.dataset.statsProcessing;
                     messageIndex--;
@@ -13018,8 +13066,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     debugLog('[Stats DISPLAY] Timestamp as Date:', generationStats?.timestamp ? new Date(generationStats.timestamp).toISOString() : 'null');
                 }
                 debugLog('[Stats] Got stats from storage:', generationStats);
-                if (!generationStats && pendingMessageStats) generationStats = pendingMessageStats;
-                if (!generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
+                if (!hasVersionCounter && !generationStats && pendingMessageStats) generationStats = pendingMessageStats;
+                if (!hasVersionCounter && !generationStats && lastGenerationSettings) generationStats = lastGenerationSettings;
                 debugLog('[Stats] Final stats:', generationStats);
                 
                 if (!generationStats) {
@@ -13121,6 +13169,12 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 }
                 debugLog('[Stats] Stats div innerHTML:', statsDiv.innerHTML);
                 
+                if (!wrapper.isConnected || !actionContainer.isConnected || (hasVersionCounter &&
+                    resolveVersionMessageId(findVersionCounter(wrapper)) !== messageId)) {
+                    delete actionContainer.dataset.statsProcessing;
+                    messageIndex--;
+                    continue;
+                }
                 let leftRacedStatsUntouched = false; // Set when another path's block for a different version is kept
                 // Insert positioning based on story mode
                 if (inStoryMode) {
@@ -13491,334 +13545,16 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     // When user switches between message regenerations (< 1/2 > buttons or arrow keys),
     // update the displayed stats to match the currently visible version
     
-    // Shared function to handle version switch stats update
-    async function handleVersionSwitch(currentVersion, totalVersions, isNext) {
-        // Calculate the NEW version number after the switch
-        let newVersion;
-        if (isNext) {
-            newVersion = currentVersion < totalVersions ? currentVersion + 1 : currentVersion;
-        } else {
-            newVersion = currentVersion > 1 ? currentVersion - 1 : currentVersion;
-        }
-        
-        debugLog('[Core] Version change:', currentVersion, '->', newVersion);
-        
-        // If version didn't change (button was disabled), do nothing
-        if (newVersion === currentVersion) {
-            debugLog('[Core] Version unchanged, skipping');
-            return;
-        }
-        
-        // IMMEDIATELY inject CSS to hide any stats div that React might create
-        // This prevents flicker by hiding React's stats divs at the CSS level
-        let hideStyle = document.getElementById('sai-hide-react-stats');
-        if (!hideStyle) {
-            hideStyle = document.createElement('style');
-            hideStyle.id = 'sai-hide-react-stats';
-            document.head.appendChild(hideStyle);
-        }
-        hideStyle.textContent = '.generation-stats:not([data-version-id]) { display: none !important; }';
-        
-        // Wait for React to update the DOM with the new message version
-        // Use a shorter delay for faster response
-        setTimeout(async () => {
-            debugLog('[Core] === INSIDE SETTIMEOUT - STARTING VERSION SWITCH HANDLER ===');
-            
-            // The counter element is likely detached by React after the version switch
-            // Instead, we search the LIVE DOM for the version switcher showing the NEW version
-            const versionText = `${newVersion}/${totalVersions}`;
-            debugLog('[Core] Searching for version text:', versionText);
-            
-            let liveStatsDiv = null;
-            let liveHeaderContainer = null;
-            let messageBubble = null;
-            
-            // Find the paragraph showing our target version (e.g., "2/2")
-            const allParagraphs = document.querySelectorAll('p.text-label-md');
-            for (const p of allParagraphs) {
-                if (p.textContent.trim() === versionText) {
-                    debugLog('[Core] Found version text paragraph in LIVE DOM');
-                    
-                    // Navigate up to the message bubble
-                    // The bubble has classes: flex flex-col ... gap-md ... px-[13px] ... rounded-[...]  bg-gray-4
-                    messageBubble = p.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                    if (!messageBubble) {
-                        // Fallback: try finding by px-[13px] which is unique to message bubbles
-                        messageBubble = p.closest('div[class*="px-\\[13px\\]"]');
-                    }
-                    
-                    if (messageBubble) {
-                        debugLog('[Core] Message bubble found:', messageBubble.className.substring(0, 80));
-                        
-                        // Find the header container (has gap-md AND justify-between items-center)
-                        liveHeaderContainer = messageBubble.querySelector('div.flex.justify-between.items-center.gap-md');
-                        debugLog('[Core] Header container found:', !!liveHeaderContainer);
-                        
-                        if (liveHeaderContainer) {
-                            liveStatsDiv = liveHeaderContainer.querySelector('.generation-stats');
-                            debugLog('[Core] Stats div in header:', !!liveStatsDiv);
-                        }
-                    }
-                    break;
-                }
-            }
-            
-            // If we couldn't find the header container, we can't proceed
-            if (!liveHeaderContainer) {
-                debugLog('[Core] Could not find header container, aborting');
-                return;
-            }
-            
-            // Try to find the message ID from our alternative groups
-            let newMessageId = null;
-            
-            // Method 3: Fall back to matching by version count (works if counts are unique)
-            // alternativeMessageGroups[prev_id] contains ALL versions including the original (v1)
-            // so alternatives.length === totalVersions
-            if (!newMessageId) {
-                debugLog('[Core] Trying to match by version count:', totalVersions);
-                debugLog('[Core] Available groups:', Object.entries(alternativeMessageGroups).map(([k, v]) => 
-                    `${k.substring(0, 8)}: ${v.length} versions [${v.map(m => m.id.substring(0, 8)).join(', ')}]`
-                ));
-                for (const [prevId, alternatives] of Object.entries(alternativeMessageGroups)) {
-                    if (alternatives.length === totalVersions) {
-                        const targetIndex = newVersion - 1;
-                        debugLog('[Core] Found group by count match! prev_id:', prevId.substring(0, 8));
-                        debugLog('[Core] Alternatives in group:', alternatives.map((m, i) => `v${i+1}=${m.id.substring(0, 8)}`));
-                        debugLog('[Core] Target index:', targetIndex, 'for newVersion:', newVersion);
-                        if (targetIndex >= 0 && targetIndex < alternatives.length) {
-                            newMessageId = alternatives[targetIndex].id;
-                            debugLog('[Core] Selected message ID:', newMessageId.substring(0, 8));
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            if (!newMessageId) {
-                debugLog('[Core] Could not determine message ID after version switch');
-                return;
-            }
-            
-            debugLog('[Core] Final message ID for lookup:', newMessageId.substring(0, 8));
-            debugLog('[Core] messageTimestamps has this ID?', !!messageTimestamps[newMessageId]);
-            debugLog('[Core] messageTimestamps[newMessageId]:', messageTimestamps[newMessageId]);
-            debugLog('[Core] All messageTimestamps keys:', Object.keys(messageTimestamps).map(k => k.substring(0, 8)));
-            
-            // Get the stats for this specific message version
-            // Note: getStatsForMessage automatically uses the API timestamp from messageTimestamps
-            const generationStats = await getStatsForMessage(newMessageId);
-            debugLog('[Core] Stats lookup result:', generationStats ? 'found' : 'not found', generationStats);
-            debugLog('[Core] Stats timestamp after getStatsForMessage:', generationStats?.timestamp, '→', generationStats?.timestamp ? new Date(generationStats.timestamp).toLocaleString() : 'null');
-            
-            if (!generationStats) {
-                debugLog('[Core] No stats found for message:', newMessageId);
-                // Clear existing stats if present
-                if (liveStatsDiv) {
-                    liveStatsDiv.textContent = '';
-                }
-                return;
-            }
-            
-            // Get current settings
-            const cache = window.__toolkitStorageCache;
-            const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
-            const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
-            const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
-            const compactStats = cache ? await cache.get('compactStats', false) : await storage.get('compactStats', false);
-            const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-
-            debugLog('[Core] Settings:', { statsEnabled, timestampEnabled, showModelDetails, compactStats, showMessageIds });
-            
-            // Build updated display
-            let displayLines = [];
-            
-            const hasSettings = generationStats.max_tokens !== null && generationStats.max_tokens !== undefined;
-            const hasModel = generationStats.model;
-            const hasTimestamp = generationStats.timestamp;
-            
-            if (statsEnabled && hasSettings && hasModel) {
-                let modelDisplay = generationStats.model;
-                if (!showModelDetails && modelDisplay.includes('→')) {
-                    modelDisplay = modelDisplay.split('→')[0].trim();
-                }
-                displayLines.push(modelDisplay);
-                displayLines.push(compactStats
-                    ? `${generationStats.max_tokens} | ${generationStats.temperature.toFixed(2)} | ${generationStats.top_p} | ${generationStats.top_k}`
-                    : `Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`);
-            }
-            
-            if (timestampEnabled && hasTimestamp) {
-                const timestamp = await formatTimestamp(generationStats.timestamp);
-                if (timestamp) {
-                    displayLines.push(withStoryMessageNumber(timestamp, newMessageId));
-                }
-            }
-
-            if (showMessageIds && newMessageId) {
-                displayLines.push(`ID: ${newMessageId}`);
-            }
-
-            debugLog('[Core] Display lines:', displayLines);
-            
-            if (displayLines.length > 0) {
-                const displayText = displayLines.join('<br>');
-                
-                // Use the liveStatsDiv and liveHeaderContainer we found earlier via versionCounterElement
-                // These were found by navigating from the clicked version counter
-                
-                // FIRST: Remove any stats divs that React created (they don't have our data-version-id)
-                // This prevents flicker by cleaning up before we add/update ours
-                if (liveHeaderContainer) {
-                    const reactStatsDivs = liveHeaderContainer.querySelectorAll('.generation-stats:not([data-version-id])');
-                    reactStatsDivs.forEach(div => div.remove());
-                }
-                
-                // If no stats div exists but we have a header container, create one
-                if (!liveStatsDiv && liveHeaderContainer) {
-                    debugLog('[Core] No stats div found, creating new one in header container');
-                    liveStatsDiv = document.createElement('div');
-                    liveStatsDiv.className = 'generation-stats';
-                    liveStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                    
-                    // Insert before the menu button container
-                    const menuButtonContainer = liveHeaderContainer.querySelector('.relative');
-                    if (menuButtonContainer) {
-                        insertBeforeContainerChild(liveHeaderContainer, menuButtonContainer, liveStatsDiv);
-                        liveHeaderContainer.style.setProperty('gap', '4px', 'important');
-                    } else {
-                        liveHeaderContainer.appendChild(liveStatsDiv);
-                    }
-                }
-                
-                if (!liveStatsDiv) {
-                    debugLog('[Core] ERROR: Could not find or create any live stats div to update!');
-                    return;
-                }
-                
-                debugLog('[Core] BEFORE update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
-                debugLog('[Core] Stats div is in document:', document.body.contains(liveStatsDiv));
-                
-                // Apply the update
-                liveStatsDiv.dataset.versionId = newMessageId;
-                safeSetHTML(liveStatsDiv, displayText);
-                
-                // Apply model change indicators (will re-evaluate all stats divs)
-                applyModelChangeIndicators();
-                
-                // IMPORTANT: Remove any duplicate stats divs in this header
-                // React might have created another one, or we might have created a duplicate
-                const allStatsDivsInHeader = liveHeaderContainer.querySelectorAll('.generation-stats');
-                debugLog('[Core] Stats divs in header after update:', allStatsDivsInHeader.length);
-                if (allStatsDivsInHeader.length > 1) {
-                    // Keep only the first one (ours), remove the rest
-                    for (let i = 1; i < allStatsDivsInHeader.length; i++) {
-                        debugLog('[Core] Removing duplicate stats div');
-                        allStatsDivsInHeader[i].remove();
-                    }
-                }
-                
-                debugLog('[Core] AFTER update - stats div content:', liveStatsDiv.textContent.substring(0, 60));
-                debugLog('[Core] Updated stats display!');
-                
-                // React re-renders aggressively, so we need to keep re-applying our update
-                // Use a MutationObserver to watch for React replacing the stats div
-                const reapplyStats = () => {
-                    // Find the message bubble containing our version switcher
-                    const allVersionSwitchers = document.querySelectorAll('p.text-label-md');
-                    for (const switcher of allVersionSwitchers) {
-                        if (switcher.textContent.trim() === `${newVersion}/${totalVersions}`) {
-                            // Found the switcher, find the message bubble
-                            const msgBubble = switcher.closest('div[class*="bg-gray-4"][class*="rounded"]');
-                            if (msgBubble) {
-                                const headerContainer = msgBubble.querySelector('div.flex.justify-between.items-center.gap-md');
-                                if (headerContainer) {
-                                    // First, remove any React-created stats divs (without our data-version-id)
-                                    const reactStatsDivs = headerContainer.querySelectorAll('.generation-stats:not([data-version-id])');
-                                    reactStatsDivs.forEach(div => div.remove());
-                                    
-                                    let allStatsDivs = headerContainer.querySelectorAll('.generation-stats');
-                                    
-                                    // If no stats div exists AT ALL, CREATE one
-                                    if (allStatsDivs.length === 0) {
-                                        debugLog('[Core] reapplyStats: No stats div found, creating new one');
-                                        const newStatsDiv = document.createElement('div');
-                                        newStatsDiv.className = 'generation-stats';
-                                        newStatsDiv.style.cssText = 'color: #6b7280; font-size: 10px; margin-left: auto; margin-right: 0; flex-shrink: 0; line-height: 1.4; text-align: right; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto;';
-                                        newStatsDiv.dataset.versionId = newMessageId;
-                                        safeSetHTML(newStatsDiv, displayText);
-                                        
-                                        // Insert before the menu button container
-                                        const menuButtonContainer = headerContainer.querySelector('.relative');
-                                        if (menuButtonContainer) {
-                                            insertBeforeContainerChild(headerContainer, menuButtonContainer, newStatsDiv);
-                                            headerContainer.style.setProperty('gap', '4px', 'important');
-                                        } else {
-                                            headerContainer.appendChild(newStatsDiv);
-                                        }
-                                    } else {
-                                        // Stats div exists - update it if needed
-                                        const statsDiv = allStatsDivs[0];
-                                        if (statsDiv.dataset.versionId !== newMessageId) {
-                                            debugLog('[Core] reapplyStats: Updating existing stats div');
-                                            statsDiv.dataset.versionId = newMessageId;
-                                            safeSetHTML(statsDiv, displayText);
-                                        }
-                                        
-                                        // Remove any duplicates
-                                        for (let i = 1; i < allStatsDivs.length; i++) {
-                                            allStatsDivs[i].remove();
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                };
-                
-                // Set up a temporary MutationObserver to catch React re-renders
-                const observer = new MutationObserver((mutations) => {
-                    reapplyStats();
-                });
-                
-                // Watch the entire chat container for changes
-                const chatContainer = document.querySelector('[class*="flex-col"][class*="items-center"]') || document.body;
-                observer.observe(chatContainer, { 
-                    childList: true, 
-                    subtree: true,
-                    characterData: true
-                });
-                
-                // Also do periodic checks for the next 2 seconds (longer duration)
-                const checkInterval = setInterval(reapplyStats, 50); // More frequent checks
-                
-                // Clean up after 2 seconds
-                setTimeout(() => {
-                    observer.disconnect();
-                    clearInterval(checkInterval);
-                    // Remove the hide-React-stats CSS rule - our stats div is stable now
-                    const hideStyle = document.getElementById('sai-hide-react-stats');
-                    if (hideStyle) {
-                        hideStyle.textContent = '';
-                    }
-                    debugLog('[Core] Stopped watching for React re-renders');
-                }, 2000);
-            } else {
-                // No displayable content, clear stats div
-                if (liveStatsDiv) {
-                    liveStatsDiv.textContent = '';
-                }
-                // Remove the hide-React-stats CSS rule
-                const hideStyle = document.getElementById('sai-hide-react-stats');
-                if (hideStyle) {
-                    hideStyle.textContent = '';
-                }
-                debugLog('[Core] No displayable content, cleared stats div');
-            }
-        }, 50); // Reduced from 200ms to 50ms for faster response
+    // A version switch can replace its React nodes. Reconcile the live wrappers
+    // through the verified identity resolver instead of searching by counter text.
+    let versionSwitchTimers = [];
+    function handleVersionSwitch() {
+        for (const timer of versionSwitchTimers) clearTimeout(timer);
+        versionSwitchTimers = [80, 300, 900].map(delay => setTimeout(() => {
+            processMessagesForStats(false).catch(error => debugLog('[Stats] Version refresh failed:', error));
+        }, delay));
     }
-    
+
     // Detect manual model changes via SpicyChat's own Generation Settings UI
     // Covers: (a) "Set Model" confirmation button in new UI, (b) direct model-option selection
     // in old UI, and (c) SpicyChat's native generation presets that swap the model.
@@ -13891,40 +13627,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             return;
         }
         
-        // Find all version switchers on the page
-        const versionSwitchers = document.querySelectorAll('p.text-label-md');
-        let foundSwitcher = null;
-        let currentVersion = 0;
-        let totalVersions = 0;
-        
-        for (const switcher of versionSwitchers) {
-            const match = switcher.textContent.trim().match(/^(\d+)\/(\d+)$/);
-            if (match) {
-                currentVersion = parseInt(match[1]);
-                totalVersions = parseInt(match[2]);
-                foundSwitcher = switcher;
-                break; // Use the first version switcher found
-            }
-        }
-        
-        if (!foundSwitcher || totalVersions <= 1) {
-            return; // No version switcher or only one version
-        }
-        
-        const isNext = e.key === 'ArrowRight';
-        
-        // Check if the version would actually change
-        if (isNext && currentVersion >= totalVersions) return;
-        if (!isNext && currentVersion <= 1) return;
-        
-        debugLog('[Core] Arrow key pressed for version switch!', {
-            key: e.key,
-            currentVersion,
-            totalVersions,
-            alternativeGroupsCount: Object.keys(alternativeMessageGroups).length
-        });
-        
-        await handleVersionSwitch(currentVersion, totalVersions, isNext);
+        if (document.querySelector('div.w-full.flex.mb-lg p.text-label-md')) handleVersionSwitch();
     }, true); // Use capture phase
 
     // Initial check in case modal is already open
@@ -15610,6 +15313,82 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             }
         });
     }
+
+    // Optional, read-only capability contract for other SpicyChat extensions.
+    // It contains booleans and the extension version only, never stored values.
+    function initToolkitCapabilities() {
+        const api = typeof browser !== 'undefined' ? browser : chrome;
+        const defaults = {
+            showGenerationStats: false, showTimestamp: false, showMessageIds: false,
+            enableGenerationProfiles: false, generationProfiles: '{}', enableHideForYou: false,
+            messageRecoveryEnabled: false, enableSidebarLayout: false, styleOverrides: null,
+            enableRoundedProfileImages: false, enableSquareMessageEdges: false
+        };
+        const attribute = 'data-sai-toolkit-capabilities';
+        let revision = 0;
+        let timer;
+        async function publish() {
+            const mine = ++revision;
+            try {
+                const settings = await api.storage.local.get(defaults);
+                if (mine !== revision) return;
+                let profiles = settings.generationProfiles;
+                if (typeof profiles === 'string') {
+                    try { profiles = JSON.parse(profiles); } catch (_) { profiles = null; }
+                }
+                const hasProfiles = !!profiles && typeof profiles === 'object' && !Array.isArray(profiles) && Object.keys(profiles).length > 0;
+                const style = normalizeStyleOverrides(settings.styleOverrides);
+                const colors = style.enabled && styleOverridesHaveColors(style);
+                const theme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+                const payload = JSON.stringify({
+                    schemaVersion: 1,
+                    version: api.runtime.getManifest().version,
+                    features: {
+                        generationStats: settings.showGenerationStats === true,
+                        timestamps: settings.showTimestamp === true,
+                        messageIds: settings.showMessageIds === true,
+                        generationProfiles: hasProfiles || settings.enableGenerationProfiles === true,
+                        hideForYou: settings.enableHideForYou === true,
+                        failedMessageRecovery: settings.messageRecoveryEnabled === true,
+                        sidebarLayout: settings.enableSidebarLayout === true,
+                        customMessageColors: !!colors,
+                        botMessageColors: !!(style.enabled && style.botMessageBg[theme]),
+                        userMessageColors: !!(style.enabled && style.userMessageBg[theme]),
+                        buttonHoverColors: !!(style.enabled && style.buttonHover[theme]),
+                        backgroundImage: !!style.backgroundImage,
+                        roundedProfileImages: settings.enableRoundedProfileImages === true,
+                        squareMessageEdges: settings.enableSquareMessageEdges === true
+                    }
+                });
+                const root = document.documentElement;
+                if (root.getAttribute(attribute) !== payload) {
+                    root.setAttribute(attribute, payload);
+                    root.dispatchEvent(new Event('sai-toolkit-capabilities-changed', { bubbles: true }));
+                }
+            } catch (_) {
+                if (mine !== revision) return;
+                const root = document.documentElement;
+                if (root?.hasAttribute(attribute)) {
+                    root.removeAttribute(attribute);
+                    root.dispatchEvent(new Event('sai-toolkit-capabilities-changed', { bubbles: true }));
+                }
+            }
+        }
+        function schedule() {
+            ++revision;
+            clearTimeout(timer);
+            timer = setTimeout(publish, 50);
+        }
+        api.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && Object.keys(changes).some(key => Object.hasOwn(defaults, key))) schedule();
+        });
+        // Observe only the root class (native Light/Dark changes), not the page subtree.
+        new MutationObserver(schedule).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+        window.addEventListener('pageshow', schedule);
+        publish();
+    }
+    if (document.documentElement) initToolkitCapabilities();
+    else document.addEventListener('DOMContentLoaded', initToolkitCapabilities, { once: true });
 
     // Call initialization when DOM is ready
     if (document.readyState === 'loading') {
